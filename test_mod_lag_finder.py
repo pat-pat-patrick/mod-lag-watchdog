@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.13.1"
+RELEASE = "Mod Lag Watchdog v0.13.2"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1984,6 +1984,135 @@ def option_names_case():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+# v0.13.2: three findings left from the code review, one scenario each.
+# Every one of them fails on v0.13.1.
+KEEPER = r"""
+local previous = rawget(_G, "update")
+local World = stingray.World
+local n, done = 0, false
+rawset(_G, "update", function(...)
+  n = n + 1
+  if n == 20 and not done then                -- 12 lamps, once, in the world of the moment
+    done = true
+    local world = stingray.Application.main_world()
+    for i = 1, 12 do World.spawn_unit(world, "units/test/lamp") end
+  end
+  return previous(...)
+end)
+"""
+# Leaks ~1 MB a minute at 4 frames a second, until LEAVE_NOW: then it
+# unhooks itself (it is on top, above the Watchdog) and stops. The flag is a
+# global boolean, so nothing of the mod is reachable from _G.
+LEAVER = r"""
+local previous = rawget(_G, "update")
+local store, n, gone = {}, 0, false
+local hook
+hook = function(...)
+  if not gone and rawget(_G, "LEAVE_NOW") then
+    gone = true
+    if rawget(_G, "update") == hook then rawset(_G, "update", previous) end
+  end
+  if not gone then
+    for i = 1, 40 do
+      n = n + 1
+      store[n] = string.rep("r", 100) .. n
+    end
+  end
+  return previous(...)
+end
+rawset(_G, "update", hook)
+"""
+
+
+def window_span_case():
+    """The window's ms/s after a long frame (v0.13.2): a bucket closes only
+    when a tick comes, so the one holding a 3 s stall spans 3 s. Over the
+    real span heavy's share drops by about a tenth (its 30 s of frames in
+    ~33 s); v0.13.1 counted every bucket as one second and showed no drop."""
+    print("window span")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua("STALL_NEXT = false\n"
+              "FAKE.before_frame = function()\n"
+              "  CLOCK = CLOCK + 0.016\n"
+              "  if STALL_NEXT then STALL_NEXT = false; CLOCK = CLOCK + 3.0 end\n"
+              "end")
+        load(s, ["heavy", "finder"])
+        s.frames(2400)                                  # the 30 s window is full
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        before = s.eval("SHOWN()")
+        s.lua("STALL_NEXT = true")
+        s.frames(20)
+        after = s.eval("SHOWN()")
+        read = lambda shown: float((re.search(r"\|heavy +(\d+\.\d) ", shown) or [0, "0"])[1])
+        span = lambda shown: int((re.search(r"last (\d+) s:", shown) or [0, "0"])[1])
+        x0, x1 = read(before), read(after)
+        check(x0 > 100, "heavy's steady share: %.1f ms/s (%r)" % (x0, before))
+        check(0.85 * x0 <= x1 <= 0.95 * x0,
+              "after a 3 s stall its share over the real span drops by about a tenth: %.1f -> %.1f" % (x0, x1))
+        check(span(after) >= 32, "and the window says how long it really covers: %r" % after)
+
+
+def units_flicker_case():
+    """The main world flickering during a transition (v0.13.2): A, B, A,
+    twice, keeps the units spawned in A and counts no world change; a real
+    change, held for a second, ends A's units and is counted once. v0.13.1
+    wiped every count at each flip."""
+    print("units flicker")
+    with session() as s:
+        s.lua("FAKE.before_frame = function() CLOCK = CLOCK + 0.25 end")   # 4 frames a second
+        check(s.load_mod(source=KEEPER, name="mods/test/keeper"), "keeper loads")
+        load(s, ["finder"])
+        s.frames(40)
+        s.lua("A = FAKE.main_world; B = FAKE.add_world('flicker', false)")
+        for _ in range(2):
+            s.lua("FAKE.main_world = B")
+            s.frames(2)                                 # half a second on B
+            s.lua("FAKE.main_world = A")
+            s.frames(2)
+        s.frames(300)                                   # past a one-minute count
+        counts = log_lines(s, r"units: alive")
+        check(bool(counts) and re.search(r"keeper 12\b", counts[-1]) is not None,
+              "the flicker keeps keeper's 12 units: %r" % counts[-1:])
+        check(not log_lines(s, r"units: main world changed"), "and is no world change: %r"
+              % log_lines(s, "world changed"))
+        s.lua("FAKE.transition({ replace_update = false })")
+        s.frames(300)
+        changed = log_lines(s, r"units: main world changed \(#\d+\)")
+        check(len(changed) == 1, "a real change is counted once: %r" % changed)
+        text = s.file(LOG, "") or ""
+        after = text.split("units: main world changed", 1)[-1] if changed else ""
+        check(re.search(r"units: alive.*keeper \d", after) is None,
+              "and ends the old world's units: %r" % re.findall(r"units: alive.*", after)[:2])
+
+
+def mem_leave_case():
+    """A mod flagged for fast memory growth that then leaves the walk
+    (v0.13.2; its link left the chain): the MEM line goes. v0.13.1 kept the
+    last flag on screen for the rest of the session."""
+    print("memory leave")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua("FAKE.before_frame = function() CLOCK = CLOCK + 0.25 end")   # 4 frames a second
+        load(s, ["std", "finder"])
+        s.frames(20)
+        check(s.load_mod(source=LEAVER, name="mods/test/leaver"), "leaver loads")
+        s.frames(2950)                                  # ~12 minutes
+        check(bool(log_lines(s, r"memory: mods/test/leaver grows fast")), "leaver is flagged: %r"
+              % log_lines(s, "grows fast|only grows"))
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        check("MEM leaver" in s.eval("SHOWN()"), "and on screen: %r" % s.eval("SHOWN()"))
+        s.lua("LEAVE_NOW = true")
+        s.frames(600)                                   # two more walks
+        shown = s.eval("SHOWN()")
+        check("MEM leaver" not in shown, "once it has left the walk, the MEM line goes: %r" % shown)
+        check(bool(log_lines(s, r"memory: mods/test/leaver is no longer walked")), "and the log says why")
+        check("hooked more than once" not in shown and "on top, not measured: mod_lag_finder" not in shown,
+              "the chain after it left is read right, not as this module hooked twice: %r" % shown)
+
+
 def report_case():
     """A click on a mod's row in the escape-menu window copies that mod's
     8-line report (v0.11.0): its name, the game build and the Watchdog
@@ -2016,7 +2145,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.1, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.2, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: 1 min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -2462,6 +2591,9 @@ def main():
     hash_case()
     patch_case()
     option_names_case()
+    window_span_case()
+    units_flicker_case()
+    mem_leave_case()
     review_errors_case()
     review_remap_case()
     review_no_shutdown_case()

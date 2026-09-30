@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.13.1 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.13.2 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -110,7 +110,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.13.1"
+local MARKER = "mod-lag-finder-v0.13.2"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -364,7 +364,7 @@ end
 
 -- ------------------------------------------------------------ inspection
 
-local ours = setmetatable({}, { __mode = "k" })   -- our spies and shims
+local ours = setmetatable({}, { __mode = "k" })   -- our spies and shims -> what each passes to
 
 local function source_of(fn)
   local ok, info = pcall(getinfo, fn, "S")
@@ -463,7 +463,7 @@ local function make_spy(rec, target)
     rec.arg = (...)
     return target(...)
   end
-  ours[spy] = true
+  ours[spy] = target
   return spy
 end
 
@@ -479,7 +479,7 @@ local function make_timer(rec, target)
     rec.arg = (...)
     return finish(timer_now(), target(...))
   end
-  ours[timer] = true
+  ours[timer] = target
   return timer
 end
 
@@ -494,7 +494,7 @@ local function make_shim(link, target)
   local shim = function(...)
     return finish(timer_now(), target(...))
   end
-  ours[shim] = true
+  ours[shim] = target
   return shim
 end
 
@@ -871,7 +871,17 @@ end
 local function start_mapping(top)
   restore_all()
   mapped_top = top
-  mapping = { links = { new_link(top, nil) }, seen_mods = false, patched = {} }
+  -- A mod that unhooks itself restores the previous it saved -- which may be
+  -- one of our shims, put in its slot while it was mapped. _G.update then
+  -- holds a stale shim of ours for good (it only passes on). The walk starts
+  -- at what it passes to: counted as a link it read as this module hooked
+  -- twice, on top, and kept the mod that left reachable to the memory walk
+  -- through the shim's old slot (v0.13.2, found by the memory-leave test).
+  local first, hops = top, 0
+  while type(ours[first]) == "function" and hops < 8 do
+    first, hops = ours[first], hops + 1
+  end
+  mapping = { links = { new_link(first, nil) }, seen_mods = false, patched = {} }
   begin_step()
 end
 
@@ -1933,6 +1943,14 @@ local function mem_visit(job, obj, owner)
   local kind = type(obj)
   if kind ~= "table" and kind ~= "function" then return end
   if job.seen[obj] ~= nil then return end
+  -- Our spies and shims only pass on; what they pass to is walked from the
+  -- chain. A stale one (a mod unhooked itself and put it back as _G.update)
+  -- still holds the slot it sat in, inside the mod that left: walking it
+  -- kept that mod counted and flagged (v0.13.2).
+  if kind == "function" and ours[obj] ~= nil then
+    job.seen[obj] = SHARED
+    return
+  end
   if kind == "function" then
     local mod = mod_of(obj)
     if mod ~= nil and mod ~= owner then
@@ -2016,6 +2034,16 @@ local function mem_finish(job, at)
   -- FLAG_MIN_KB or more, across a world change. A drop of up to 1 KB is
   -- noise, not a drop.
   for owner, history in pairs(mem.history) do
+    -- An owner this walk did not reach (its link left the chain, or MDL
+    -- stopped the script) is judged no more (v0.13.2: its last flag used to
+    -- stay on screen for the rest of the session).
+    if job.size[owner] == nil then
+      if mem.flagged[owner] ~= nil or mem.logged[owner] ~= nil then
+        say(string.format("memory: %s is no longer walked; no longer flagged", owner))
+      end
+      mem.history[owner], mem.flagged[owner], mem.logged[owner] = nil, nil, nil
+      history = {}
+    end
     local count = #history
     local leak, fast = nil, nil
     if count >= FLAG_SPAN + 1 then
@@ -2040,7 +2068,7 @@ local function mem_finish(job, at)
     elseif leak == nil and mem.logged[owner] ~= nil then
       say(string.format("memory: %s dropped again; no longer flagged", owner))
     end
-    mem.logged[owner] = leak
+    if job.size[owner] ~= nil then mem.logged[owner] = leak end
     -- The screen: only growth a player would feel.
     if fast ~= nil and mem.flagged[owner] == nil then
       say(string.format("memory: %s grows fast: ~%s, +%s in %d min", owner, kb_text(fast.kb),
@@ -2052,7 +2080,7 @@ local function mem_finish(job, at)
                   until_at = at + 8, colour = AMBER }
       end
     end
-    mem.flagged[owner] = fast
+    if job.size[owner] ~= nil then mem.flagged[owner] = fast end
   end
   ui.dirty = true
 end
@@ -2146,12 +2174,17 @@ end   -- memory
 -- same arguments, same results, errors not caught. Out of reach: a mod that
 -- kept its own copy of spawn_unit before this module loaded.
 local units = { alive = {}, owner = {}, born = {}, old = {}, history = {}, flagged = {}, told = {},
+                world_of = {}, candidate = nil, candidate_at = nil,
                 world = nil, installed = false, next_at = nil, max = {}, world_changes = 0 }
 do
 local UNITS_EVERY_S = 60
 local UNITS_MIN = 300          -- old units
 local UNITS_SPAN = 5
 local UNITS_OLD_S = 600
+-- A new main world counts once it has held for UNITS_SETTLE_S (v0.13.2):
+-- during a transition the handle flips between worlds (A, B, A --
+-- hd2-main-world-flickers), and each flip used to wipe every count.
+local UNITS_SETTLE_S = 1
 
 local function source_mod(info)
   local source = type(info) == "table" and info.source or nil
@@ -2177,10 +2210,11 @@ local function caller()
   return nil
 end
 
-local function after_spawn(mod, ...)
+local function after_spawn(mod, world, ...)
   local unit = (...)
   if mod ~= nil and unit ~= nil and units.owner[unit] == nil then
     units.owner[unit] = mod
+    units.world_of[unit] = world
     units.born[unit] = now()
     units.alive[mod] = (units.alive[mod] or 0) + 1
     units.max[mod] = math.max(units.max[mod] or 0, units.alive[mod])
@@ -2193,14 +2227,15 @@ function units.install()
   units.own = source_mod(getinfo(1, "S"))
   local spawn, destroy = rawget(World, "spawn_unit"), rawget(World, "destroy_unit")
   if type(spawn) ~= "function" or type(destroy) ~= "function" then return end
-  local spawn_wrapper = function(...)
-    return after_spawn(caller(), spawn(...))
+  local spawn_wrapper = function(world, ...)
+    return after_spawn(caller(), world, spawn(world, ...))
   end
   local destroy_wrapper = function(world, unit, ...)
     local mod = unit ~= nil and units.owner[unit] or nil
     if mod ~= nil then
       units.owner[unit] = nil
       units.born[unit] = nil
+      units.world_of[unit] = nil
       units.alive[mod] = math.max(0, (units.alive[mod] or 1) - 1)
     end
     return destroy(world, unit, ...)
@@ -2214,15 +2249,31 @@ function units.install()
   end
 end
 
--- Every frame: a new main world starts every count again.
+-- Every frame: a new main world, once it has held UNITS_SETTLE_S, ends the
+-- units of the world before it (each unit's world is the one it was spawned
+-- into) and starts the trends again; units already in the new world stay.
 function units.tick(at)
   if not units.installed or type(original_main_world) ~= "function" then return end
   local ok, world = pcall(original_main_world)
-  if ok and world ~= nil and world ~= units.world then
-    if units.world ~= nil then units.world_changes = units.world_changes + 1 end
-    units.world = world
-    units.alive, units.owner, units.born, units.old, units.history = {}, {}, {}, {}, {}
-    units.flagged = {}
+  if ok and world ~= nil then
+    if units.world == nil then
+      units.world = world
+    elseif world == units.world then
+      units.candidate = nil
+    elseif units.candidate ~= world then
+      units.candidate, units.candidate_at = world, at
+    elseif at - units.candidate_at >= UNITS_SETTLE_S then
+      units.world_changes = units.world_changes + 1
+      units.world, units.candidate = world, nil
+      for unit, mod in pairs(units.owner) do
+        if units.world_of[unit] ~= world then
+          units.owner[unit], units.born[unit], units.world_of[unit] = nil, nil, nil
+          units.alive[mod] = math.max(0, (units.alive[mod] or 1) - 1)
+        end
+      end
+      units.old, units.history, units.flagged = {}, {}, {}
+      say(string.format("units: main world changed (#%d)", units.world_changes))
+    end
   end
   if units.next_at == nil then units.next_at = at + UNITS_EVERY_S end
   if at < units.next_at then return end
@@ -2424,14 +2475,17 @@ end   -- report
 
 local function panel_lines(at)
   local out = {}
-  local rows, frames, time, stalls, seconds = {}, 0, 0, 0, #live.ring
+  local rows, frames, time, stalls, seconds = {}, 0, 0, 0, 0
   local merged = {}
   local buckets = {}
   for _, bucket in ipairs(live.ring) do buckets[#buckets + 1] = bucket end
   if live.bucket ~= nil then
     buckets[#buckets + 1] = live.bucket          -- the second under way
-    seconds = seconds + math.max(0, at - live.bucket.at)
   end
+  -- The real time the buckets cover (v0.13.2): a bucket closes only when a
+  -- tick comes, so one that held a 3 s frame spans 3 s, not 1 -- counting
+  -- each as a second made every mod's ms/s read high after a stall.
+  if #buckets > 0 then seconds = math.max(0, at - buckets[1].at) end
   for _, bucket in ipairs(buckets) do
     frames, time, stalls = frames + bucket.frames, time + bucket.time, stalls + bucket.stalls
     for key, row in pairs(bucket.mods) do
