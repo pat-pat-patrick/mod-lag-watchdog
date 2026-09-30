@@ -7,6 +7,7 @@ shows a one-line alert when one mod causes a stall and a panel on Home.
 
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -23,7 +24,7 @@ TEMPLATE = os.path.join(HERE, "lua_archive_template.bin")
 ADDON = "mods/patpatpatrick/mod_lag_finder"
 LUA_T = 0xA14E8DFA2CD117E2
 PAYLOAD_FLAG = 2
-VERSION = "v0.13.2"
+VERSION = "v0.13.3"
 MOD = "Mod Lag Watchdog"
 # A build is a local test build unless the user says it goes to Nexus (the
 # user, 2026-09-30): then the release name has no "Nexus" and the manifest
@@ -130,7 +131,13 @@ def build():
               newline="\r\n") as out:
         out.write(README)
 
-    gate_release(OUT)          # raises GateFailed: do not zip
+    try:
+        gate_release(OUT)      # raises GateFailed: do not zip
+    except Exception:
+        # No ungated folder may stay behind for modpaths.find to pick up,
+        # or block the next build of this version (v0.13.3, review [15]).
+        shutil.rmtree(OUT, ignore_errors=True)
+        raise
 
     count = 0
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as bundle:

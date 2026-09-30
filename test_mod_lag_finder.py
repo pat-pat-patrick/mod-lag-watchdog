@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.13.2"
+RELEASE = "Mod Lag Watchdog v0.13.3"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1703,22 +1703,48 @@ end)
 """
 
 
+# Hooked above the Watchdog: keeps the traceback of an error from below, as
+# the engine would see it, and passes the error on.
+REVIEW_TOPCAP = r"""
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  local ok, trace = xpcall(previous, debug.traceback, ...)
+  if not ok then
+    TRACE = TRACE or trace
+    error(trace, 0)
+  end
+end)
+"""
+
+
 def review_errors_case():
     """1. An error from a mod below the Watchdog reaches the engine every
-    frame, as it would without the Watchdog; the Watchdog's own tick still
-    runs. v0.12.6 swallowed it (logged once) and the engine never saw it."""
+    frame, as it would without the Watchdog, with its own traceback (v0.13.3,
+    review [10]: v0.12.7-v0.13.2 caught and re-raised it, so the trace began
+    in this module). Errors for 400 frames with a mod hooked above us cause
+    no re-arm, no stall when they stop, and the Watchdog ticks on after.
+    v0.12.6 swallowed the error; v0.13.2 re-raised it from its own code."""
     print("review: errors from below")
     with session() as s:
         check(s.load_mod(source=REVIEW_THROWER, name="mods/test/thrower"), "thrower loads")
         load(s, ["finder"])
         s.frames(60)
+        check(s.load_mod(source=REVIEW_TOPCAP, name="mods/test/topcap"), "topcap loads (above us)")
+        s.frames(60)
         s.lua("THROW = true")
+        s.frames(400)
+        s.lua("THROW = false")
         s.frames(3800)
         r = s.report()
         thrown = [u for u in r["uncaught"] if "thrower broke" in u["error"]]
-        check(len(thrown) >= 3700, "every frame's error reaches the engine: %d of 3800" % len(thrown))
-        check(bool(log_lines(s, r"raised an error \(passed on\): thrower broke")), "and is logged once")
-        check(bool(log_lines(s, r"summary 60 s: frames=\d{4}")), "the Watchdog keeps ticking: %r"
+        check(len(thrown) >= 390, "every frame's error reaches the engine: %d of 400" % len(thrown))
+        trace = s.eval("TRACE") or ""
+        check("mods/test/thrower" in trace, "with the thrower's own traceback: %r" % trace[:300])
+        check(not log_lines(s, r"update armed generation=2"), "no re-arm while the errors last: %r"
+              % log_lines(s, "armed"))
+        hitches = [int(v) for v in re.findall(r"hitch (\d+) ms", s.file(LOG, "") or "")]
+        check(not [h for h in hitches if h >= 500], "no stall for the frames that raised: %r" % hitches)
+        check(bool(log_lines(s, r"summary 60 s: frames=\d{4}")), "the Watchdog ticks on after: %r"
               % log_lines(s, "summary")[:1])
 
 
@@ -2113,6 +2139,243 @@ def mem_leave_case():
               "the chain after it left is read right, not as this module hooked twice: %r" % shown)
 
 
+# v0.13.3: the cloud review of v0.12.6..v0.13.2 (PR #1), one scenario per
+# fix. Each fails on v0.13.2.
+REVIEW_SKIPPING_PATCH = r"""
+local original = rawget(_G, "update")
+local calls = 0
+rawset(_G, "update", function(...)
+  calls = calls + 1
+  CLOCK = CLOCK + 0.004
+  if calls <= 11 and calls % 2 == 0 then return end   -- skips its previous now and then, early on
+  return original(...)
+end)
+"""
+REVIEW_UNHOOKER = r"""
+local previous = rawget(_G, "update")
+local hook
+hook = function(...)
+  if rawget(_G, "UNHOOK_NOW") and rawget(_G, "update") == hook then
+    rawset(_G, "update", previous)                       -- may hand back a shim of the Watchdog's
+  end
+  return previous(...)
+end
+rawset(_G, "update", hook)
+"""
+REVIEW_C_MOD = r"""
+local prev = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  CLOCK = CLOCK + 0.003
+  return prev(...)
+end)
+"""
+# Leaks ~1.5 MB a minute at 4 frames a second while hooked; unhooks while
+# PAUSE is set and hooks back when REHOOK is resumed. Hooked above the
+# Watchdog. Its way back is kept in a coroutine, which the memory walk does
+# not enter -- as a callback the engine holds on the C side would be: while
+# out of the chain, nothing the walk reaches leads to it.
+REVIEW_BLINKER = r"""
+local previous = rawget(_G, "update")
+local store, n = {}, 0
+local hook
+hook = function(...)
+  if rawget(_G, "PAUSE") and rawget(_G, "update") == hook then
+    rawset(_G, "update", previous)
+    UNHOOKED = true
+  end
+  for i = 1, 60 do
+    n = n + 1
+    store[n] = string.rep("b", 100) .. n
+  end
+  return previous(...)
+end
+rawset(_G, "update", hook)
+REHOOK = coroutine.create(function()
+  if rawget(_G, "update") ~= hook then rawset(_G, "update", hook) end
+end)
+"""
+
+
+def review_arsenal(scratch, archives):
+    """An Arsenal list in a Session scratch: archives = [(label, folder, [(name, source)])]."""
+    import json
+    root = os.path.join(scratch, "Arsenal Mods")
+    os.makedirs(os.path.join(scratch, "hd2arsenal"), exist_ok=True)
+    mods = []
+    for label, folder, rows in archives:
+        path = os.path.join(root, folder, "Main")
+        os.makedirs(path)
+        with open(os.path.join(path, "9ba626afa44a3aa3.patch_0"), "wb") as f:
+            f.write(lua_archive([src for _, src in rows], names=[n for n, _ in rows]))
+        mods.append({"label": label, "path": os.path.join(root, folder), "enabled": True,
+                     "options": [{"name": "Main", "enabled": True, "include": ["Main"], "suboptions": []}]})
+    with open(os.path.join(scratch, "hd2arsenal", "hd2a_data.json"), "w", encoding="utf-8") as f:
+        json.dump({"selectedProfile": "p1", "modsList": {"p1": {"label": "Test", "mods": mods}}}, f)
+
+
+def review_patch_retry_case():
+    """[1] A boot patch whose first watch misses (it skips its previous now
+    and then early on) is retried as a patch and walked; v0.13.2's retry
+    called it the game, with every mod below it."""
+    print("review: patch retry")
+    scratch = tempfile.mkdtemp(prefix="mlf_retry_")
+    try:
+        review_arsenal(scratch, [("Boot Mod", "Boot_AR31", [("boot", "return {}")])])
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            load(s, ["heavy"])
+            check(s.load_mod(source=REVIEW_SKIPPING_PATCH, name="boot"), "patch loads")
+            load(s, ["finder"])
+            s.frames(320)
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            shown = s.eval("SHOWN()")
+            check(re.search(r"\|Boot Mod +\d+\.\d", shown) is not None and re.search(r"\|heavy +\d+\.\d", shown)
+                  is not None, "the patch is walked after its retry, heavy below it stays: %r" % shown)
+            check(bool(log_lines(s, r"#\d+ boot:\d+ via .*own copy of a game script")),
+                  "the chain shows it as the mod's patch: %r" % log_lines(s, r"#\d+ "))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def review_unknown_patch_case():
+    """[3] With an Arsenal list, a boot patch in no archive (installed by
+    hand, another profile) is found by the name-hint probe, as before
+    v0.13.0; v0.13.2 called it the game, with every mod below it."""
+    print("review: patch in no archive")
+    scratch = tempfile.mkdtemp(prefix="mlf_unknown_")
+    try:
+        review_arsenal(scratch, [("Where's My Shit?", "WMS_AR1",
+                                  [("mods/test/slow", "-- HD2-Addon: mods/test/slow\nreturn {}\n")])])
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            load(s, ["heavy"])
+            check(s.load_mod(source=HUD_BOOT_012, name="boot"), "a hand-installed boot patch loads")
+            load(s, ["finder"])
+            s.frames(320)
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            shown = s.eval("SHOWN()")
+            check(re.search(r"\|boot \(boot patch\) +\d+\.\d", shown) is not None
+                  and re.search(r"\|heavy +\d+\.\d", shown) is not None,
+                  "found by the probe, heavy below it stays: %r" % shown)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def review_rearm_window_case():
+    """[4] After a 30 s gap out of the chain and a re-arm, the window starts
+    afresh: heavy's ms/s stays its real ~240. v0.13.2 counted the gap in
+    the window and read about half."""
+    print("review: window after a re-arm")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["heavy"])
+        s.lua("BELOW = rawget(_G, 'update')")
+        load(s, ["finder"])
+        s.frames(2400)
+        s.lua("rawset(_G, 'update', BELOW)")           # the Watchdog is cut out; heavy stays
+        s.lua("CLOCK = CLOCK + 30")
+        s.frames(300)
+        check(bool(log_lines(s, r"update armed generation=2")), "re-armed: %r" % log_lines(s, "armed"))
+        s.frames(200)
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        row = re.search(r"\|heavy +(\d+\.\d) ", shown)
+        check(row is not None and float(row.group(1)) >= 200, "heavy reads its real share: %r" % shown)
+
+
+def review_stale_middle_case():
+    """[2] A mod that unhooked left a stale shim of ours as _G.update; a mod
+    hooking on top of it keeps its previous (the shim stands for what it
+    passes to): the Watchdog and the mods below stay in the table. v0.13.2
+    gave that mod no previous and the chain ended at it."""
+    print("review: stale shim in the middle")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["heavy", "finder"])
+        s.frames(60)
+        check(s.load_mod(source=REVIEW_UNHOOKER, name="mods/test/unhooker"), "unhooker loads (above us)")
+        s.frames(200)
+        s.lua("UNHOOK_NOW = true")
+        s.frames(200)
+        check(s.load_mod(source=REVIEW_C_MOD, name="mods/test/c_mod"), "c_mod loads on top")
+        s.frames(2400)                                  # past the 30 s window: only the new chain's numbers
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        check(re.search(r"\|heavy +\d+\.\d", shown) is not None, "heavy stays in the table: %r" % shown)
+        check("on top, not measured: c_mod" in shown and "hooked more than once" not in shown,
+              "c_mod is on top, the Watchdog once: %r" % shown)
+        text = s.file(LOG, "") or ""
+        last_map = text.rsplit("chain mapped:", 1)[-1]
+        check("#1 mods/test/c_mod" in last_map and "#2 mods/patpatpatrick/mod_lag_finder" in last_map
+              and "no function held" not in last_map,
+              "c_mod keeps its previous, the Watchdog below it: %r" % last_map[:400])
+
+
+def review_mem_miss_case():
+    """[11] A mod missing from one walk (unhooked for 50 s across a world
+    change) keeps its history: its fast growth is flagged on time, and its
+    leak, which crosses the world change, is logged. v0.13.2 wiped the
+    history at the one miss, so neither came."""
+    print("review: one missed walk")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua("FAKE.before_frame = function() CLOCK = CLOCK + 0.25 end")   # 4 frames a second
+        load(s, ["std", "finder"])
+        s.frames(20)
+        check(s.load_mod(source=REVIEW_BLINKER, name="mods/test/blinker"), "blinker loads (above us)")
+        s.frames(8 * 240 + 120)                         # eight and a half minutes
+        s.lua("PAUSE = true")
+        s.frames(4)
+        s.lua("FAKE.transition({ replace_update = false })")
+        s.frames(196)                                   # 50 s out of the chain: one walk starts then
+        s.lua("PAUSE = false; coroutine.resume(REHOOK)")
+        s.frames(5 * 240 + 120)                         # to ~14.5 minutes
+        walks = log_lines(s, r"memory: \d+ objects")
+        missed = [w for w in walks if "blinker" not in w]
+        check(len(missed) >= 1, "a walk ran while blinker was out: %d of %d" % (len(missed), len(walks)))
+        check(bool(log_lines(s, r"memory: mods/test/blinker grows fast")), "its fast growth is flagged on time: %r"
+              % log_lines(s, "blinker"))
+        check(bool(log_lines(s, r"memory: mods/test/blinker only grows")),
+              "and its leak across the world change is logged: %r" % log_lines(s, "only grows|no longer"))
+
+
+def review_builder_case():
+    """[15] A build whose gate fails leaves no release folder or zip behind.
+    v0.13.2 left the ungated folder where modpaths.find picks it up."""
+    print("review: builder on a gate failure")
+    import build_mod_lag_finder as builder
+    from hd2fake.gate import GateFailed
+    scratch = tempfile.mkdtemp(prefix="mlf_build_")
+    out, zip_path = os.path.join(scratch, "out"), os.path.join(scratch, "out.zip")
+    saved = builder.modpaths.out_paths, builder.gate_release
+
+    def failing_gate(path):
+        raise GateFailed("test: the gate fails")
+
+    try:
+        builder.modpaths.out_paths = lambda mod, name: (out, zip_path)
+        builder.gate_release = failing_gate
+        raised = False
+        try:
+            builder.build()
+        except GateFailed:
+            raised = True
+        check(raised, "the gate failure stops the build")
+        check(not os.path.exists(out) and not os.path.exists(zip_path),
+              "and nothing is left behind: %r" % os.listdir(scratch))
+    finally:
+        builder.modpaths.out_paths, builder.gate_release = saved
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def report_case():
     """A click on a mod's row in the escape-menu window copies that mod's
     8-line report (v0.11.0): its name, the game build and the Watchdog
@@ -2145,7 +2408,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.2, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.3, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: 1 min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -2594,6 +2857,12 @@ def main():
     window_span_case()
     units_flicker_case()
     mem_leave_case()
+    review_patch_retry_case()
+    review_unknown_patch_case()
+    review_rearm_window_case()
+    review_stale_middle_case()
+    review_mem_miss_case()
+    review_builder_case()
     review_errors_case()
     review_remap_case()
     review_no_shutdown_case()

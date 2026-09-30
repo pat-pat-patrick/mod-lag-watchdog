@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.13.2 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.13.3 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -110,14 +110,13 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.13.2"
+local MARKER = "mod-lag-finder-v0.13.3"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
 
 local sr = rawget(_G, "stingray")
 local App = sr and rawget(sr, "Application") or nil
-local unpack_fn = rawget(_G, "unpack")
 local dbg = rawget(_G, "debug")
 local getupvalue = dbg and rawget(dbg, "getupvalue") or nil
 local setupvalue = dbg and rawget(dbg, "setupvalue") or nil
@@ -421,6 +420,14 @@ local function upvalue_slots(fn, avoid)
   for index = 1, 255 do
     local name, value = getupvalue(fn, index)
     if name == nil then break end
+    -- A stale spy or shim of ours (a mod unhooked and left one in the chain,
+    -- and another mod stored it as its previous) stands for what it passes
+    -- to: taken as that, the mod keeps its previous (v0.13.3, review [2];
+    -- before, it read as "no function held" and was charged all below it).
+    for _ = 1, 8 do
+      if type(ours[value]) ~= "function" then break end
+      value = ours[value]
+    end
     if not avoid[value] and is_lua_function(value) then
       out[#out + 1] = { kind = "uv", holder = fn, key = index, name = name,
                         original = value }
@@ -440,6 +447,10 @@ local function field_slots(fn, avoid)
       for key, field in next, value do
         count = count + 1
         if count > TABLE_FIELDS_MAX then break end
+        for _ = 1, 8 do                       -- a stale spy or shim of ours: see upvalue_slots
+          if type(ours[field]) ~= "function" then break end
+          field = ours[field]
+        end
         if type(key) == "string" and not avoid[field] and is_lua_function(field) then
           out[#out + 1] = { kind = "field", holder = value, key = key,
                             name = name .. "." .. key, original = field }
@@ -505,7 +516,7 @@ local installed = { wrapper = nil, generation = 0, last_tick_at = nil,
                     shutdown_wrapper = nil, rearmed = false,
                     told_upstream = false, told_tick = false,
                     previous_slot = nil, bootstrap = nil, bootstrap_slot = nil,
-                    settling = 0, shutdown_done = false,
+                    settling = 0, shutdown_done = false, entries = 0, ticked = 0,
                     -- v0.13.0: the resource-name hashes of every Lua resource
                     -- in the enabled mods' archives (nil when no Arsenal list
                     -- was read), and the pure-Lua murmur64 that matches them.
@@ -647,15 +658,17 @@ local function begin_step()
   local link = mapping.links[#mapping.links]
   if #mapping.links >= MAX_LINKS then return finish_mapping("link limit") end
   local known = installed.archive_hashes
-  if mapping.seen_mods and not is_mod_source(link.source) and known ~= nil then
-    if known[installed.hash_of(link.source)] and not mapping.patched[link.source] then
-      mapping.patched[link.source] = true
-      link.patch = true
-    else
-      link.bottom = "game"
-      return finish_mapping("reached the game")
-    end
-  elseif mapping.seen_mods and not is_mod_source(link.source) then
+  -- A patch link being retried stays a patch (v0.13.3, review [1]: the retry
+  -- found its name already taken and called it the game). A name in no
+  -- archive goes to the name-hint probe, as before v0.13.0 (review [3]: a
+  -- boot patch installed by hand, or from another profile, was the game).
+  local patch = link.patch
+  if not patch and mapping.seen_mods and not is_mod_source(link.source) and known ~= nil
+     and known[installed.hash_of(link.source)] and not mapping.patched[link.source] then
+    mapping.patched[link.source] = true
+    link.patch, patch = true, true
+  end
+  if not patch and mapping.seen_mods and not is_mod_source(link.source) then
     local named = {}
     for _, slot in ipairs(upvalue_slots(link.fn, avoid_set())) do
       local lower = string.lower(slot.name or "")
@@ -1879,7 +1892,8 @@ end
 -- which are not Lua memory at all. The walk is spread over frames, at most
 -- MEM_BUDGET_S and MEM_STEPS objects a frame; its time is this module's own.
 local mem = { job = nil, next_at = nil, history = {}, flagged = {}, logged = {}, told = {},
-              failed = false, walks = 0, world = nil, worlds = 0, first = {}, dropped = {} }
+              failed = false, walks = 0, world = nil, worlds = 0, first = {}, dropped = {},
+              missed = {} }
 local kb_text, mem_step
 do
 local MEM_EVERY_S = 60
@@ -2034,15 +2048,28 @@ local function mem_finish(job, at)
   -- FLAG_MIN_KB or more, across a world change. A drop of up to 1 KB is
   -- noise, not a drop.
   for owner, history in pairs(mem.history) do
-    -- An owner this walk did not reach (its link left the chain, or MDL
-    -- stopped the script) is judged no more (v0.13.2: its last flag used to
-    -- stay on screen for the rest of the session).
-    if job.size[owner] == nil then
+    -- An owner two walks in a row did not reach (its link left the chain,
+    -- or MDL stopped the script) is judged no more (v0.13.2: its last flag
+    -- used to stay on screen for the rest of the session). One miss is
+    -- forgiven (v0.13.3, review [11]): a mod can be out of the chain for the
+    -- few frames it takes to re-hook at a world change, and one walk
+    -- starting then wiped the history a leak needs to cross that change.
+    -- Two is the fewest that filters a one-off miss, and keeps a stale MEM
+    -- line up at most about one extra minute.
+    local missing = job.size[owner] == nil
+    if missing then
+      mem.missed[owner] = (mem.missed[owner] or 0) + 1
+    else
+      mem.missed[owner] = nil
+    end
+    if missing and mem.missed[owner] >= 2 then
       if mem.flagged[owner] ~= nil or mem.logged[owner] ~= nil then
         say(string.format("memory: %s is no longer walked; no longer flagged", owner))
       end
-      mem.history[owner], mem.flagged[owner], mem.logged[owner] = nil, nil, nil
+      mem.history[owner], mem.flagged[owner], mem.logged[owner], mem.missed[owner] = nil, nil, nil, nil
       history = {}
+    elseif missing then
+      history = {}                        -- nothing new to judge this walk; the flags stand
     end
     local count = #history
     local leak, fast = nil, nil
@@ -2065,7 +2092,7 @@ local function mem_finish(job, at)
     if leak ~= nil and mem.logged[owner] == nil then
       say(string.format("memory: %s only grows: ~%s, %s more than %d walks ago",
                         owner, kb_text(leak.kb), kb_text(leak.growth), FLAG_SPAN))
-    elseif leak == nil and mem.logged[owner] ~= nil then
+    elseif leak == nil and mem.logged[owner] ~= nil and not missing then
       say(string.format("memory: %s dropped again; no longer flagged", owner))
     end
     if job.size[owner] ~= nil then mem.logged[owner] = leak end
@@ -2092,6 +2119,7 @@ mem_step = function(at)
   if job == nil then
     if mem.next_at == nil then mem.next_at = at + MEM_EVERY_S end
     if at < mem.next_at then return end
+    if mapping ~= nil or #links == 0 then return end     -- the roots are the chain's links
     job = mem_new_job(at)
     if type(original_main_world) == "function" then
       local ok, world = pcall(original_main_world)
@@ -2106,7 +2134,7 @@ mem_step = function(at)
       if ok then mem_visit(job, registry, SHARED) end
     end
     for _, link in ipairs(links) do
-      local mod = type(link.fn) == "function" and mod_of(link.fn) or nil
+      local mod = type(link.fn) == "function" and ours[link.fn] == nil and mod_of(link.fn) or nil
       if mod ~= nil then mem_add_root(job, link.fn, mod) end
     end
     mem.job = job
@@ -2397,7 +2425,7 @@ local function report_text(key, at)
   local version = string.match(MARKER, "(v[%d%.]+)$") or MARKER
   local chain = 0
   for _, link in ipairs(links) do
-    if string.sub(tostring(link.source), 1, 5) == "mods/" then chain = chain + 1 end
+    if string.sub(tostring(link.source), 1, 5) == "mods/" or link.patch then chain = chain + 1 end
   end
   -- The session so far: the summaries written plus the minute under way.
   local partial = window.started and math.max(0, at - window.started) or 0
@@ -2960,9 +2988,15 @@ local function tick()
     -- its links still hold that frame's times (v0.12.7; it used to be
     -- dropped, no line, no count).
     if pending ~= nil then
-      local old = mapping == nil and #links > 0 and installed.settling <= 0
-      report(pending, pending.mapped and old and selfs() or nil)
-      pending = nil
+      local hitch = pending
+      pending = nil                       -- a raise below must not repeat it every tick
+      local ok_report, err = pcall(function()
+        local old = mapping == nil and #links > 0 and installed.settling <= 0
+        local frame_selfs = hitch.mapped and old and selfs() or nil
+        add_mdl(frame_selfs)              -- a stall in an MDL script goes to the script (review [12])
+        report(hitch, frame_selfs)
+      end)
+      if not ok_report then say("stall report failed: " .. tostring(err)) end
     end
     walk(start_mapping, top)
   elseif mapping ~= nil then
@@ -2987,6 +3021,10 @@ local function tick()
   end
   if frame_selfs ~= nil then charge(frame_selfs) end
 
+  if installed.entries - installed.ticked > 1 then
+    last_tick_time, pending = nil, nil      -- frames that raised below us had no tick
+  end
+  installed.ticked = installed.entries
   if last_tick_time ~= nil then
     local interval = at - last_tick_time
     window.frames = window.frames + 1
@@ -3035,10 +3073,6 @@ end
 
 -- ------------------------------------------------------------ update hook
 
-local function pack(...)
-  return { n = select("#", ...), ... }
-end
-
 local function clock()
   if App == nil or type(rawget(App, "time_since_launch")) ~= "function" then
     return nil
@@ -3074,19 +3108,20 @@ local function arm()
   installed.rearmed = false
   local current = rawget(_G, "update")
   if type(current) == "function" and current ~= installed.wrapper and
-     not update_is_live() and type(unpack_fn) == "function" then
+     not update_is_live() then
     local previous_update = current
     installed.generation = installed.generation + 1
     local generation = installed.generation
     -- Our tick runs after the frame below, then its results go back up
-    -- unchanged -- and so does an error from below (v0.12.7: it used to be
-    -- swallowed, so a mod that raised every frame silently cut off the
-    -- rest of the chain, the game's update included, and the engine never
-    -- heard of it). Every generation's copy does the same.
-    local function finish(ok, ...)
+    -- unchanged. An error from below is not caught at all (v0.13.3, review
+    -- [10]): it reaches the engine as it was raised, with its own traceback
+    -- -- v0.12.7 caught and re-raised it, so crash traces ended in this
+    -- module -- and that frame has no tick. The heartbeat is taken on the
+    -- way in, so frames that raise still show we are in the chain (no
+    -- re-arm over a mod hooked above us); the frames without a tick are
+    -- counted, so the first tick after them is no stall.
+    local function after(...)
       if installed.generation == generation then
-        installed.last_tick_at = clock()
-        installed.tick_calls = installed.mw_calls
         local started = now()
         local ok_tick, err = pcall(tick)
         installed.tick_cost = now() - started
@@ -3095,19 +3130,17 @@ local function arm()
           say("tick error: " .. tostring(err))
         end
       end
-      if not ok then
-        if not installed.told_upstream then
-          installed.told_upstream = true
-          say("the update before this one raised an error (passed on): " .. tostring((...)))
-        end
-        error((...), 0)
-      end
       return ...
     end
     local wrapper = function(...)
       frame_dt = (...)
       frame_argc = select("#", ...)
-      return finish(pcall(previous_update, ...))
+      if installed.generation == generation then
+        installed.last_tick_at = clock()
+        installed.tick_calls = installed.mw_calls
+        installed.entries = installed.entries + 1
+      end
+      return after(previous_update(...))
     end
     -- The slot our own previous lives in, found by name in our own closure.
     installed.previous_slot = nil
@@ -3115,16 +3148,28 @@ local function arm()
       local name, value = getupvalue(wrapper, index)
       if name == nil then break end
       if name == "previous_update" then
+        local target = value
+        for _ = 1, 8 do                       -- a stale spy or shim of ours: see upvalue_slots
+          if type(ours[target]) ~= "function" then break end
+          target = ours[target]
+        end
+        if target ~= value then setupvalue(wrapper, index, target) end
         installed.previous_slot = { kind = "uv", holder = wrapper, key = index,
-                                    name = name, original = value }
+                                    name = name, original = target }
       end
     end
     installed.wrapper = wrapper
     installed.last_tick_at = clock()
     installed.rearmed = true
     -- The time spent out of the chain is no frame (v0.12.7: the first tick
-    -- after a re-arm counted the whole gap as a stall).
+    -- after a re-arm counted the whole gap as a stall), and not part of the
+    -- window either (v0.13.3, review [4]: its span covered the gap, so every
+    -- mod's ms/s read low -- about half after a 30 s gap).
     last_tick_time, pending = nil, nil
+    if installed.generation > 1 then
+      live.bucket, live.ring = nil, {}
+      window = { mods = {}, started = now(), frames = 0, hitches = 0 }
+    end
     rawset(_G, "update", wrapper)
     say("update armed generation=" .. installed.generation)
   end
