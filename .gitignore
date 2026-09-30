@@ -1,0 +1,7 @@
+# Only Mod Lag Watchdog is tracked here; hd2fake is its own repository.
+/*
+!/.gitignore
+!/.gitattributes
+!/mod_lag_finder_src/
+!/build_mod_lag_finder.py
+!/test_mod_lag_finder.py
