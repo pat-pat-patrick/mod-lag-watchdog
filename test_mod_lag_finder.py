@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.13.0"
+RELEASE = "Mod Lag Watchdog v0.13.1"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1921,6 +1921,69 @@ def patch_case():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def option_names_case():
+    """Which name a mod's resources get (v0.13.1), in the layouts of the
+    user's own profile (2026-09-30 20:06, where v0.13.0 got them wrong):
+    HD2 HUD+ with six options enabled and both its scripts in COMMON;
+    Ammo Lamp with one script among several enabled options; and the
+    Megapack, one script per option folder, which keeps the option names."""
+    import json
+    print("option names")
+    scratch = tempfile.mkdtemp(prefix="mlf_options_")
+    root = os.path.join(scratch, "Arsenal Mods")
+    arsenal = os.path.join(scratch, "hd2arsenal")
+    os.makedirs(arsenal)
+
+    def archive(folder, rows):
+        os.makedirs(folder, exist_ok=True)
+        if rows:
+            with open(os.path.join(folder, "9ba626afa44a3aa3.patch_0"), "wb") as f:
+                f.write(lua_archive([src for _, src in rows], names=[n for n, _ in rows]))
+
+    def option(name, folder):
+        return {"name": name, "enabled": True, "include": [folder], "suboptions": []}
+
+    hud = os.path.join(root, "HUD_AR20")
+    archive(os.path.join(hud, "COMMON"), [("boot", "return {}"), ("mods/hd2_hud/product", "return {}")])
+    for extra in ("Compass", "Radar", "Ammo", "Health", "Colours"):
+        archive(os.path.join(hud, extra), [])              # options with no Lua in them
+    lamp = os.path.join(root, "Lamp_AR21")
+    archive(os.path.join(lamp, "Shoulder"), [("mods/test/lamp", "-- HD2-Addon: mods/test/lamp\nreturn {}\n")])
+    archive(os.path.join(lamp, "Colour"), [])
+    pack = os.path.join(root, "Pack_AR22")
+    archive(os.path.join(pack, "RowA"), [("mods/test/row_a", "-- HD2-Addon: mods/test/row_a\nreturn {}\n")])
+    archive(os.path.join(pack, "RowB"), [("mods/test/row_b", "-- HD2-Addon: mods/test/row_b\nreturn {}\n")])
+    other = os.path.join(root, "Other_AR23")
+    archive(os.path.join(other, "Core"), [("mods/test/other", "-- HD2-Addon: mods/test/other\nreturn {}\n")])
+    profile = {"label": "Test", "mods": [
+        {"label": "HD2 HUD+", "path": hud, "enabled": True,
+         "options": [option("Core", "COMMON")] + [option(x, x) for x in ("Compass", "Radar", "Ammo", "Health", "Colours")]},
+        {"label": "Ammo Lamp v0.11.0", "path": lamp, "enabled": True,
+         "options": [option("Shoulder ammo lamp", "Shoulder"), option("Colour", "Colour")]},
+        {"label": "Vanilla Plus Megapack Rows - v34", "path": pack, "enabled": True,
+         "options": [option("Enemy Collision Synchronized", "RowA"), option("Know Your Constellation Rows", "RowB")]},
+        {"label": "Other Mod", "path": other, "enabled": True, "options": [option("Core", "Core")]},
+    ]}
+    with open(os.path.join(arsenal, "hd2a_data.json"), "w", encoding="utf-8") as f:
+        json.dump({"selectedProfile": "p1", "modsList": {"p1": profile}}, f)
+    try:
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            load(s, ["finder"])
+            s.frames(5)
+            said = dict(re.findall(r"name: (\S+) = (.+)", s.file(LOG, "") or ""))
+        want = {"#f476df93691895fa": "HD2 HUD+", "#ef0157640928609f": "HD2 HUD+",
+                "mods/test/lamp": "Ammo Lamp",
+                "mods/test/row_a": "Enemy Collision Synchronized",
+                "mods/test/row_b": "Know Your Constellation Rows",
+                "mods/test/other": "Other Mod"}
+        for key, label in want.items():
+            check(said.get(key) == label, "%s is named %r: %r" % (key, label, said.get(key)))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def report_case():
     """A click on a mod's row in the escape-menu window copies that mod's
     8-line report (v0.11.0): its name, the game build and the Watchdog
@@ -1953,7 +2016,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.0, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.1, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: 1 min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -2398,6 +2461,7 @@ def main():
     bootstrap_case()
     hash_case()
     patch_case()
+    option_names_case()
     review_errors_case()
     review_remap_case()
     review_no_shutdown_case()

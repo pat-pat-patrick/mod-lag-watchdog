@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.13.0 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.13.1 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -110,7 +110,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.13.0"
+local MARKER = "mod-lag-finder-v0.13.1"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1299,11 +1299,12 @@ read_names = function()
         end
       end
       -- Which options each resource of this mod comes from.
-      local by_addon, order = {}, {}
+      local by_addon, order, lua_folders = {}, {}, 0
       for _, folder in ipairs(folders) do
         local path = mod.path .. (folder.dir ~= "" and ("\\" .. folder.dir) or "") .. "\\" .. LUA_ARCHIVE
         local addons = archive_addons(path)
         if addons ~= nil then archives = archives + 1 end
+        if addons ~= nil and #addons > 0 then lua_folders = lua_folders + 1 end
         for _, entry in ipairs(addons or {}) do
           hashes[entry.key] = true
           hashes[entry.row] = true
@@ -1315,13 +1316,17 @@ read_names = function()
           by_addon[entry.key][tostring(folder.option)] = folder.option
         end
       end
-      -- The mod's name; when the mod has several enabled option folders, a
-      -- resource found in only one of them takes that option's name (the
-      -- Megapack's rows). v0.13.0: several resources in a single folder all
-      -- keep the mod's name (HD2 HUD+'s "boot" and "mods/hd2_hud/product").
+      -- The mod's name; when the mod's several resources come from different
+      -- option folders, a resource found in only one of them takes that
+      -- option's name (the Megapack's rows). One resource (Ammo Lamp,
+      -- Helmet Headlamp), or several in a single folder (HD2 HUD+'s "boot"
+      -- and "mods/hd2_hud/product" in COMMON, with 5 more options enabled),
+      -- keep the mod's name. (v0.13.0 went by enabled folders alone and
+      -- named HUD+ "Core" and Ammo Lamp "Shoulder ammo lamp" in game,
+      -- 2026-09-30 20:06.)
       for _, key in ipairs(order) do
         local label = mod.label
-        if #folders > 1 then
+        if #order > 1 and lua_folders > 1 then
           local only, count = nil, 0
           for _, option in pairs(by_addon[key]) do
             only, count = option, count + 1
