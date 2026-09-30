@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.13.4 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.14.0 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -54,6 +54,9 @@
 --     mission, all still logged. Saved as the 4th number of the window file.
 --   * on the escape menu every mod is listed, those under 10 ms/s in grey
 --     (v0.12.2); in missions they are only counted
+--   * a mod that keeps raising Lua errors (v0.14.0; see "blame"): named in
+--     the log every minute, an amber "ERROR <name> N frames/min" window
+--     line, and once per mod an alert in missions
 --   * the slowest log write of the last 30 s, in the window and in the 60 s
 --     summary (v0.4.1; GameGuard's CPU, shown next to it in v0.4.1, was
 --     taken out in v0.5.0)
@@ -110,7 +113,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.13.4"
+local MARKER = "mod-lag-finder-v0.14.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -201,6 +204,9 @@ local AMBER_MSS = 50
 -- gives the process, it shows in play at most once every GPU_ALERT_QUIET_S.
 local GPU_SAMPLE_S = 1
 local GPU_ALERT_QUIET_S = 60
+-- A mod that raised a Lua error in this many frames within one summary
+-- minute gets its alert in missions, once a session (v0.14.0).
+local ERROR_ALERT_FRAMES = 60
 local gpu = { read = nil, last = nil, next_at = 0, alerted = nil, minute = nil, libraries = {} }
 local QUIET_WORST_MS = 10
 local REFRESH_S = 1
@@ -463,7 +469,7 @@ end
 
 -- ------------------------------------------------------------- the frame
 
-local frame_dt, frame_argc = nil, 0
+local frame_dt, frame_argc, frame_no = nil, 0, 0
 
 -- A pass-through spy: records its arguments, then tail-calls the original,
 -- so it adds no stack frame and returns exactly what the original returns.
@@ -494,15 +500,20 @@ local function make_timer(rec, target)
   return timer
 end
 
--- The shim a mapped link keeps: its duration, this frame and the last.
+-- The shim a mapped link keeps: its duration, this frame and the last, and
+-- the frame it was last entered and last returned in (v0.14.0: a link
+-- entered and not returned in a frame that did not finish is where a Lua
+-- error came from).
 local function make_shim(link, target)
   local function finish(t0, ...)
     local took = timer_now() - t0
     link.prev_incl = link.last_incl
     link.last_incl = took
+    link.done = frame_no
     return ...
   end
   local shim = function(...)
+    link.entered = frame_no
     return finish(timer_now(), target(...))
   end
   ours[shim] = target
@@ -517,7 +528,7 @@ local installed = { wrapper = nil, generation = 0, last_tick_at = nil,
                     told_upstream = false, told_tick = false,
                     previous_slot = nil, bootstrap = nil, bootstrap_slot = nil,
                     settling = 0, shutdown_done = false, entries = 0, ticked = 0,
-                    owed = false, unfinished = 0,
+                    owed = false, errors = {}, errors_session = {}, error_told = {},
                     -- v0.13.0: the resource-name hashes of every Lua resource
                     -- in the enabled mods' archives (nil when no Arsenal list
                     -- was read), and the pure-Lua murmur64 that matches them.
@@ -998,11 +1009,13 @@ local function write_summary(at)
                       r.row.time * 1000 / math.max(window.frames, 1), ms1(r.row.worst)))
   end
   say(string.format("  log write worst %.0f ms", writes_worst() * 1000))
-  if installed.unfinished > 0 then
-    say(string.format("  errors: %d frames did not finish below this module (a mod below raised an error;"
-                      .. " the game's own log names it)", installed.unfinished))
-    installed.unfinished = 0
+  local raised = {}
+  for key, n in pairs(installed.errors) do raised[#raised + 1] = { key = key, n = n } end
+  table.sort(raised, function(a, b) return a.n > b.n end)
+  for _, e in ipairs(raised) do
+    say(string.format("  errors: %s raised a Lua error in %d frames", e.key, e.n))
   end
+  installed.errors = {}
   local g = gpu.minute
   if g ~= nil and g.n > 0 then
     say(string.format("  vram: max %.2f of %.2f GB budget; read worst %.3f ms",
@@ -2479,8 +2492,10 @@ local function report_text(key, at)
     stall_text,
     memory_text,
     units_text,
-    string.format("Update hook: hooked %d time%s, %s", copies, copies == 1 and "" or "s",
-                  on_top and "on top (its own time not measured)" or "not on top"),
+    string.format("Update hook: hooked %d time%s, %s%s", copies, copies == 1 and "" or "s",
+                  on_top and "on top (its own time not measured)" or "not on top",
+                  (installed.errors_session[key] or 0) > 0
+                    and string.format("; Lua errors in %d frames", installed.errors_session[key]) or ""),
   }
   return ascii(table.concat(lines, "\r\n"))
 end
@@ -2602,6 +2617,14 @@ local function panel_lines(at)
   end
   for mod, flag in pairs(units.flagged) do
     out[#out + 1] = { string.format("UNITS %s %d old units, still rising", short_name(mod), flag.old), AMBER }
+  end
+  local raised = {}
+  for _, bucket in ipairs(buckets) do
+    for key, n in pairs(bucket.errors or {}) do raised[key] = (raised[key] or 0) + n end
+  end
+  for key, n in pairs(raised) do
+    out[#out + 1] = { string.format("ERROR %s %.0f frames/min", short_name(key), n * 60 / math.max(seconds, 1)),
+                      AMBER }
   end
   if last_stall ~= nil then
     out[#out + 1] = { string.format("last stall %s ms %s, %.0f s ago", ms(last_stall.ms),
@@ -3142,6 +3165,40 @@ local function arm()
       end
       return ...
     end
+    -- "blame": which link raised in a frame that did not finish -- the
+    -- deepest link below us that its shim saw entered in that frame and not
+    -- returned (v0.14.0; the user: the tool exists because mod quality
+    -- varies, so name the mod). Whether it raised before or after calling
+    -- the rest of the chain, that link is the one; the links between us and
+    -- it were entered too, but sit above it. While the chain is being
+    -- mapped there are no stamps, and the error is put on "below".
+    local function blame(frame)
+      local key = nil
+      if mapping == nil and our_index ~= nil then
+        for index = #links, our_index + 1, -1 do
+          local link = links[index]
+          if link.entered == frame and link.done ~= frame then
+            key = owner(link)
+            break
+          end
+        end
+      end
+      key = key or "(below this module, chain not mapped)"
+      installed.errors[key] = (installed.errors[key] or 0) + 1
+      installed.errors_session[key] = (installed.errors_session[key] or 0) + 1
+      if live.bucket ~= nil then
+        live.bucket.errors = live.bucket.errors or {}
+        live.bucket.errors[key] = (live.bucket.errors[key] or 0) + 1
+      end
+      if installed.errors[key] >= ERROR_ALERT_FRAMES and not installed.error_told[key]
+         and (toast == nil or now() >= toast.until_at) then
+        installed.error_told[key] = true
+        toast = { text = string.format("ERROR %s keeps raising Lua errors", short_name(key)),
+                  until_at = now() + 8, colour = AMBER }
+        ui.dirty = true
+        say("errors: " .. key .. " keeps raising Lua errors")
+      end
+    end
     -- A frame that raised below us never reaches after(): its tick is run at
     -- the start of the next frame instead (v0.13.4). v0.13.3 had no tick at
     -- all while a mod below raised every frame -- no window on Home, no
@@ -3153,9 +3210,10 @@ local function arm()
       frame_argc = select("#", ...)
       if installed.generation == generation then
         if installed.owed then
-          installed.unfinished = installed.unfinished + 1
+          pcall(blame, frame_no)
           run_tick()
         end
+        frame_no = frame_no + 1
         installed.owed = true
         installed.last_tick_at = clock()
         installed.tick_calls = installed.mw_calls

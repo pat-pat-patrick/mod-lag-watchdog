@@ -24,7 +24,7 @@ TEMPLATE = os.path.join(HERE, "lua_archive_template.bin")
 ADDON = "mods/patpatpatrick/mod_lag_finder"
 LUA_T = 0xA14E8DFA2CD117E2
 PAYLOAD_FLAG = 2
-VERSION = "v0.13.4"
+VERSION = "v0.14.0"
 MOD = "Mod Lag Watchdog"
 # A build is a local test build unless the user says it goes to Nexus (the
 # user, 2026-09-30): then the release name has no "Nexus" and the manifest
@@ -64,6 +64,7 @@ Shows which Lua mod is making your game stutter.
 - Click a mod in that window to copy a short report for its author.
 - If the game uses more video memory than Windows gives it (which causes
   stutter), a line says so.
+- If a mod keeps raising Lua errors, a line names it.
 
 The pause-menu window needs the game version this release was made for.
 After a game update, Home still works.

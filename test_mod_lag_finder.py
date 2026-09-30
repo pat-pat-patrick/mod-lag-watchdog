@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.13.4"
+RELEASE = "Mod Lag Watchdog v0.14.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -2410,14 +2410,85 @@ def late_error_case():
         check(re.search(r"last \d+ s: frame", shown) is not None, "Home opens the window: %r" % shown)
         check(bool(log_lines(s, r"hitch 4\d\d ms")), "slow's 400 ms stall is still seen: %r" % log_lines(s, "hitch")[:2])
         s.frames(3600)
-        check(bool(log_lines(s, r"errors: \d{3,} frames did not finish below this module")),
-              "the summary counts the frames that did not finish: %r" % log_lines(s, "errors:")[:1])
+        check(bool(log_lines(s, r"errors: mods/test/late raised a Lua error in \d{3,} frames")),
+              "the summary names the mod and counts its frames (v0.14.0): %r" % log_lines(s, "errors:")[:2])
         r = s.report()
         late = [u for u in r["uncaught"] if "late broke" in u["error"]]
         check(len(late) >= 3900, "the error still reaches the engine every frame: %d" % len(late))
         counts = s.eval("string.format('%d %d', COUNTS.heavy or 0, FAKE.frame)")
         heavy, frames = (int(v) for v in counts.split())
         check(heavy == frames, "the chain below still runs every frame: heavy %d of %d" % (heavy, frames))
+
+
+# Raises before it calls the rest of the chain, from ERR_FROM on.
+EARLY_THROWER = r"""
+local previous = rawget(_G, "update")
+local n = 0
+rawset(_G, "update", function(...)
+  n = n + 1
+  if n >= (ERR_FROM or 1e9) then error("early broke", 0) end
+  return previous(...)
+end)
+"""
+# Raises after the rest of the chain ran, once every 100 frames.
+RARE_THROWER = r"""
+local previous = rawget(_G, "update")
+local n = 0
+rawset(_G, "update", function(...)
+  n = n + 1
+  local result = previous(...)
+  if n % 100 == 0 then error("rare broke", 0) end
+  return result
+end)
+"""
+
+
+def blame_case():
+    """Which mod raises (v0.14.0). A mod in the middle of the chain that
+    raises every frame after its chain ran is named -- not the mods above
+    it, which it cut short, nor the ones below: in the log every minute, an
+    amber ERROR line in the window, and one alert in missions. One that
+    raises before calling on is named just the same. One that raises once
+    every 100 frames is logged but gets no alert. Fails on v0.13.4."""
+    print("blame")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["std"])                                    # below the thrower
+        check(s.load_mod(source=LATE_THROWER, name="mods/test/late"), "late loads")
+        load(s, ["heavy", "finder"])                        # heavy above it
+        s.frames(400)
+        shown = s.eval("SHOWN()")
+        check("ERROR late keeps raising Lua errors" in shown, "one alert in missions names it: %r" % shown)
+        s.frames(600)
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        check(re.search(r"ERROR late \d+ frames/min", shown) is not None and "ERROR heavy" not in shown
+              and "ERROR std" not in shown, "the window names it, and only it: %r" % shown)
+        s.frames(3000)
+        told = log_lines(s, r"errors: .* keeps raising Lua errors")
+        check(len(told) == 1 and "mods/test/late" in told[0], "the alert is given once: %r" % told)
+        named = log_lines(s, r"errors: (\S+) raised a Lua error in \d+ frames")
+        check(bool(named) and all("mods/test/late " in l for l in named),
+              "the minute summaries name only it: %r" % named[:3])
+    with session() as s:
+        load(s, ["std"])                                    # below (std would swallow it from above)
+        check(s.load_mod(source=EARLY_THROWER, name="mods/test/early"), "early loads")
+        load(s, ["heavy", "finder"])
+        s.frames(400)                                       # mapped before it starts
+        s.lua("ERR_FROM = 0")
+        s.frames(3800)
+        named = log_lines(s, r"errors: (\S+) raised a Lua error in \d+ frames")
+        check(bool(named) and all("mods/test/early " in l for l in named),
+              "raising before it calls on, it is named just the same: %r" % named[:3])
+    with session() as s:
+        s.lua(GUI_STUB)
+        check(s.load_mod(source=RARE_THROWER, name="mods/test/rare"), "rare loads")
+        load(s, ["heavy", "finder"])
+        s.frames(3900)
+        named = log_lines(s, r"errors: mods/test/rare raised a Lua error in \d+ frames")
+        check(bool(named), "an error every 100 frames is logged: %r" % log_lines(s, "errors:")[:2])
+        check(not log_lines(s, r"keeps raising Lua errors"), "but gets no alert: %r" % log_lines(s, "keeps raising"))
 
 
 def report_case():
@@ -2452,7 +2523,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.4, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.14\.0, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: 1 min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -2908,6 +2979,7 @@ def main():
     review_mem_miss_case()
     review_builder_case()
     late_error_case()
+    blame_case()
     review_errors_case()
     review_remap_case()
     review_no_shutdown_case()
