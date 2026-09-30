@@ -1,13 +1,19 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.12.6 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.12.7 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
--- Native calls, all through LuaJIT's ffi and all read-only: kernel32's
--- QueryPerformanceCounter (the timer, v0.8.0; see "timer") and
--- ReadProcessMemory on this process only, 2 reads a frame (5 while the escape
--- menu is up) of the game's UI state to see the escape menu (below). It never
--- writes memory. Once a second (v0.12.1): dxgi's QueryVideoMemoryInfo for this
--- process's video memory and the budget Windows gives it (read-only).
+-- Native calls, all through LuaJIT's ffi, each bound once at load:
+--   * kernel32's QueryPerformanceCounter, the timer (v0.8.0; see "timer");
+--   * ReadProcessMemory on this process only, 2 reads of a few bytes a frame
+--     (5 while the escape menu is up) of the game's UI state, to see the
+--     escape menu (below);
+--   * once a second, dxgi's QueryVideoMemoryInfo: this process's video memory
+--     and the budget Windows gives it (v0.12.1);
+--   * only when the player clicks a mod's row: user32's clipboard calls
+--     (OpenClipboard, EmptyClipboard, SetClipboardData, CloseClipboard) and
+--     kernel32's GlobalAlloc/GlobalLock/GlobalUnlock/GlobalFree for the text
+--     handed to the clipboard (v0.11.0; see "report").
+-- The first three only read. None of them writes to the game's memory.
 -- (Up to v0.7.1 this line said "makes no native call", which
 -- was wrong since the menu window came in v0.3.0.) It times how long each mod's update
 -- takes every frame and writes %APPDATA%\Arrowhead\Helldivers2\
@@ -104,7 +110,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.12.6"
+local MARKER = "mod-lag-finder-v0.12.7"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -498,7 +504,8 @@ local installed = { wrapper = nil, generation = 0, last_tick_at = nil,
                     mw_calls = 0, tick_calls = 0,
                     shutdown_wrapper = nil, rearmed = false,
                     told_upstream = false, told_tick = false,
-                    previous_slot = nil, bootstrap = nil, bootstrap_slot = nil }
+                    previous_slot = nil, bootstrap = nil, bootstrap_slot = nil,
+                    settling = 0, shutdown_done = false }
 
 local links = {}              -- mapped chain, top first
 local our_index = nil         -- our wrapper's place in it
@@ -594,8 +601,11 @@ end
 
 local function avoid_set()
   local avoid = {}
-  avoid[rawget(_G, "update")] = true
-  avoid[rawget(_G, "shutdown")] = true
+  -- Either can be nil (a game without shutdown): a nil key would raise, and
+  -- the walk would stay half-built for the session (v0.12.7).
+  local update, shutdown = rawget(_G, "update"), rawget(_G, "shutdown")
+  if update ~= nil then avoid[update] = true end
+  if shutdown ~= nil then avoid[shutdown] = true end
   for _, link in ipairs(mapping.links) do avoid[link.fn] = true end
   return avoid
 end
@@ -778,6 +788,10 @@ local function step_mapping()
 end
 
 finish_mapping = function(why)
+  -- A link adopted this tick has no finished frame yet, and one adopted a
+  -- tick ago has only one: until every shim has run twice, the link above
+  -- the newest would be charged the whole frame below it (v0.12.7).
+  installed.settling = 2
   -- Our start-up hook is walked through (its previous is timed by the shim
   -- in its slot) but kept out of the chain: the link above it then counts
   -- its few microseconds, and chains read as they did before v0.12.5.
@@ -2780,21 +2794,44 @@ local function tick()
   roll(at)
   if at - flushed_at >= FLUSH_S then flush_log() end
 
+  -- A walk that raises is undone and waits for the next chain change,
+  -- rather than failing every frame half-built (v0.12.7).
+  local function walk(fn, arg)
+    local ok, err = pcall(fn, arg)
+    if not ok then
+      pcall(restore_all)
+      say("chain walk failed, stopped until the chain changes: " .. tostring(err))
+    end
+  end
   local top = rawget(_G, "update")
   if top ~= mapped_top then
     if mapped_top ~= nil and (last_change_note == nil or at - last_change_note > 10) then
       last_change_note = at
       say("update chain changed; mapping again")
     end
-    pending = nil
-    start_mapping(top)
+    -- A stall seen last tick is reported now, on the chain it happened in:
+    -- its links still hold that frame's times (v0.12.7; it used to be
+    -- dropped, no line, no count).
+    if pending ~= nil then
+      local old = mapping == nil and #links > 0 and installed.settling <= 0
+      report(pending, pending.mapped and old and selfs() or nil)
+      pending = nil
+    end
+    walk(start_mapping, top)
   elseif mapping ~= nil then
-    step_mapping()
+    walk(step_mapping)
   end
 
   local heap = heap_kb()
   local mapped = mapping == nil and #links > 0
-  local frame_selfs = mapped and selfs() or nil
+  local frame_selfs = nil
+  if mapped then
+    if installed.settling > 0 then
+      installed.settling = installed.settling - 1
+    else
+      frame_selfs = selfs()
+    end
+  end
   add_mdl(frame_selfs)
 
   if pending ~= nil then
@@ -2894,30 +2931,36 @@ local function arm()
     local previous_update = current
     installed.generation = installed.generation + 1
     local generation = installed.generation
-    local wrapper = function(...)
-      frame_dt = (...)
-      frame_argc = select("#", ...)
-      local results = pack(pcall(previous_update, ...))
+    -- Our tick runs after the frame below, then its results go back up
+    -- unchanged -- and so does an error from below (v0.12.7: it used to be
+    -- swallowed, so a mod that raised every frame silently cut off the
+    -- rest of the chain, the game's update included, and the engine never
+    -- heard of it). Every generation's copy does the same.
+    local function finish(ok, ...)
       if installed.generation == generation then
         installed.last_tick_at = clock()
         installed.tick_calls = installed.mw_calls
         local started = now()
-        local ok, err = pcall(tick)
+        local ok_tick, err = pcall(tick)
         installed.tick_cost = now() - started
-        if not ok and not installed.told_tick then
+        if not ok_tick and not installed.told_tick then
           installed.told_tick = true
           say("tick error: " .. tostring(err))
         end
       end
-      if results[1] ~= true then
+      if not ok then
         if not installed.told_upstream then
           installed.told_upstream = true
-          say("the update before this one raised an error: " ..
-              tostring(results[2]))
+          say("the update before this one raised an error (passed on): " .. tostring((...)))
         end
-      elseif results.n > 1 then
-        return unpack_fn(results, 2, results.n)
+        error((...), 0)
       end
+      return ...
+    end
+    local wrapper = function(...)
+      frame_dt = (...)
+      frame_argc = select("#", ...)
+      return finish(pcall(previous_update, ...))
     end
     -- The slot our own previous lives in, found by name in our own closure.
     installed.previous_slot = nil
@@ -2932,15 +2975,21 @@ local function arm()
     installed.wrapper = wrapper
     installed.last_tick_at = clock()
     installed.rearmed = true
+    -- The time spent out of the chain is no frame (v0.12.7: the first tick
+    -- after a re-arm counted the whole gap as a stall).
+    last_tick_time, pending = nil, nil
     rawset(_G, "update", wrapper)
     say("update armed generation=" .. installed.generation)
   end
   local current_shutdown = rawget(_G, "shutdown")
-  if type(current_shutdown) == "function" and
-     (installed.rearmed or installed.shutdown_wrapper == nil) and
-     current_shutdown ~= installed.shutdown_wrapper then
+  -- Wrapped once a session (v0.12.7: every re-arm stacked another wrapper
+  -- when a mod had wrapped shutdown over ours, and the summary ran k+1
+  -- times at exit); the flag keeps any copy from doing it twice.
+  if type(current_shutdown) == "function" and installed.shutdown_wrapper == nil then
     local previous_shutdown = current_shutdown
     local wrapper = function(...)
+      if installed.shutdown_done then return previous_shutdown(...) end
+      installed.shutdown_done = true
       pcall(function()
         write_summary(now())
         say(session_line("game over"))
