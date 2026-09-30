@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.12.7 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.13.0 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -110,7 +110,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.12.7"
+local MARKER = "mod-lag-finder-v0.13.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -505,7 +505,11 @@ local installed = { wrapper = nil, generation = 0, last_tick_at = nil,
                     shutdown_wrapper = nil, rearmed = false,
                     told_upstream = false, told_tick = false,
                     previous_slot = nil, bootstrap = nil, bootstrap_slot = nil,
-                    settling = 0, shutdown_done = false }
+                    settling = 0, shutdown_done = false,
+                    -- v0.13.0: the resource-name hashes of every Lua resource
+                    -- in the enabled mods' archives (nil when no Arsenal list
+                    -- was read), and the pure-Lua murmur64 that matches them.
+                    archive_hashes = nil, name_hash = nil, hash_of = nil }
 
 local links = {}              -- mapped chain, top first
 local our_index = nil         -- our wrapper's place in it
@@ -622,20 +626,36 @@ local function name_score(name)
   return 0
 end
 
--- A mod that replaced the game's boot script runs under the game's own
--- source name (HD2 HUD+ 0.1.12: chunk "boot", its wrapper at boot:142 keeps
--- the game's update in an upvalue named "original"; seen in the user's log
--- 2026-09-30 as the chain's bottom, so its cost was shown as "(the game)").
--- So the first link that is not "mods/..." is tested once before it counts
--- as the game: only upvalues named like a stored previous are watched, with
--- the usual dt test. The game's own code is compiled with no names, so it is
--- never spied on (evidence: likely -- verify in game with HUD+ 0.1.12).
+-- The first link that is not "mods/..." is the game -- unless a mod ships a
+-- Lua resource under that name (v0.13.0). A chunk's source name is its
+-- resource name, and an archive's file table holds murmur64 of every
+-- resource name (proven 2026-09-30: 58 of 58 HD2-Addon rows, and HD2 HUD+'s
+-- "boot" f476df93691895fa and "mods/hd2_hud/product" ef0157640928609f).
+-- HD2 HUD+ 0.1.12 hooks update from its own copy of "boot", so that link is
+-- in HUD+'s archive: it is walked like any mod's link, with the usual dt test
+-- on all its upvalues and fields. The game's own scripts are in no mod
+-- archive (likely: archives carry only what a mod ships). A patch wraps the
+-- game's script of the same name, so a second link of that name is the game
+-- (likely; HUD+ loads the original boot as stripped bytecode under no name,
+-- so there it never comes up). With no Arsenal list read (another manager,
+-- a manual install), the v0.12.4 probe is kept: a link that is not "mods/"
+-- is tested once, watching only upvalues named like a stored previous (the
+-- game's own code is compiled with no names, so it is never spied on).
 -- (The hint test lives inside begin_step: the main chunk is at Lua's
 -- 200-locals limit.)
 local function begin_step()
   local link = mapping.links[#mapping.links]
   if #mapping.links >= MAX_LINKS then return finish_mapping("link limit") end
-  if mapping.seen_mods and not is_mod_source(link.source) then
+  local known = installed.archive_hashes
+  if mapping.seen_mods and not is_mod_source(link.source) and known ~= nil then
+    if known[installed.hash_of(link.source)] and not mapping.patched[link.source] then
+      mapping.patched[link.source] = true
+      link.patch = true
+    else
+      link.bottom = "game"
+      return finish_mapping("reached the game")
+    end
+  elseif mapping.seen_mods and not is_mod_source(link.source) then
     local named = {}
     for _, slot in ipairs(upvalue_slots(link.fn, avoid_set())) do
       local lower = string.lower(slot.name or "")
@@ -669,7 +689,7 @@ local function begin_step()
   end
   local slots = upvalue_slots(link.fn, avoid_set())
   mapping.phase = "upvalues"
-  if #slots == 0 and is_mod_source(link.source) then
+  if #slots == 0 and (is_mod_source(link.source) or link.patch) then
     slots = field_slots(link.fn, avoid_set())
     mapping.phase = "fields"
   end
@@ -767,7 +787,7 @@ local function step_mapping()
     link.bottom = "game"
     return finish_mapping("reached the game")
   end
-  if mapping.phase == "upvalues" and is_mod_source(link.source) then
+  if mapping.phase == "upvalues" and (is_mod_source(link.source) or link.patch) then
     local fields = field_slots(link.fn, avoid_set())
     if #fields > 0 then
       mapping.phase, mapping.slots, mapping.frames = "fields", fields, 0
@@ -777,7 +797,7 @@ local function step_mapping()
   end
   -- Once more before giving up on a mod's link: one watch can miss (a mod
   -- that skipped its previous for a frame).
-  if is_mod_source(link.source) and not mapping.retried then
+  if (is_mod_source(link.source) or link.patch) and not mapping.retried then
     mapping.retried = true
     return begin_step()
   end
@@ -841,6 +861,7 @@ finish_mapping = function(why)
     if link.tie then notes[#notes + 1] = "chosen of " .. link.tie .. " by time" end
     if link.bottom then notes[#notes + 1] = "bottom: " .. link.bottom end
     if link.boot_patch then notes[#notes + 1] = "boot patch: a mod in the game's boot script" end
+    if link.patch then notes[#notes + 1] = "a mod's own copy of a game script (in its archive)" end
     say(string.format("  #%d %s via %s%s", index, link_label(link),
                       link.upname == "" and "(stripped)" or link.upname,
                       #notes > 0 and ("  [" .. table.concat(notes, "; ") .. "]") or ""))
@@ -850,7 +871,7 @@ end
 local function start_mapping(top)
   restore_all()
   mapped_top = top
-  mapping = { links = { new_link(top, nil) }, seen_mods = false }
+  mapping = { links = { new_link(top, nil) }, seen_mods = false, patched = {} }
   begin_step()
 end
 
@@ -1107,11 +1128,87 @@ local function le(bytes, at, size)
   return n
 end
 
--- The addon names the Lua resources in one archive declare; nil when there
--- is no such file.
-local BOOT_PATCH_READ = 4096
-local boot_names = {}            -- names found in boot patches: all of one mod, so they may share a label
+-- MurmurHash64A, seed 0, as the game and the SDK hash resource names
+-- (hashing.murmur64_hash in hd2_diag; the builders write it into every file
+-- row). Pure Lua on four 16-bit limbs: no ffi, and bit.bxor only when there
+-- is a bit library. It runs at load and once per chain source (cached).
+local function murmur64(text)
+  local bit_lib = rawget(_G, "bit")
+  local bxor = type(bit_lib) == "table" and bit_lib.bxor or nil
+  local function xor16(a, b)
+    if bxor ~= nil then return bxor(a, b) end
+    local r, p = 0, 1
+    for _ = 1, 16 do
+      local x, y = a % 2, b % 2
+      if x ~= y then r = r + p end
+      a, b, p = (a - x) / 2, (b - y) / 2, p * 2
+    end
+    return r
+  end
+  local function mul(a, b)
+    local r0 = a[1] * b[1]
+    local r1 = a[1] * b[2] + a[2] * b[1]
+    local r2 = a[1] * b[3] + a[2] * b[2] + a[3] * b[1]
+    local r3 = a[1] * b[4] + a[2] * b[3] + a[3] * b[2] + a[4] * b[1]
+    local c = math.floor(r0 / 65536)
+    r0 = r0 % 65536
+    r1 = r1 + c
+    c = math.floor(r1 / 65536)
+    r1 = r1 % 65536
+    r2 = r2 + c
+    c = math.floor(r2 / 65536)
+    r2 = r2 % 65536
+    r3 = (r3 + c) % 65536
+    return { r0, r1, r2, r3 }
+  end
+  local function xor64(a, b)
+    return { xor16(a[1], b[1]), xor16(a[2], b[2]), xor16(a[3], b[3]), xor16(a[4], b[4]) }
+  end
+  local function shr47(a)
+    return { math.floor(a[3] / 32768) + (a[4] % 32768) * 2, math.floor(a[4] / 32768), 0, 0 }
+  end
+  local M = { 0xe995, 0x5bd1, 0xa793, 0xc6a4 }          -- 0xc6a4a7935bd1e995
+  local n = #text
+  local h = mul(M, { n % 65536, math.floor(n / 65536) % 65536, 0, 0 })
+  local blocks = n - n % 8
+  for at = 1, blocks, 8 do
+    local b1, b2, b3, b4, b5, b6, b7, b8 = string.byte(text, at, at + 7)
+    local k = { b1 + b2 * 256, b3 + b4 * 256, b5 + b6 * 256, b7 + b8 * 256 }
+    k = mul(k, M)
+    k = xor64(k, shr47(k))
+    k = mul(k, M)
+    h = mul(xor64(h, k), M)
+  end
+  local tail = n % 8
+  for i = tail - 1, 0, -1 do
+    local limb = math.floor(i / 2) + 1
+    local byte = string.byte(text, blocks + i + 1)
+    h[limb] = xor16(h[limb], i % 2 == 1 and byte * 256 or byte)
+  end
+  if tail >= 1 then h = mul(h, M) end
+  h = xor64(h, shr47(h))
+  h = mul(h, M)
+  h = xor64(h, shr47(h))
+  return string.format("%04x%04x%04x%04x", h[4], h[3], h[2], h[1])
+end
+installed.name_hash = murmur64
+local hash_cache = {}
+installed.hash_of = function(text)
+  local hash = hash_cache[text]
+  if hash == nil then
+    hash = murmur64(tostring(text))
+    hash_cache[text] = hash
+  end
+  return hash
+end
+-- Only a test sets this, to check the hash against the SDK's.
+if rawget(_G, "__mlf_test_hash") == true then rawset(_G, "__mlf_test_hash", murmur64) end
 
+-- The Lua resources in one archive: { key = name hash, readable = addon
+-- name or nil }. The key is murmur64 of the HD2-Addon name when the resource
+-- declares one (the same value its file row holds, 58 of 58 on 2026-09-30),
+-- else the row's own name hash (HD2 HUD+'s "boot" and "mods/hd2_hud/product"
+-- have no such line). nil when there is no such file.
 local function archive_addons(path)
   local file = io.open(path, "rb")
   if file == nil then return nil end
@@ -1126,29 +1223,13 @@ local function archive_addons(path)
     for index = 0, files - 1 do
       local row = types * 32 + index * 80 + 1
       if string.sub(tables, row + 8, row + 15) == LUA_TYPE then
+        local digits = {}
+        for k = 7, 0, -1 do digits[#digits + 1] = string.format("%02x", string.byte(tables, row + k)) end
+        local row_hash = table.concat(digits)
         file:seek("set", le(tables, row + 16, 8))
         local start = file:read(160) or ""
         local addon = string.match(start, "^........%-%- HD2%-Addon:%s*([%w_%-%./]+)")
-        if addon ~= nil then found[#found + 1] = addon end
-        -- A boot patch (HD2 HUD+: "local __original_boot = <the game's boot
-        -- as bytecode>", then its own code) has no HD2-Addon line. Its
-        -- "mods/..." names are its modules (0.1.13 requires
-        -- "mods/hd2_hud/product" ~1.3 KB in), and "boot" is its own source
-        -- when it hooks update in the boot script itself (0.1.12).
-        if addon == nil and string.match(start, "^........local __original_boot") then
-          file:seek("set", le(tables, row + 16, 8))
-          local more = file:read(BOOT_PATCH_READ) or ""
-          local named = {}
-          for name in string.gmatch(more, "\"(mods/[%w_/%-%.]+)\"") do
-            if not named[name] then
-              named[name] = true
-              boot_names[name] = true
-              found[#found + 1] = name
-            end
-          end
-          boot_names["boot (boot patch)"] = true
-          found[#found + 1] = "boot (boot patch)"
-        end
+        found[#found + 1] = { key = addon and murmur64(addon) or row_hash, row = row_hash, readable = addon }
       end
     end
   end)
@@ -1196,7 +1277,8 @@ read_names = function()
   local profile = type(data.modsList) == "table" and data.modsList[data.selectedProfile or "default"]
   if type(profile) ~= "table" or type(profile.mods) ~= "table" then return "no active Arsenal profile" end
   local seen, archives = {}, 0
-  for _, mod in ipairs(profile.mods) do
+  local hashes, readable, owner_of = {}, {}, {}
+  for mod_index, mod in ipairs(profile.mods) do
     if type(mod) == "table" and mod.enabled == true and type(mod.path) == "string" then
       local folders = {}
       local function add(option)
@@ -1216,64 +1298,70 @@ read_names = function()
           end
         end
       end
-      -- Which options each addon of this mod comes from.
+      -- Which options each resource of this mod comes from.
       local by_addon, order = {}, {}
       for _, folder in ipairs(folders) do
         local path = mod.path .. (folder.dir ~= "" and ("\\" .. folder.dir) or "") .. "\\" .. LUA_ARCHIVE
         local addons = archive_addons(path)
         if addons ~= nil then archives = archives + 1 end
-        for _, addon in ipairs(addons or {}) do
-          if by_addon[addon] == nil then
-            by_addon[addon] = {}
-            order[#order + 1] = addon
+        for _, entry in ipairs(addons or {}) do
+          hashes[entry.key] = true
+          hashes[entry.row] = true
+          if entry.readable ~= nil then readable[entry.key] = entry.readable end
+          if by_addon[entry.key] == nil then
+            by_addon[entry.key] = {}
+            order[#order + 1] = entry.key
           end
-          by_addon[addon][tostring(folder.option)] = folder.option
+          by_addon[entry.key][tostring(folder.option)] = folder.option
         end
       end
-      -- One addon: the mod's name. Several: the option an addon alone comes
-      -- from (the Megapack's rows), else the mod's name. A boot patch's
-      -- names are all the mod itself.
-      local real = 0
-      for _, addon in ipairs(order) do
-        if not boot_names[addon] then real = real + 1 end
-      end
-      for _, addon in ipairs(order) do
+      -- The mod's name; when the mod has several enabled option folders, a
+      -- resource found in only one of them takes that option's name (the
+      -- Megapack's rows). v0.13.0: several resources in a single folder all
+      -- keep the mod's name (HD2 HUD+'s "boot" and "mods/hd2_hud/product").
+      for _, key in ipairs(order) do
         local label = mod.label
-        if real > 1 and not boot_names[addon] then
+        if #folders > 1 then
           local only, count = nil, 0
-          for _, option in pairs(by_addon[addon]) do
+          for _, option in pairs(by_addon[key]) do
             only, count = option, count + 1
           end
           if count == 1 and type(only) == "string" then label = only end
         end
         local clean = clean_label(label) or false
-        if seen[addon] == nil then
-          seen[addon] = clean
-        elseif seen[addon] ~= clean then
-          seen[addon] = false              -- two mods claim it: keep the short name
+        if seen[key] == nil then
+          seen[key], owner_of[key] = clean, mod_index
+        elseif seen[key] ~= clean then
+          seen[key] = false                -- two mods claim it: keep the short name
         end
       end
     end
   end
-  -- Two addons under the same name keep their short names -- except the
-  -- names of one boot patch, which all belong to its mod.
+  installed.archive_hashes = hashes
+  -- Two mods under the same name keep their short names; one mod's several
+  -- resources may share its name.
   local uses = {}
-  for addon, label in pairs(seen) do
-    if label and not boot_names[addon] then uses[label] = (uses[label] or 0) + 1 end
+  for key, label in pairs(seen) do
+    if label then
+      uses[label] = uses[label] or {}
+      uses[label][owner_of[key]] = true
+    end
   end
   local shown, count = {}, 0
-  for addon, label in pairs(seen) do
-    if label and (uses[label] == 1 or (boot_names[addon] and (uses[label] or 0) <= 1)) then
-      shown[addon] = label
+  for key, label in pairs(seen) do
+    local mods = 0
+    for _ in pairs(label and uses[label] or {}) do mods = mods + 1 end
+    if label and mods == 1 then
+      shown[key] = label
       count = count + 1
     end
   end
   names = shown
   local keys = {}
-  for addon in pairs(seen) do keys[#keys + 1] = addon end
-  table.sort(keys)
-  for _, addon in ipairs(keys) do
-    say(string.format("name: %s = %s", addon, shown[addon] or "(short name)"))
+  for key in pairs(seen) do keys[#keys + 1] = key end
+  table.sort(keys, function(a, b) return (readable[a] or "#" .. a) < (readable[b] or "#" .. b) end)
+  for _, key in ipairs(keys) do
+    say(string.format("name: %s = %s", readable[key] or ("#" .. key), shown[key] or "(short name)"))
   end
   return string.format("%d addons named from Arsenal (%d Lua archives read)", count, archives)
 end
@@ -1288,7 +1376,7 @@ local function short_name(key)
     key = string.gsub(key, " %(%+ all below it%)$", "")
     plus = "+"
   end
-  return (names[key] or string.match(key, "([^/]+)$") or key) .. plus
+  return (names[installed.hash_of(key)] or string.match(key, "([^/]+)$") or key) .. plus
 end
 
 -- ------------------------------------------------------------ on screen
@@ -2249,7 +2337,7 @@ local function copy_to_clipboard(text)
 end
 
 local function report_text(key, at)
-  local name = names[key] or short_name(key)
+  local name = short_name(key)
   local version = string.match(MARKER, "(v[%d%.]+)$") or MARKER
   local chain = 0
   for _, link in ipairs(links) do

@@ -99,9 +99,10 @@ sys.path.insert(0, HERE)
 import modpaths  # noqa: E402
 from hd2fake import Session, lua_literal  # noqa: E402
 from hd2fake.gate import FFI_DOORS  # noqa: E402
+from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.12.7"
+RELEASE = "Mod Lag Watchdog v0.13.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -469,10 +470,11 @@ end)
 """
 
 
-def lua_archive(sources):
+def lua_archive(sources, names=None):
     """A Lua archive as the builders write one: header, type table, file
     table (name, type, offset ... size at +56), then each payload with its
-    8-byte length/flag prefix."""
+    8-byte length/flag prefix. With names, each row's name is
+    murmur64(name) as in a real archive; without, a placeholder."""
     import struct
     lua_t = 0xA14E8DFA2CD117E2
     types, files = 1, len(sources)
@@ -483,7 +485,8 @@ def lua_archive(sources):
     for index, source in enumerate(sources):
         payload = struct.pack("<2I", len(source), 2) + source.encode("utf-8")
         row = 0x48 + types * 32 + index * 80
-        struct.pack_into("<3Q", head, row, 0x1000 + index, lua_t, len(head) + len(body))
+        fid = murmur64_hash(names[index].encode("utf-8")) if names else 0x1000 + index
+        struct.pack_into("<3Q", head, row, fid, lua_t, len(head) + len(body))
         struct.pack_into("<I", head, row + 56, len(payload))
         body += payload
     return bytes(head + body)
@@ -1579,7 +1582,7 @@ def boot_case():
     folder = os.path.join(root, "HD2 HUD Plus 0.1.13_AR9", "COMMON")
     os.makedirs(folder)
     with open(os.path.join(folder, "9ba626afa44a3aa3.patch_0"), "wb") as f:
-        f.write(lua_archive([HUD_BOOT_PATCH]))
+        f.write(lua_archive([HUD_BOOT_PATCH, HUD_PRODUCT_013], names=["boot", "mods/hd2_hud/product"]))
     wms = os.path.join(root, "WMS_AR1", "Beacon")
     os.makedirs(wms)
     with open(os.path.join(wms, "9ba626afa44a3aa3.patch_0"), "wb") as f:
@@ -1609,11 +1612,12 @@ def boot_case():
 
     try:
         text, shown = game("boot", HUD_BOOT_012)
-        check(re.search(r"name: boot \(boot patch\) = HD2 HUD\+", text) is not None,
-              "the boot patch's names come from Arsenal: %r" % re.findall(r"name: .*", text))
+        check(re.search(r"name: #f476df93691895fa = HD2 HUD\+", text) is not None,
+              "HUD+'s \"boot\" is named by its archive's name hash: %r" % re.findall(r"name: .*", text))
         chain = [l for l in text.splitlines() if re.search(r"#\d+ ", l)]
-        check(any("boot patch" in l for l in chain) and any("bottom: game" in l for l in chain),
-              "the chain shows the boot patch, then the game below it: %r" % chain)
+        check(any("boot:" in l and "own copy of a game script" in l for l in chain)
+              and any("bottom: game" in l for l in chain),
+              "the chain walks HUD+'s boot as a mod, then the game below it: %r" % chain)
         hud = re.search(r"\|HD2 HUD\+ +(\d+\.\d) ", shown)
         game_row = re.search(r"\|\(the game\) +(\d+\.\d) ", shown)
         check(hud is not None and float(hud.group(1)) > 150,
@@ -1624,8 +1628,8 @@ def boot_case():
             if "mod_lag_finder_window.txt" in files:
                 os.remove(os.path.join(base, "mod_lag_finder_window.txt"))
         text, shown = game("mods/hd2_hud/product", HUD_PRODUCT_013)
-        check(re.search(r"name: mods/hd2_hud/product = HD2 HUD\+", text) is not None,
-              "0.1.13's module is named from its boot patch: %r" % re.findall(r"name: .*", text))
+        check(re.search(r"name: #ef0157640928609f = HD2 HUD\+", text) is not None,
+              "0.1.13's module is named by its archive's name hash: %r" % re.findall(r"name: .*", text))
         check(re.search(r"\|HD2 HUD\+ +\d+\.\d ", shown) is not None and "|product " not in shown,
               "it shows as HD2 HUD+, not product: %r" % shown)
     finally:
@@ -1806,6 +1810,117 @@ def review_shutdown_once_case():
         check(s.eval("SHUT_TOP") == "1", "and the mod's own shutdown still runs once: %s" % s.eval("SHUT_TOP"))
 
 
+HASH_NAMES = ["boot", "mods/hd2_hud/product", "core/wwise/lua/wwise_flow_callbacks",
+               "mods/patpatpatrick/mod_lag_finder", "", "a", "abcdefg", "abcdefgh", "abcdefghi",
+               "mods/cowboybingus/vanilla_plus_megapack/enemy_collision_synchronized"]
+
+
+def hash_case():
+    """The Watchdog's pure-Lua murmur64 (v0.13.0) gives what the SDK's
+    hashing.murmur64_hash gives, with LuaJIT's bit library and without it."""
+    print("hash")
+    for without_bit in (False, True):
+        with session() as s:
+            if without_bit:
+                s.lua("bit = nil")
+            s.lua("__mlf_test_hash = true")
+            load(s, ["finder"])
+            for name in HASH_NAMES:
+                want = "%016x" % murmur64_hash(name.encode("utf-8"))
+                got = s.eval("__mlf_test_hash(%s)" % lua_literal(name))
+                check(got == want, "%s%r: %s (want %s)" % ("no bit: " if without_bit else "", name, got, want))
+
+
+# v0.13.0: links found through their archive's name hash. Each fails on v0.12.7.
+PATCH_OLD_UPDATE = r"""
+local old_update = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  CLOCK = CLOCK + 0.004
+  return old_update(...)
+end)
+"""
+PATCH_STRIPPED = r"""
+local factory = function(original)
+  return function(...)
+    CLOCK = CLOCK + 0.004
+    return original(...)
+  end
+end
+local make = loadstring(string.dump(factory, true), "@boot")
+rawset(_G, "update", make(rawget(_G, "update")))
+"""
+PATCH_SUBMODULE = r"""
+local down = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  CLOCK = CLOCK + 0.004
+  return down(...)
+end)
+"""
+
+
+def patch_case():
+    """A mod's update found through its archive (v0.13.0), not through its
+    shape: a boot patch whose previous is in "old_update", one with stripped
+    upvalue names, and an update hook in a submodule with no HD2-Addon line
+    and no "mods/" name. Each gets its own row under its mod's name, the
+    mods below it stay visible, and "(the game)" keeps only the game."""
+    import json
+    print("patch")
+    scratch = tempfile.mkdtemp(prefix="mlf_patch_")
+    root = os.path.join(scratch, "Arsenal Mods")
+    arsenal = os.path.join(scratch, "hd2arsenal")
+    os.makedirs(arsenal)
+
+    def mod_folder(folder, rows):
+        path = os.path.join(root, folder, "Main")
+        os.makedirs(path)
+        with open(os.path.join(path, "9ba626afa44a3aa3.patch_0"), "wb") as f:
+            f.write(lua_archive([source for _, source in rows], names=[name for name, _ in rows]))
+
+    mod_folder("Boot Mod_AR11", [("boot", "return {}")])
+    mod_folder("Sub Mod_AR12", [("sub_core/update", "return {}"), ("mods/sub/main", "return {}")])
+    mod_folder("WMS_AR1", [("mods/test/slow", "-- HD2-Addon: mods/test/slow\nreturn {}\n")])
+    profile = {"label": "Test", "mods": [
+        {"label": label, "path": os.path.join(root, folder), "enabled": True,
+         "options": [{"name": "Main", "enabled": True, "include": ["Main"], "suboptions": []}]}
+        for label, folder in (("Boot Mod", "Boot Mod_AR11"), ("Sub Mod", "Sub Mod_AR12"),
+                              ("Where's My Shit?", "WMS_AR1"))]}
+    with open(os.path.join(arsenal, "hd2a_data.json"), "w", encoding="utf-8") as f:
+        json.dump({"selectedProfile": "p1", "modsList": {"p1": profile}}, f)
+
+    def game(chunk, source, label):
+        for base, _dirs, files in os.walk(scratch):
+            if "mod_lag_finder_window.txt" in files:
+                os.remove(os.path.join(base, "mod_lag_finder_window.txt"))
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            load(s, ["heavy"])                          # below the patch
+            check(s.load_mod(source=source, name=chunk), "%s loads" % label)
+            load(s, ["slow", "finder"])
+            s.frames(320)
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            shown = s.eval("SHOWN()")
+            row = re.search(r"\|%s +(\d+\.\d) " % re.escape(label), shown)
+            check(row is not None and float(row.group(1)) > 100,
+                  "%s: its own row under its mod's name (4 ms a frame, ~140 ms/s here): %r" % (label, shown))
+            check(re.search(r"\|heavy +\d+\.\d", shown) is not None,
+                  "%s: the mod below it stays visible: %r" % (label, shown))
+            game_row = re.search(r"\|\(the game\) +(\d+\.\d) ", shown)
+            check(game_row is None or float(game_row.group(1)) < 50,
+                  "%s: (the game) keeps only the game: %r" % (label, shown))
+            clean(s, "patch")
+
+    try:
+        game("boot", PATCH_OLD_UPDATE, "Boot Mod")         # previous in "old_update"
+        game("boot", PATCH_STRIPPED, "Boot Mod")           # stripped: no upvalue names at all
+        game("sub_core/update", PATCH_SUBMODULE, "Sub Mod")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def report_case():
     """A click on a mod's row in the escape-menu window copies that mod's
     8-line report (v0.11.0): its name, the game build and the Watchdog
@@ -1838,7 +1953,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.12\.7, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.0, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: 1 min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -2281,6 +2396,8 @@ def main():
     small_case()
     boot_case()
     bootstrap_case()
+    hash_case()
+    patch_case()
     review_errors_case()
     review_remap_case()
     review_no_shutdown_case()
