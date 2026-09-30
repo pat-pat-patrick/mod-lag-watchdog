@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.13.3 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.13.4 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -110,7 +110,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.13.3"
+local MARKER = "mod-lag-finder-v0.13.4"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -517,6 +517,7 @@ local installed = { wrapper = nil, generation = 0, last_tick_at = nil,
                     told_upstream = false, told_tick = false,
                     previous_slot = nil, bootstrap = nil, bootstrap_slot = nil,
                     settling = 0, shutdown_done = false, entries = 0, ticked = 0,
+                    owed = false, unfinished = 0,
                     -- v0.13.0: the resource-name hashes of every Lua resource
                     -- in the enabled mods' archives (nil when no Arsenal list
                     -- was read), and the pure-Lua murmur64 that matches them.
@@ -997,6 +998,11 @@ local function write_summary(at)
                       r.row.time * 1000 / math.max(window.frames, 1), ms1(r.row.worst)))
   end
   say(string.format("  log write worst %.0f ms", writes_worst() * 1000))
+  if installed.unfinished > 0 then
+    say(string.format("  errors: %d frames did not finish below this module (a mod below raised an error;"
+                      .. " the game's own log names it)", installed.unfinished))
+    installed.unfinished = 0
+  end
   local g = gpu.minute
   if g ~= nil and g.n > 0 then
     say(string.format("  vram: max %.2f of %.2f GB budget; read worst %.3f ms",
@@ -3120,22 +3126,37 @@ local function arm()
     -- way in, so frames that raise still show we are in the chain (no
     -- re-arm over a mod hooked above us); the frames without a tick are
     -- counted, so the first tick after them is no stall.
+    local function run_tick()
+      local started = now()
+      local ok_tick, err = pcall(tick)
+      installed.tick_cost = now() - started
+      if not ok_tick and not installed.told_tick then
+        installed.told_tick = true
+        say("tick error: " .. tostring(err))
+      end
+    end
     local function after(...)
       if installed.generation == generation then
-        local started = now()
-        local ok_tick, err = pcall(tick)
-        installed.tick_cost = now() - started
-        if not ok_tick and not installed.told_tick then
-          installed.told_tick = true
-          say("tick error: " .. tostring(err))
-        end
+        installed.owed = false
+        run_tick()
       end
       return ...
     end
+    -- A frame that raised below us never reaches after(): its tick is run at
+    -- the start of the next frame instead (v0.13.4). v0.13.3 had no tick at
+    -- all while a mod below raised every frame -- no window on Home, no
+    -- alerts, no log (a player's report, 2026-10-01: "the window does not
+    -- pop up anymore when pressing home"). The error itself still goes up
+    -- untouched.
     local wrapper = function(...)
       frame_dt = (...)
       frame_argc = select("#", ...)
       if installed.generation == generation then
+        if installed.owed then
+          installed.unfinished = installed.unfinished + 1
+          run_tick()
+        end
+        installed.owed = true
         installed.last_tick_at = clock()
         installed.tick_calls = installed.mw_calls
         installed.entries = installed.entries + 1
@@ -3166,6 +3187,7 @@ local function arm()
     -- window either (v0.13.3, review [4]: its span covered the gap, so every
     -- mod's ms/s read low -- about half after a 30 s gap).
     last_tick_time, pending = nil, nil
+    installed.owed = false
     if installed.generation > 1 then
       live.bucket, live.ring = nil, {}
       window = { mods = {}, started = now(), frames = 0, hitches = 0 }

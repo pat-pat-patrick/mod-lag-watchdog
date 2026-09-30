@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.13.3"
+RELEASE = "Mod Lag Watchdog v0.13.4"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -2376,6 +2376,50 @@ def review_builder_case():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+# Runs the chain below it, then its own code fails, every frame: the game
+# plays on, but nothing after it in the frame runs.
+LATE_THROWER = r"""
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  local result = previous(...)
+  error("late broke", 0)
+  return result
+end)
+"""
+
+
+def late_error_case():
+    """A mod below that raises every frame after the rest of its chain ran
+    (a player's report on v0.13.3, 2026-10-01: Home no longer opened the
+    window): the Watchdog still ticks, one tick a frame, at the start of the
+    next frame. Home opens the window, a stall is still seen, the minute
+    summary counts the frames that did not finish, the error still reaches
+    the engine every frame, and the chain below still runs every frame.
+    (Which mod a stall is in is not known while frames do not finish: the
+    timings of the links between us and the error freeze -- review [5],
+    open; v0.11.0 read them as 0 as well.) Fails on v0.13.3."""
+    print("late error below")
+    with session() as s:
+        s.lua(GUI_STUB)
+        check(s.load_mod(source=LATE_THROWER, name="mods/test/late"), "late loads")
+        load(s, ["slow", "heavy", "finder"])
+        s.frames(320)
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        check(re.search(r"last \d+ s: frame", shown) is not None, "Home opens the window: %r" % shown)
+        check(bool(log_lines(s, r"hitch 4\d\d ms")), "slow's 400 ms stall is still seen: %r" % log_lines(s, "hitch")[:2])
+        s.frames(3600)
+        check(bool(log_lines(s, r"errors: \d{3,} frames did not finish below this module")),
+              "the summary counts the frames that did not finish: %r" % log_lines(s, "errors:")[:1])
+        r = s.report()
+        late = [u for u in r["uncaught"] if "late broke" in u["error"]]
+        check(len(late) >= 3900, "the error still reaches the engine every frame: %d" % len(late))
+        counts = s.eval("string.format('%d %d', COUNTS.heavy or 0, FAKE.frame)")
+        heavy, frames = (int(v) for v in counts.split())
+        check(heavy == frames, "the chain below still runs every frame: heavy %d of %d" % (heavy, frames))
+
+
 def report_case():
     """A click on a mod's row in the escape-menu window copies that mod's
     8-line report (v0.11.0): its name, the game build and the Watchdog
@@ -2408,7 +2452,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.3, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.13\.4, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: 1 min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -2863,6 +2907,7 @@ def main():
     review_stale_middle_case()
     review_mem_miss_case()
     review_builder_case()
+    late_error_case()
     review_errors_case()
     review_remap_case()
     review_no_shutdown_case()
