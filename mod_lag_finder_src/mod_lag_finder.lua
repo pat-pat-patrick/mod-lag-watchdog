@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.16.1 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.16.2 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -118,7 +118,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.16.1"
+local MARKER = "mod-lag-finder-v0.16.2"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3209,6 +3209,21 @@ end
 -- main_world frame after frame without us. Likely: 200 calls is at least
 -- 100 frames at the engine's rate in the fake (2 a frame); the game's rate
 -- is not measured, so the re-arm after a world change may take longer.
+-- v0.16.2: and 3 s with no tick is enough on its own. The game never calls
+-- main_world, only mods do (proven twice: BSL + SmoothBoot + Watchdog made
+-- no calls, 09-30; BSL + Helmet Headlamp made none, 10-01 --
+-- hd2-game-never-calls-main-world), so with few callers 200 calls took
+-- 35 s at one call per 10 frames and 208 s at one a second, the Watchdog
+-- dead all that while. Helmet Headlamp 1.2.1 measured the cost of the cap:
+-- stalls of 0.6-2.5 s add no hook, 3.5-8 s add one, which then stays on
+-- top. Here two guards keep long frames from re-arming us at all: inside
+-- our own frame (installed.depth > 0) a link below is just slow -- in game
+-- single mods held a frame 5-7 s (Casemate Turrets 6.7 s, WMS 6.3 s, Super
+-- Beacon 5.1 s); and a long gap between frames (8-32 s in the log, outside
+-- update) is followed by at most a call or two from a mod above us before
+-- we are entered again, so the cap also wants 3 calls. Likely, measured in
+-- the fake (test_mod_lag_finder_rearm_runtime.py), not yet in game.
+-- (No new local: the main chunk is at Lua's 200-locals limit.)
 local STALE_S, STALE_CALLS = 0.5, 200
 
 local function update_is_live()
@@ -3218,7 +3233,10 @@ local function update_is_live()
     return rawget(_G, "update") == installed.wrapper
   end
   if (at - seen) <= STALE_S then return true end
-  return (installed.mw_calls - (installed.tick_calls or 0)) < STALE_CALLS
+  if (installed.depth or 0) > 0 and (at - seen) < 60 then return true end
+  local calls = installed.mw_calls - (installed.tick_calls or 0)
+  if (at - seen) >= 3.0 and calls >= 3 then return false end
+  return calls < STALE_CALLS
 end
 
 local function arm()

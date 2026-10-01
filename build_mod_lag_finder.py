@@ -9,7 +9,6 @@ import json
 import os
 import shutil
 import struct
-import subprocess
 import sys
 import zipfile
 
@@ -17,6 +16,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from hashing import murmur64_hash  # noqa: E402
 import modpaths  # noqa: E402
+import spawn  # noqa: E402
 from hd2fake.gate import gate_release  # noqa: E402
 
 SOURCE = os.path.join(HERE, "mod_lag_finder_src", "mod_lag_finder.lua")
@@ -24,7 +24,7 @@ TEMPLATE = os.path.join(HERE, "lua_archive_template.bin")
 ADDON = "mods/patpatpatrick/mod_lag_finder"
 LUA_T = 0xA14E8DFA2CD117E2
 PAYLOAD_FLAG = 2
-VERSION = "v0.16.1"
+VERSION = "v0.16.2"
 MOD = "Mod Lag Watchdog"
 # A build is a local test build unless the user says it goes to Nexus (the
 # user, 2026-09-30): then the release name has no "Nexus" and the manifest
@@ -95,7 +95,7 @@ def write_module(out_dir, resource_name, source):
 
 
 def run_check(script, why):
-    check = subprocess.run([sys.executable, os.path.join(HERE, script), SOURCE],
+    check = spawn.run([sys.executable, os.path.join(HERE, script), SOURCE],
                            capture_output=True, text=True)
     sys.stdout.write(check.stdout)
     if check.returncode != 0:

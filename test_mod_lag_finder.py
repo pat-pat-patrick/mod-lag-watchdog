@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.16.1"
+RELEASE = "Mod Lag Watchdog v0.16.2"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -2858,7 +2858,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.16\.1, 4 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog " + re.escape(RELEASE.split()[-1]) + r", 4 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: \d+ min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
