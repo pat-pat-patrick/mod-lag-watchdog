@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.15.0 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.16.0 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -58,9 +58,10 @@
 --     game closes on it as it would without the Watchdog, but the mod, the
 --     line and the message are logged first, and the next launch shows
 --     "LAST CRASH: <name> raised a Lua error" once on the ship. A mod whose
---     errors something above us catches is named in the log every minute,
---     an amber "ERROR <name> N frames/min" window line, and once per mod an
---     alert in missions (v0.14.0)
+--     errors another mod catches -- above this module or, since v0.16.0,
+--     below it too -- is named in the log every minute (with the full stack
+--     of its first error), an amber "ERROR <name> N frames/min" window line,
+--     and once per mod an alert in missions (v0.14.0)
 --   * the slowest log write of the last 30 s, in the window and in the 60 s
 --     summary (v0.4.1; GameGuard's CPU, shown next to it in v0.4.1, was
 --     taken out in v0.5.0)
@@ -117,7 +118,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.15.0"
+local MARKER = "mod-lag-finder-v0.16.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -508,15 +509,34 @@ end
 -- The shim a mapped link keeps: its duration, this frame and the last.
 -- (v0.14.0 also stamped the frame each link was entered and left in, to
 -- find where an error came from; v0.15.0 reads that off the stack.)
-local function make_shim(link, target)
+-- With a handler (v0.16.0, see "errors") the link runs under xpcall: an
+-- error from it is noted while its stack is whole, then raised on unchanged,
+-- so a mod above that catches it no longer hides it from this module. The
+-- game sees the same as before. Without (a VM whose xpcall cannot pass
+-- arguments on) it is v0.15.0's plain call.
+local function make_shim(link, target, handler)
   local function finish(t0, ...)
     local took = timer_now() - t0
     link.prev_incl = link.last_incl
     link.last_incl = took
     return ...
   end
-  local shim = function(...)
-    return finish(timer_now(), target(...))
+  local shim
+  if handler == nil then
+    shim = function(...)
+      return finish(timer_now(), target(...))
+    end
+  else
+    local function settle_up(t0, ok, ...)
+      local took = timer_now() - t0
+      link.prev_incl = link.last_incl
+      link.last_incl = took
+      if ok then return ... end
+      error((...), 0)
+    end
+    shim = function(...)
+      return settle_up(timer_now(), xpcall(target, handler, ...))
+    end
   end
   ours[shim] = target
   return shim
@@ -536,11 +556,23 @@ local installed = { wrapper = nil, generation = 0, last_tick_at = nil,
                     -- the file that tells the next launch.
                     depth = 0, crash_pending = nil, survives = {}, error_logged = {},
                     crash_path = nil, xpcall_args = nil,
+                    -- v0.16.0: the error noted last this frame (each shim it
+                    -- passes sees it again), whether one cut this frame short
+                    -- anywhere, and the mod each message came from.
+                    last_err = nil, frame_failed = false, culprit_cache = {}, culprit_cached = 0,
                     errors = {}, errors_session = {}, error_told = {},
                     -- v0.13.0: the resource-name hashes of every Lua resource
                     -- in the enabled mods' archives (nil when no Arsenal list
                     -- was read), and the pure-Lua murmur64 that matches them.
                     archive_hashes = nil, name_hash = nil, hash_of = nil }
+
+-- Every timing shim runs its link under this handler (v0.16.0): arm() puts
+-- the note-taker in installed.note.
+installed.link_handler = function(err)
+  local note = installed.note
+  if note ~= nil then pcall(note, err) end
+  return err
+end
 
 local links = {}              -- mapped chain, top first
 local our_index = nil         -- our wrapper's place in it
@@ -741,7 +773,7 @@ local function adopt(slot)
   end
   local link = new_link(slot.original, slot)
   link.tie = slot.tie
-  slot.shim = make_shim(link, slot.original)
+  slot.shim = make_shim(link, slot.original, installed.xpcall_args and installed.link_handler or nil)
   slot_set(slot, slot.shim)
   shims[#shims + 1] = slot
   mapping.links[#mapping.links + 1] = link
@@ -2738,6 +2770,9 @@ local function items(at)
   end
   if toast ~= nil and at < toast.until_at and (ui.in_menu or not ui.alerts_off or toast.always) then
     local y = window_shown and (g.top + 8 * s) or (g.top - HEADER * s + 8 * s)
+    -- A window dragged to the top of the screen leaves no room above it: the
+    -- line goes under the window instead (v0.16.0; it was drawn off screen).
+    if window_shown and y + 24 * s > g.height then y = math.max(4 * s, g.top - g.h - 26 * s) end
     list[#list + 1] = { text = toast.text, x = g.x + PAD * s, y = y, size = 20 * s,
                         c = toast.colour or RED,
                         shadow = true }
@@ -2850,7 +2885,7 @@ local function display(at)
      (not units.installed or (units.world ~= nil and units.candidate == nil and
                               at - (units.world_since or at) >= 10)) then
     local text = string.sub(note.key, 1, 1) == "(" and "LAST CRASH: a Lua error outside every mod"
-                 or ("LAST CRASH: " .. short_name(note.key) .. " raised a Lua error")
+                 or ("LAST CRASH: " .. (note.name or short_name(note.key)) .. " raised a Lua error")
     if ui.alert({ text = text, until_at = at + 12, colour = AMBER, keep = true, always = true }) then
       ui.crash_note = nil
       say("last crash shown: " .. text)
@@ -3209,6 +3244,16 @@ local function arm()
     -- "(game script <name>)", or "(the game)" when no script is on it
     -- either (review [18]: v0.14.0 put a mod's error in a function the game
     -- calls on the game).
+    --
+    -- v0.16.0: every timing shim runs its link under xpcall too (see
+    -- make_shim), so an error is noted at the shim nearest to it, whole, even
+    -- when a mod between that link and this wrapper catches it (Lua Error
+    -- Probe v2 in game, 2026-10-01: Speed Dial's pcall dropped it and nothing
+    -- was logged). Each shim on the way up sees the same error again: it is
+    -- noted once. A frame where one was raised charges nothing, as a frame
+    -- cut short. The first error of each mod is logged with its full stack:
+    -- the game and the mods above now see a stack that starts here, and this
+    -- log is where the rest of it is kept (the user, 2026-10-01).
     local wrapper, on_error
     local own_source = source_of(arm)
     local function key_of(source)
@@ -3217,31 +3262,49 @@ local function arm()
       if first == "@" or first == "=" then source = string.sub(source, 2) end
       return (string.gsub(source, "%.lua$", ""))
     end
+    -- The mod, and the stack from the raise when that mod has not been logged
+    -- yet. A message seen before goes by its first answer (no walk).
     local function culprit(err)
+      local key = nil
       if type(err) == "string" then
+        key = installed.culprit_cache[err]
+        if key ~= nil then return key, nil end
         local chunk = string.match(err, "^([^:\n]+):%d+:")
         if chunk ~= nil then
           chunk = key_of(chunk)
-          if is_mod_source(chunk) and chunk ~= own_source then return chunk end
+          if is_mod_source(chunk) and chunk ~= own_source then key = chunk end
         end
       end
       -- The stack from the raise outward: the frames above the handler
-      -- (this function, its pcall) are skipped, the walk ends at our wrapper.
-      local game, raised = nil, false
+      -- (this function, its pcall) are skipped; the raise path ends at the
+      -- first frame of ours (the shim the link ran in, or our wrapper).
+      local game, found, start = nil, nil, nil
       for level = 1, 120 do
         local info = getinfo(level, "Sf")
         if type(info) ~= "table" or info.func == wrapper then break end
-        if info.func == on_error then
-          raised = true
-        elseif raised and info.what ~= "C" then
+        if start == nil then
+          if info.func == on_error or info.func == installed.link_handler then start = level + 1 end
+        elseif info.what ~= "C" then
           local source = key_of(info.source)
-          if source ~= own_source then
-            if is_mod_source(source) then return source end
+          if source == own_source then break end
+          if is_mod_source(source) then
+            found = found or source
+          else
             game = game or source
           end
         end
       end
-      return game and ("(game script " .. game .. ")") or "(the game)"
+      key = key or found or (game and ("(game script " .. game .. ")")) or "(the game)"
+      if type(err) == "string" and installed.culprit_cached < 64 then
+        installed.culprit_cache[err] = key
+        installed.culprit_cached = installed.culprit_cached + 1
+      end
+      local trace = nil
+      local traceback = rawget(dbg, "traceback")
+      if start ~= nil and not installed.error_logged[key] and type(traceback) == "function" then
+        trace = traceback("", start)
+      end
+      return key, trace
     end
     local function write_crash(text)
       if installed.crash_path == nil then return end
@@ -3251,7 +3314,10 @@ local function arm()
       file:close()
     end
     local function note_error(err)
-      local key = culprit(err)
+      if installed.last_err ~= nil and rawequal(installed.last_err, err) then return end
+      installed.last_err = err
+      installed.frame_failed = true
+      local key, trace = culprit(err)
       local text = string.gsub(string.sub(tostring(err), 1, 300), "[%c]+", " ")
       installed.errors[key] = (installed.errors[key] or 0) + 1
       installed.errors_session[key] = (installed.errors_session[key] or 0) + 1
@@ -3262,13 +3328,28 @@ local function arm()
       if not installed.error_logged[key] then
         installed.error_logged[key] = true
         say("error: " .. key .. " raised a Lua error: " .. text)
+        if trace ~= nil then
+          local shown = 0
+          for line in string.gmatch(trace, "[^\n]+") do
+            if not string.find(line, "^stack traceback") then
+              shown = shown + 1
+              if shown > 24 then
+                say("    ...")
+                break
+              end
+              say("    " .. string.gsub(line, "^%s+", ""))
+            end
+          end
+        end
       end
       if not installed.survives[key] then
-        -- On disk before the error goes on: the game is about to close.
+        -- On disk before the error goes on: the game may be about to close.
+        -- The name is kept as the mod manager shows it now: the player may
+        -- have removed the mod by the next launch (v0.16.0).
         installed.crash_pending = key
-        write_crash(string.format("date=%s%skey=%s%smessage=%s%s", local_time(os.time()), NL,
-                                  key, NL, text, NL))
-        say("error: passed on to the game, which closes on it unless a mod above catches it")
+        write_crash(string.format("date=%s%skey=%s%sname=%s%smessage=%s%s", local_time(os.time()), NL,
+                                  key, NL, short_name(key), NL, text, NL))
+        say("error: passed on to the game, which closes on it unless another mod catches it")
         flush_log()
       end
       if installed.errors[key] >= ERROR_ALERT_FRAMES and not installed.error_told[key] and
@@ -3282,13 +3363,14 @@ local function arm()
       pcall(note_error, err)
       return err
     end
+    installed.note = note_error
     -- The game lived through the error after all: a mod above caught it.
     local function survived()
       local key = installed.crash_pending
       installed.crash_pending = nil
       installed.survives[key] = true
       write_crash("")
-      say("error: the game went on after " .. key .. "'s error (a mod above caught it); counted from now on")
+      say("error: the game went on after " .. key .. "'s error (another mod caught it); counted from now on")
     end
     installed.clear_crash = function()
       if installed.crash_pending ~= nil then
@@ -3307,7 +3389,7 @@ local function arm()
     end
     local function after(ok, ...)
       installed.depth = 0
-      if installed.generation == generation then run_tick(not ok) end
+      if installed.generation == generation then run_tick(not ok or installed.frame_failed) end
       if ok then return ... end
       error((...), 0)
     end
@@ -3327,6 +3409,7 @@ local function arm()
       frame_dt = (...)
       frame_argc = select("#", ...)
       if installed.crash_pending ~= nil then pcall(survived) end
+      installed.last_err, installed.frame_failed = nil, false
       installed.last_tick_at = clock()
       installed.tick_calls = installed.mw_calls
       installed.depth = 1
@@ -3479,7 +3562,8 @@ local function main()
     if key ~= nil and key ~= "" then
       say(string.format("last crash: the game closed on a Lua error from %s (%s): %s", key,
                         string.match(last, "date=([^\r\n]*)") or "?", string.match(last, "message=([^\r\n]*)") or "?"))
-      ui.crash_note = { key = key }
+      local name = string.match(last, "name=([^\r\n]*)")
+      ui.crash_note = { key = key, name = (name ~= nil and name ~= "") and name or nil }
       local file = io.open(installed.crash_path, "w")
       if file ~= nil then file:close() end
     end

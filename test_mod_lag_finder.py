@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.15.0"
+RELEASE = "Mod Lag Watchdog v0.16.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -2470,7 +2470,7 @@ def crash_case():
         check(bool(log_lines(s, r"error: mods/test/early raised a Lua error: early broke")),
               "the log names it first, on disk: %r" % log_lines(s, "error"))
         crash = s.file(CRASH_FILE, "") or ""
-        check("key=mods/test/early" in crash and "message=early broke" in crash
+        check("key=mods/test/early" in crash and "message=early broke" in crash and "name=early" in crash
               and re.search(r"date=\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", crash) is not None,
               "the crash file holds it: %r" % crash)
 
@@ -2694,6 +2694,73 @@ def alert_kept_case():
               "the alert is still the one shown: %r" % s.eval("SHOWN()"))
 
 
+def hidden_case():
+    """A mod between the Watchdog and the error catches it (v0.16.0; Speed
+    Dial did in game, 2026-10-01, and nothing was logged): the shim nearest
+    the error notes it first, whole, and raises it on unchanged, so the game
+    and the catcher see the same as before. The mod is named once, with the
+    full stack of its first error, then counted (minute line, ERROR window
+    line, one alert); heavy below it, never run, is not charged. Fails on
+    v0.15.0 (no line at all)."""
+    print("hidden")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["heavy"])
+        check(s.load_mod(source=EARLY_THROWER, name="mods/test/early"), "early loads")
+        load(s, ["std", "finder"])                           # std catches it, below us
+        s.frames(300)
+        s.lua("EARLY_ON = true")
+        s.frames(2400)
+        r = s.report()
+        check(r["dead"] is None and not r["uncaught"], "the game lives, as without the Watchdog")
+        named = log_lines(s, r"error: (.+?) raised a Lua error")
+        check(len(named) == 1 and "error: mods/test/early raised a Lua error: early broke" in named[0],
+              "the mod std hid is named, once: %r" % named)
+        text = s.file(LOG, "") or ""
+        after = text.split("raised a Lua error: early broke", 1)[-1].splitlines()[1:6]
+        check(any("mods/test/early" in l for l in after) and all(l.split(" ", 1)[1].startswith("    ") for l in after[:2]),
+              "with the stack of its first error: %r" % after)
+        check(len(log_lines(s, r"error: the game went on after mods/test/early's error")) == 1
+              and (s.file(CRASH_FILE, "") or "") == "", "the crash file is emptied when the game goes on")
+        check("ERROR early keeps raising Lua errors" in s.eval("SHOWN()") or
+              bool(log_lines(s, r"errors: mods/test/early keeps raising Lua errors")), "one alert names it")
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        check(re.search(r"ERROR early \d+ frames/min", shown) is not None, "the window names it: %r" % shown)
+        check(re.search(r"\|heavy +\d", shown) is None, "heavy, never run, is not charged: %r" % shown)
+        counts = s.eval("string.format('%d', COUNTS.std or 0)")
+        check(int(counts) >= 2700, "std below us still runs every frame: %s" % counts)
+
+
+def alert_place_case():
+    """With the window dragged to the very top of the screen and shown, an
+    alert above it would be off screen: it goes under the window (v0.16.0;
+    v0.15.0 drew it at y = top + 8). The LAST CRASH line uses the name kept
+    in the crash file, so a mod removed since still shows by that name."""
+    print("alert place")
+    scratch = tempfile.mkdtemp(prefix="mlf_place_")
+    try:
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            with open(os.path.join(s.game_dir, "mod_lag_finder_window.txt"), "w") as f:
+                f.write("1056 1080 1 1\n")               # at the top, table on
+            with open(os.path.join(s.game_dir, CRASH_FILE), "w") as f:
+                f.write("date=2026-10-01 13:19:47\nkey=mods/test/gone\nname=Gone Mod\nmessage=x\n")
+            load(s, ["heavy", "finder"])
+            s.frames(1500)
+            pos = s.eval("POS('LAST CRASH')")
+            check(pos != "none", "the line is drawn: %r" % s.eval("SHOWN()"))
+            x, y = (float(v) for v in pos.split(",")) if pos != "none" else (0, 9999)
+            check(y + 20 <= 1080, "on screen, under the window: y=%s" % y)
+            check("LAST CRASH: Gone Mod raised a Lua error" in s.eval("SHOWN()"),
+                  "by the name kept in the file: %r" % s.eval("SHOWN()"))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def rearm_summary_case():
     """A re-arm writes the minute under way first (review [5]: v0.14.0
     dropped it, and its error counts), and one before the first tick still
@@ -2755,7 +2822,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.15\.0, 4 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.16\.0, 4 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: \d+ min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -3218,6 +3285,8 @@ def main():
     substep_case()
     alert_kept_case()
     rearm_summary_case()
+    hidden_case()
+    alert_place_case()
     review_remap_case()
     review_no_shutdown_case()
     review_rearm_gap_case()
