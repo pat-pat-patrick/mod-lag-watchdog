@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.16.0"
+RELEASE = "Mod Lag Watchdog v0.16.1"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -2733,6 +2733,42 @@ def hidden_case():
         check(int(counts) >= 2700, "std below us still runs every frame: %s" % counts)
 
 
+# Works 4 ms a frame, then calls on.
+BUSY = r"""
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  CLOCK = CLOCK + 0.004
+  return previous(...)
+end)
+"""
+
+
+def error_table_case():
+    """While a mod below raises every frame (hidden by another mod), the
+    mods that do run keep their cost in the window: busy, above the error,
+    reads its ~250 ms/s after 40 s of errors, and heavy, which the error cuts
+    off, reads nothing (v0.16.1: by each shim's frame stamp). Fails on
+    v0.16.0, which charged nothing in a frame with an error, so the whole
+    table fell to zero."""
+    print("error table")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["heavy"])
+        check(s.load_mod(source=EARLY_THROWER, name="mods/test/early"), "early loads")
+        load(s, ["std"])                                     # hides the error, below us
+        check(s.load_mod(source=BUSY, name="mods/test/busy"), "busy loads")
+        load(s, ["finder"])
+        s.frames(300)
+        s.lua("EARLY_ON = true")
+        s.frames(2000)                                       # ~40 s of errors
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        row = re.search(r"\|busy +(\d+\.\d) ", shown)
+        check(row is not None and float(row.group(1)) >= 150, "busy keeps its cost: %r" % shown)
+        check(re.search(r"\|heavy +\d", shown) is None, "heavy, cut off, costs nothing: %r" % shown)
+
+
 def alert_place_case():
     """With the window dragged to the very top of the screen and shown, an
     alert above it would be off screen: it goes under the window (v0.16.0;
@@ -2822,7 +2858,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.16\.0, 4 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.16\.1, 4 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: \d+ min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -3287,6 +3323,7 @@ def main():
     rearm_summary_case()
     hidden_case()
     alert_place_case()
+    error_table_case()
     review_remap_case()
     review_no_shutdown_case()
     review_rearm_gap_case()

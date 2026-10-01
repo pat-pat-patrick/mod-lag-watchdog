@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.16.0 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.16.1 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -118,7 +118,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.16.0"
+local MARKER = "mod-lag-finder-v0.16.1"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -514,11 +514,15 @@ end
 -- so a mod above that catches it no longer hides it from this module. The
 -- game sees the same as before. Without (a VM whose xpcall cannot pass
 -- arguments on) it is v0.15.0's plain call.
-local function make_shim(link, target, handler)
+--
+-- Each run is stamped with the frame it finished in (counter.frame_id,
+-- v0.16.1): a link a Lua error cut off did not run, and its time from an
+-- older frame must not be read as this one's.
+local function make_shim(link, target, handler, counter)
   local function finish(t0, ...)
     local took = timer_now() - t0
-    link.prev_incl = link.last_incl
-    link.last_incl = took
+    link.prev_incl, link.prev_frame = link.last_incl, link.last_frame
+    link.last_incl, link.last_frame = took, counter.frame_id
     return ...
   end
   local shim
@@ -529,8 +533,8 @@ local function make_shim(link, target, handler)
   else
     local function settle_up(t0, ok, ...)
       local took = timer_now() - t0
-      link.prev_incl = link.last_incl
-      link.last_incl = took
+      link.prev_incl, link.prev_frame = link.last_incl, link.last_frame
+      link.last_incl, link.last_frame = took, counter.frame_id
       if ok then return ... end
       error((...), 0)
     end
@@ -560,6 +564,7 @@ local installed = { wrapper = nil, generation = 0, last_tick_at = nil,
                     -- passes sees it again), whether one cut this frame short
                     -- anywhere, and the mod each message came from.
                     last_err = nil, frame_failed = false, culprit_cache = {}, culprit_cached = 0,
+                    frame_id = 0,          -- v0.16.1: counts our wrapper's frames, for the shims' stamps
                     errors = {}, errors_session = {}, error_told = {},
                     -- v0.13.0: the resource-name hashes of every Lua resource
                     -- in the enabled mods' archives (nil when no Arsenal list
@@ -773,7 +778,7 @@ local function adopt(slot)
   end
   local link = new_link(slot.original, slot)
   link.tie = slot.tie
-  slot.shim = make_shim(link, slot.original, installed.xpcall_args and installed.link_handler or nil)
+  slot.shim = make_shim(link, slot.original, installed.xpcall_args and installed.link_handler or nil, installed)
   slot_set(slot, slot.shim)
   shims[#shims + 1] = slot
   mapping.links[#mapping.links + 1] = link
@@ -960,13 +965,18 @@ end
 
 -- ------------------------------------------------------------- accounting
 
--- Each link's inclusive time for the frame that has just fully finished:
--- links above this module (and this module) finish after our tick, so their
--- last value is that frame; links below finished inside it, so theirs is
--- the one before.
+-- Each link's inclusive time for the frame that has just fully finished
+-- (the one before the frame our tick runs in): links above this module
+-- finish after our tick, so their last run is that frame; links below
+-- finished inside this one, so theirs is the one before. By stamp since
+-- v0.16.1: a link that did not run in that frame -- a Lua error cut it off
+-- -- costs nothing in it. v0.16.0 charged nothing at all in a frame with an
+-- error, so with a mod raising every frame the whole table fell to zero.
 local function settled_incl(index, link)
-  if our_index ~= nil and index > our_index then return link.prev_incl end
-  return link.last_incl
+  local frame = installed.frame_id - 1
+  if link.last_frame == frame then return link.last_incl end
+  if link.prev_frame == frame then return link.prev_incl end
+  return 0
 end
 
 local function selfs()
@@ -3046,9 +3056,7 @@ local function report(hitch, frame_selfs)
     end
   end
   local body
-  if hitch.failed then
-    body = "a Lua error cut this frame or the next short; not broken down"
-  elseif frame_selfs == nil then
+  if frame_selfs == nil then
     body = "chain not mapped yet"
   else
     local mine = hitch.mine or 0
@@ -3066,10 +3074,11 @@ end
 
 -- failed: a Lua error cut this frame short (v0.15.0). Its tick still runs
 -- once, at its end, so Home, clicks and the window work whatever raises
--- (review [2]: v0.13.4's tick owed to the next frame ran twice there). But
--- the shims of the links it cut off kept an older frame's times, so nothing
--- is charged, no stall is broken down and the walk does not count the frame
--- (review [1], [4], [6], [16]).
+-- (review [2]: v0.13.4's tick owed to the next frame ran twice there). The
+-- walk does not count the frame (its spies below the error saw no call);
+-- the time of each link that ran is charged as usual, and a link that did
+-- not run costs nothing (settled_incl, v0.16.1; v0.15.0-v0.16.0 charged
+-- nothing at all in such a frame -- review [1], [4], [6], [16]).
 local function tick(failed)
   local at = now()
   if window.started == nil then
@@ -3118,17 +3127,16 @@ local function tick(failed)
   local heap = heap_kb()
   local mapped = mapping == nil and #links > 0
   local frame_selfs = nil
-  if mapped and not failed then
+  if mapped then
     if installed.settling > 0 then
       installed.settling = installed.settling - 1
     else
       frame_selfs = selfs()
     end
   end
-  if not failed then add_mdl(frame_selfs) end
+  add_mdl(frame_selfs)
 
   if pending ~= nil then
-    if failed then pending.failed = true end
     report(pending, pending.mapped and mapped and frame_selfs or nil)
     pending = nil
   end
@@ -3148,7 +3156,7 @@ local function tick(failed)
       -- The tick that ended the last frame lies inside this interval: its
       -- cost is this module's own share (unmeasured when it is the top link).
       pending = { interval = interval, dt = frame_dt, heap = heap, heap_drop = drop,
-                  mapped = mapped, mine = installed.tick_cost or 0, failed = failed }
+                  mapped = mapped, mine = installed.tick_cost or 0 }
     end
   end
   last_tick_time = at
@@ -3410,6 +3418,7 @@ local function arm()
       frame_argc = select("#", ...)
       if installed.crash_pending ~= nil then pcall(survived) end
       installed.last_err, installed.frame_failed = nil, false
+      installed.frame_id = installed.frame_id + 1
       installed.last_tick_at = clock()
       installed.tick_calls = installed.mw_calls
       installed.depth = 1
