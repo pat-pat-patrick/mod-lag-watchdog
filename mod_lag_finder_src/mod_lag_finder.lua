@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.14.0 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.15.0 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -54,9 +54,13 @@
 --     mission, all still logged. Saved as the 4th number of the window file.
 --   * on the escape menu every mod is listed, those under 10 ms/s in grey
 --     (v0.12.2); in missions they are only counted
---   * a mod that keeps raising Lua errors (v0.14.0; see "blame"): named in
---     the log every minute, an amber "ERROR <name> N frames/min" window
---     line, and once per mod an alert in missions
+--   * a Lua error from a mod below this module (v0.15.0; see "errors"): the
+--     game closes on it as it would without the Watchdog, but the mod, the
+--     line and the message are logged first, and the next launch shows
+--     "LAST CRASH: <name> raised a Lua error" once on the ship. A mod whose
+--     errors something above us catches is named in the log every minute,
+--     an amber "ERROR <name> N frames/min" window line, and once per mod an
+--     alert in missions (v0.14.0)
 --   * the slowest log write of the last 30 s, in the window and in the 60 s
 --     summary (v0.4.1; GameGuard's CPU, shown next to it in v0.4.1, was
 --     taken out in v0.5.0)
@@ -113,7 +117,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.14.0"
+local MARKER = "mod-lag-finder-v0.15.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -380,6 +384,17 @@ local function source_of(fn)
   return source, tonumber(info.linedefined) or 0, tostring(info.what or "?")
 end
 
+-- A stale spy or shim of ours (a mod unhooked and left one in the chain, and
+-- another mod stored it as its previous) stands for what it passes to
+-- (v0.13.3, review [2]; v0.15.0 review [13]: one helper for the four places).
+local function through_ours(value)
+  for _ = 1, 8 do
+    if type(ours[value]) ~= "function" then break end
+    value = ours[value]
+  end
+  return value
+end
+
 local function is_lua_function(value)
   if type(value) ~= "function" or ours[value] then return false end
   local _, _, what = source_of(value)
@@ -426,14 +441,7 @@ local function upvalue_slots(fn, avoid)
   for index = 1, 255 do
     local name, value = getupvalue(fn, index)
     if name == nil then break end
-    -- A stale spy or shim of ours (a mod unhooked and left one in the chain,
-    -- and another mod stored it as its previous) stands for what it passes
-    -- to: taken as that, the mod keeps its previous (v0.13.3, review [2];
-    -- before, it read as "no function held" and was charged all below it).
-    for _ = 1, 8 do
-      if type(ours[value]) ~= "function" then break end
-      value = ours[value]
-    end
+    value = through_ours(value)
     if not avoid[value] and is_lua_function(value) then
       out[#out + 1] = { kind = "uv", holder = fn, key = index, name = name,
                         original = value }
@@ -453,10 +461,7 @@ local function field_slots(fn, avoid)
       for key, field in next, value do
         count = count + 1
         if count > TABLE_FIELDS_MAX then break end
-        for _ = 1, 8 do                       -- a stale spy or shim of ours: see upvalue_slots
-          if type(ours[field]) ~= "function" then break end
-          field = ours[field]
-        end
+        field = through_ours(field)
         if type(key) == "string" and not avoid[field] and is_lua_function(field) then
           out[#out + 1] = { kind = "field", holder = value, key = key,
                             name = name .. "." .. key, original = field }
@@ -469,7 +474,7 @@ end
 
 -- ------------------------------------------------------------- the frame
 
-local frame_dt, frame_argc, frame_no = nil, 0, 0
+local frame_dt, frame_argc = nil, 0
 
 -- A pass-through spy: records its arguments, then tail-calls the original,
 -- so it adds no stack frame and returns exactly what the original returns.
@@ -500,20 +505,17 @@ local function make_timer(rec, target)
   return timer
 end
 
--- The shim a mapped link keeps: its duration, this frame and the last, and
--- the frame it was last entered and last returned in (v0.14.0: a link
--- entered and not returned in a frame that did not finish is where a Lua
--- error came from).
+-- The shim a mapped link keeps: its duration, this frame and the last.
+-- (v0.14.0 also stamped the frame each link was entered and left in, to
+-- find where an error came from; v0.15.0 reads that off the stack.)
 local function make_shim(link, target)
   local function finish(t0, ...)
     local took = timer_now() - t0
     link.prev_incl = link.last_incl
     link.last_incl = took
-    link.done = frame_no
     return ...
   end
   local shim = function(...)
-    link.entered = frame_no
     return finish(timer_now(), target(...))
   end
   ours[shim] = target
@@ -525,10 +527,16 @@ end
 local installed = { wrapper = nil, generation = 0, last_tick_at = nil,
                     mw_calls = 0, tick_calls = 0,
                     shutdown_wrapper = nil, rearmed = false,
-                    told_upstream = false, told_tick = false,
+                    told_tick = false,
                     previous_slot = nil, bootstrap = nil, bootstrap_slot = nil,
-                    settling = 0, shutdown_done = false, entries = 0, ticked = 0,
-                    owed = false, errors = {}, errors_session = {}, error_told = {},
+                    settling = 0, shutdown_done = false,
+                    -- v0.15.0 (see "errors"): our depth in the chain (a mod
+                    -- below may call _G.update again), the mod whose error
+                    -- went on to the game and whether the game lived, and
+                    -- the file that tells the next launch.
+                    depth = 0, crash_pending = nil, survives = {}, error_logged = {},
+                    crash_path = nil, xpcall_args = nil,
+                    errors = {}, errors_session = {}, error_told = {},
                     -- v0.13.0: the resource-name hashes of every Lua resource
                     -- in the enabled mods' archives (nil when no Arsenal list
                     -- was read), and the pure-Lua murmur64 that matches them.
@@ -902,10 +910,7 @@ local function start_mapping(top)
   -- at what it passes to: counted as a link it read as this module hooked
   -- twice, on top, and kept the mod that left reachable to the memory walk
   -- through the shim's old slot (v0.13.2, found by the memory-leave test).
-  local first, hops = top, 0
-  while type(ours[first]) == "function" and hops < 8 do
-    first, hops = ours[first], hops + 1
-  end
+  local first = through_ours(top)
   mapping = { links = { new_link(first, nil) }, seen_mods = false, patched = {} }
   begin_step()
 end
@@ -1451,8 +1456,20 @@ local ui = { gui = nil, world = nil, panel = false, key_id = nil,
              signature = nil, in_menu = false, moving = nil,
              place = { x = DEFAULT_X, top = DEFAULT_TOP }, geometry = nil,
              mouse_ids = {}, told = {} }
-local toast = nil             -- { text, until_at }
+local toast = nil             -- { text, until_at, colour, keep, always }
 local last_stall = nil        -- { ms, who, at }
+
+-- An alert that is given once (ERROR, LAST CRASH: keep) is not replaced by
+-- another before its time is up, and the caller marks it given only when this
+-- says it is showing (v0.15.0, review [17]: a LAG line in the same tick took
+-- an ERROR alert's place, and it never came again). "always" shows even with
+-- the alerts switched off: the one LAST CRASH line on the ship.
+function ui.alert(new)
+  if toast ~= nil and toast.keep and now() < toast.until_at then return false end
+  toast = new
+  ui.dirty = true
+  return true
+end
 
 local function tell_once(what, text)
   if ui.told[what] then return end
@@ -1765,9 +1782,8 @@ local function rehook_alert(at)
   if second ~= nil and second.n >= 2 then
     text = text .. string.format(", %s x%d", short_name(second.source), second.n)
   end
-  toast = { text = text .. string.format(" (chain %d)", rehook.length),
-            until_at = at + 8, colour = AMBER }
-  ui.dirty = true
+  ui.alert({ text = text .. string.format(" (chain %d)", rehook.length),
+             until_at = at + 8, colour = AMBER })
 end
 
 -- ------------------------------------------------------------ vram
@@ -1874,8 +1890,7 @@ function gpu.tick(at)
     if not quiet and (toast == nil or at >= toast.until_at) then
       gpu.alerted = at
       local text = string.format("VRAM %.1f / %.1f GB - over budget", usage / 1073741824, budget / 1073741824)
-      toast = { text = text, until_at = at + 8, colour = AMBER }
-      ui.dirty = true
+      ui.alert({ text = text, until_at = at + 8, colour = AMBER })
       say("vram: " .. text)
     end
   end
@@ -2119,11 +2134,10 @@ local function mem_finish(job, at)
     if fast ~= nil and mem.flagged[owner] == nil then
       say(string.format("memory: %s grows fast: ~%s, +%s in %d min", owner, kb_text(fast.kb),
                         kb_text(fast.growth), fast.minutes))
-      if not mem.told[owner] then
+      if not mem.told[owner] and ui.alert({ text = string.format("MEM %s +%s in %d min", short_name(owner),
+                                                                 kb_text(fast.growth), fast.minutes),
+                                            until_at = at + 8, colour = AMBER }) then
         mem.told[owner] = true
-        toast = { text = string.format("MEM %s +%s in %d min", short_name(owner),
-                                       kb_text(fast.growth), fast.minutes),
-                  until_at = at + 8, colour = AMBER }
       end
     end
     if job.size[owner] ~= nil then mem.flagged[owner] = fast end
@@ -2138,7 +2152,6 @@ mem_step = function(at)
   if job == nil then
     if mem.next_at == nil then mem.next_at = at + MEM_EVERY_S end
     if at < mem.next_at then return end
-    if mapping ~= nil or #links == 0 then return end     -- the roots are the chain's links
     job = mem_new_job(at)
     if type(original_main_world) == "function" then
       local ok, world = pcall(original_main_world)
@@ -2153,7 +2166,7 @@ mem_step = function(at)
       if ok then mem_visit(job, registry, SHARED) end
     end
     for _, link in ipairs(links) do
-      local mod = type(link.fn) == "function" and ours[link.fn] == nil and mod_of(link.fn) or nil
+      local mod = type(link.fn) == "function" and mod_of(link.fn) or nil
       if mod ~= nil then mem_add_root(job, link.fn, mod) end
     end
     mem.job = job
@@ -2304,14 +2317,14 @@ function units.tick(at)
   local ok, world = pcall(original_main_world)
   if ok and world ~= nil then
     if units.world == nil then
-      units.world = world
+      units.world, units.world_since = world, at
     elseif world == units.world then
       units.candidate = nil
     elseif units.candidate ~= world then
       units.candidate, units.candidate_at = world, at
     elseif at - units.candidate_at >= UNITS_SETTLE_S then
       units.world_changes = units.world_changes + 1
-      units.world, units.candidate = world, nil
+      units.world, units.candidate, units.world_since = world, nil, at
       for unit, mod in pairs(units.owner) do
         if units.world_of[unit] ~= world then
           units.owner[unit], units.born[unit], units.world_of[unit] = nil, nil, nil
@@ -2349,10 +2362,10 @@ function units.tick(at)
     local flag = (rising and aged >= UNITS_MIN) and { alive = count, old = aged } or nil
     if flag ~= nil and units.flagged[mod] == nil then
       say(string.format("units: %s has %d units older than 10 min and still rising", mod, aged))
-      if not units.told[mod] then
+      if not units.told[mod] and ui.alert({ text = string.format("UNITS %s %d old units, still rising",
+                                                                   short_name(mod), aged),
+                                             until_at = at + 8, colour = AMBER }) then
         units.told[mod] = true
-        toast = { text = string.format("UNITS %s %d old units, still rising", short_name(mod), aged),
-                  until_at = at + 8, colour = AMBER }
       end
     end
     units.flagged[mod] = flag
@@ -2444,7 +2457,9 @@ local function report_text(key, at)
   local version = string.match(MARKER, "(v[%d%.]+)$") or MARKER
   local chain = 0
   for _, link in ipairs(links) do
-    if string.sub(tostring(link.source), 1, 5) == "mods/" or link.patch then chain = chain + 1 end
+    if string.sub(tostring(link.source), 1, 5) == "mods/" or link.patch or link.boot_patch then
+      chain = chain + 1
+    end
   end
   -- The session so far: the summaries written plus the minute under way.
   local partial = window.started and math.max(0, at - window.started) or 0
@@ -2618,13 +2633,21 @@ local function panel_lines(at)
   for mod, flag in pairs(units.flagged) do
     out[#out + 1] = { string.format("UNITS %s %d old units, still rising", short_name(mod), flag.old), AMBER }
   end
-  local raised = {}
+  local raised, order = {}, {}
   for _, bucket in ipairs(buckets) do
-    for key, n in pairs(bucket.errors or {}) do raised[key] = (raised[key] or 0) + n end
+    for key, n in pairs(bucket.errors or {}) do
+      if raised[key] == nil then order[#order + 1] = key end
+      raised[key] = (raised[key] or 0) + n
+    end
   end
-  for key, n in pairs(raised) do
-    out[#out + 1] = { string.format("ERROR %s %.0f frames/min", short_name(key), n * 60 / math.max(seconds, 1)),
-                      AMBER }
+  -- Most first, so two mods do not swap places between refreshes (review [15]).
+  table.sort(order, function(a, b)
+    if raised[a] ~= raised[b] then return raised[a] > raised[b] end
+    return a < b
+  end)
+  for _, key in ipairs(order) do
+    out[#out + 1] = { string.format("ERROR %s %.0f frames/min", short_name(key),
+                                    raised[key] * 60 / math.max(seconds, 1)), AMBER }
   end
   if last_stall ~= nil then
     out[#out + 1] = { string.format("last stall %s ms %s, %.0f s ago", ms(last_stall.ms),
@@ -2713,7 +2736,7 @@ local function items(at)
       y = y - LINE * s
     end
   end
-  if toast ~= nil and at < toast.until_at and (ui.in_menu or not ui.alerts_off) then
+  if toast ~= nil and at < toast.until_at and (ui.in_menu or not ui.alerts_off or toast.always) then
     local y = window_shown and (g.top + 8 * s) or (g.top - HEADER * s + 8 * s)
     list[#list + 1] = { text = toast.text, x = g.x + PAD * s, y = y, size = 20 * s,
                         c = toast.colour or RED,
@@ -2817,6 +2840,22 @@ end
 
 local function display(at)
   rehook_alert(at)
+  -- The last session's crash, once, on the ship (v0.15.0; the user chose the
+  -- log and one line on the next launch). On the ship = 20 s after the first
+  -- frame and the main world unchanged for 10 s (likely: the launch loads
+  -- straight to the ship; the log's "last crash shown" line says when it
+  -- came, to check in game).
+  local note = ui.crash_note
+  if note ~= nil and ui.first_tick ~= nil and at - ui.first_tick >= 20 and
+     (not units.installed or (units.world ~= nil and units.candidate == nil and
+                              at - (units.world_since or at) >= 10)) then
+    local text = string.sub(note.key, 1, 1) == "(" and "LAST CRASH: a Lua error outside every mod"
+                 or ("LAST CRASH: " .. short_name(note.key) .. " raised a Lua error")
+    if ui.alert({ text = text, until_at = at + 12, colour = AMBER, keep = true, always = true }) then
+      ui.crash_note = nil
+      say("last crash shown: " .. text)
+    end
+  end
   if key_pressed() then
     ui.panel = not ui.panel
     ui.dirty = true
@@ -2837,7 +2876,7 @@ local function display(at)
     end
   end
   if in_menu then handle_mouse() end
-  if not (in_menu or ui.panel or (toast ~= nil and not ui.alerts_off)) then
+  if not (in_menu or ui.panel or (toast ~= nil and (not ui.alerts_off or toast.always))) then
     if ui.gui ~= nil then drop_gui() end
     ui.dirty = false
     return
@@ -2950,9 +2989,8 @@ local function report(hitch, frame_selfs)
       caused.top[#caused.top + 1] = hitch.interval
       table.sort(caused.top, function(a, b) return a > b end)
       while #caused.top > 3 do table.remove(caused.top) end
-      toast = { text = string.format("LAG %s ms - %s", ms(hitch.interval), who),
-                until_at = at + TOAST_S }
-      ui.dirty = true
+      ui.alert({ text = string.format("LAG %s ms - %s", ms(hitch.interval), who),
+                 until_at = at + TOAST_S })
     else
       last_stall = { ms = hitch.interval, who = nil, at = at }
     end
@@ -2973,7 +3011,9 @@ local function report(hitch, frame_selfs)
     end
   end
   local body
-  if frame_selfs == nil then
+  if hitch.failed then
+    body = "a Lua error cut this frame or the next short; not broken down"
+  elseif frame_selfs == nil then
     body = "chain not mapped yet"
   else
     local mine = hitch.mine or 0
@@ -2989,12 +3029,20 @@ local function report(hitch, frame_selfs)
   if hitch_lines == HITCH_LINES then say("-- hitch lines spent; summaries keep counting") end
 end
 
-local function tick()
+-- failed: a Lua error cut this frame short (v0.15.0). Its tick still runs
+-- once, at its end, so Home, clicks and the window work whatever raises
+-- (review [2]: v0.13.4's tick owed to the next frame ran twice there). But
+-- the shims of the links it cut off kept an older frame's times, so nothing
+-- is charged, no stall is broken down and the walk does not count the frame
+-- (review [1], [4], [6], [16]).
+local function tick(failed)
   local at = now()
   if window.started == nil then
     window.started = at
+    ui.first_tick = ui.first_tick or at
     pcall(note_deploy)
   end
+  window.last_at = at
   roll(at)
   if at - flushed_at >= FLUSH_S then flush_log() end
 
@@ -3028,32 +3076,29 @@ local function tick()
       if not ok_report then say("stall report failed: " .. tostring(err)) end
     end
     walk(start_mapping, top)
-  elseif mapping ~= nil then
+  elseif mapping ~= nil and not failed then
     walk(step_mapping)
   end
 
   local heap = heap_kb()
   local mapped = mapping == nil and #links > 0
   local frame_selfs = nil
-  if mapped then
+  if mapped and not failed then
     if installed.settling > 0 then
       installed.settling = installed.settling - 1
     else
       frame_selfs = selfs()
     end
   end
-  add_mdl(frame_selfs)
+  if not failed then add_mdl(frame_selfs) end
 
   if pending ~= nil then
+    if failed then pending.failed = true end
     report(pending, pending.mapped and mapped and frame_selfs or nil)
     pending = nil
   end
   if frame_selfs ~= nil then charge(frame_selfs) end
 
-  if installed.entries - installed.ticked > 1 then
-    last_tick_time, pending = nil, nil      -- frames that raised below us had no tick
-  end
-  installed.ticked = installed.entries
   if last_tick_time ~= nil then
     local interval = at - last_tick_time
     window.frames = window.frames + 1
@@ -3068,7 +3113,7 @@ local function tick()
       -- The tick that ended the last frame lies inside this interval: its
       -- cost is this module's own share (unmeasured when it is the top link).
       pending = { interval = interval, dt = frame_dt, heap = heap, heap_drop = drop,
-                  mapped = mapped, mine = installed.tick_cost or 0 }
+                  mapped = mapped, mine = installed.tick_cost or 0, failed = failed }
     end
   end
   last_tick_time = at
@@ -3141,85 +3186,155 @@ local function arm()
     local previous_update = current
     installed.generation = installed.generation + 1
     local generation = installed.generation
-    -- Our tick runs after the frame below, then its results go back up
-    -- unchanged. An error from below is not caught at all (v0.13.3, review
-    -- [10]): it reaches the engine as it was raised, with its own traceback
-    -- -- v0.12.7 caught and re-raised it, so crash traces ended in this
-    -- module -- and that frame has no tick. The heartbeat is taken on the
-    -- way in, so frames that raise still show we are in the chain (no
-    -- re-arm over a mod hooked above us); the frames without a tick are
-    -- counted, so the first tick after them is no stall.
-    local function run_tick()
-      local started = now()
-      local ok_tick, err = pcall(tick)
-      installed.tick_cost = now() - started
-      if not ok_tick and not installed.told_tick then
-        installed.told_tick = true
-        say("tick error: " .. tostring(err))
-      end
+    -- "errors" (v0.15.0). A Lua error that reaches the engine from update
+    -- closes the game (proven 2026-10-01: Lua Error Probe v1, one error()
+    -- from the top of _G.update on the ship; a ~0.5 s hitch, then the game
+    -- was gone; crash dump 0xC0000005 at lua51.dll+0x4a050 with the message
+    -- in its heap). The release game writes no log a player can read, so
+    -- nobody can tell which mod it was. The frame below runs under xpcall:
+    -- before the stack unwinds, the handler finds the mod, logs it with the
+    -- message, flushes the log and writes mod_lag_finder_crash.txt; the
+    -- error then goes on to the game unchanged (error(err, 0)), and the game
+    -- closes exactly as it would without this module (the user, 2026-10-01:
+    -- pass it on, do not catch it). The next launch reads that file, logs it
+    -- and shows "LAST CRASH: <name> raised a Lua error" once. When the next
+    -- frame comes after all, a mod above us caught the error: the file is
+    -- emptied, that mod's errors are only counted from then on (the v0.14.0
+    -- log line, ERROR window line and one alert in missions).
+    --
+    -- Which mod: the position at the start of the message when it is a
+    -- mods/ script (what error() and the runtime put there; it survives a
+    -- mod that catches and re-raises with level 0), else the first mods/
+    -- function on the stack between the raise and this wrapper. Neither =
+    -- "(game script <name>)", or "(the game)" when no script is on it
+    -- either (review [18]: v0.14.0 put a mod's error in a function the game
+    -- calls on the game).
+    local wrapper, on_error
+    local own_source = source_of(arm)
+    local function key_of(source)
+      source = tostring(source or "?")
+      local first = string.sub(source, 1, 1)
+      if first == "@" or first == "=" then source = string.sub(source, 2) end
+      return (string.gsub(source, "%.lua$", ""))
     end
-    local function after(...)
-      if installed.generation == generation then
-        installed.owed = false
-        run_tick()
+    local function culprit(err)
+      if type(err) == "string" then
+        local chunk = string.match(err, "^([^:\n]+):%d+:")
+        if chunk ~= nil then
+          chunk = key_of(chunk)
+          if is_mod_source(chunk) and chunk ~= own_source then return chunk end
+        end
       end
-      return ...
-    end
-    -- "blame": which link raised in a frame that did not finish -- the
-    -- deepest link below us that its shim saw entered in that frame and not
-    -- returned (v0.14.0; the user: the tool exists because mod quality
-    -- varies, so name the mod). Whether it raised before or after calling
-    -- the rest of the chain, that link is the one; the links between us and
-    -- it were entered too, but sit above it. While the chain is being
-    -- mapped there are no stamps, and the error is put on "below".
-    local function blame(frame)
-      local key = nil
-      if mapping == nil and our_index ~= nil then
-        for index = #links, our_index + 1, -1 do
-          local link = links[index]
-          if link.entered == frame and link.done ~= frame then
-            key = owner(link)
-            break
+      -- The stack from the raise outward: the frames above the handler
+      -- (this function, its pcall) are skipped, the walk ends at our wrapper.
+      local game, raised = nil, false
+      for level = 1, 120 do
+        local info = getinfo(level, "Sf")
+        if type(info) ~= "table" or info.func == wrapper then break end
+        if info.func == on_error then
+          raised = true
+        elseif raised and info.what ~= "C" then
+          local source = key_of(info.source)
+          if source ~= own_source then
+            if is_mod_source(source) then return source end
+            game = game or source
           end
         end
       end
-      key = key or "(below this module, chain not mapped)"
+      return game and ("(game script " .. game .. ")") or "(the game)"
+    end
+    local function write_crash(text)
+      if installed.crash_path == nil then return end
+      local file = io.open(installed.crash_path, "w")
+      if file == nil then return end
+      file:write(text)
+      file:close()
+    end
+    local function note_error(err)
+      local key = culprit(err)
+      local text = string.gsub(string.sub(tostring(err), 1, 300), "[%c]+", " ")
       installed.errors[key] = (installed.errors[key] or 0) + 1
       installed.errors_session[key] = (installed.errors_session[key] or 0) + 1
       if live.bucket ~= nil then
         live.bucket.errors = live.bucket.errors or {}
         live.bucket.errors[key] = (live.bucket.errors[key] or 0) + 1
       end
-      if installed.errors[key] >= ERROR_ALERT_FRAMES and not installed.error_told[key]
-         and (toast == nil or now() >= toast.until_at) then
+      if not installed.error_logged[key] then
+        installed.error_logged[key] = true
+        say("error: " .. key .. " raised a Lua error: " .. text)
+      end
+      if not installed.survives[key] then
+        -- On disk before the error goes on: the game is about to close.
+        installed.crash_pending = key
+        write_crash(string.format("date=%s%skey=%s%smessage=%s%s", local_time(os.time()), NL,
+                                  key, NL, text, NL))
+        say("error: passed on to the game, which closes on it unless a mod above catches it")
+        flush_log()
+      end
+      if installed.errors[key] >= ERROR_ALERT_FRAMES and not installed.error_told[key] and
+         ui.alert({ text = string.format("ERROR %s keeps raising Lua errors", short_name(key)),
+                    until_at = now() + 8, colour = AMBER, keep = true }) then
         installed.error_told[key] = true
-        toast = { text = string.format("ERROR %s keeps raising Lua errors", short_name(key)),
-                  until_at = now() + 8, colour = AMBER }
-        ui.dirty = true
         say("errors: " .. key .. " keeps raising Lua errors")
       end
     end
-    -- A frame that raised below us never reaches after(): its tick is run at
-    -- the start of the next frame instead (v0.13.4). v0.13.3 had no tick at
-    -- all while a mod below raised every frame -- no window on Home, no
-    -- alerts, no log (a player's report, 2026-10-01: "the window does not
-    -- pop up anymore when pressing home"). The error itself still goes up
-    -- untouched.
-    local wrapper = function(...)
+    on_error = function(err)
+      pcall(note_error, err)
+      return err
+    end
+    -- The game lived through the error after all: a mod above caught it.
+    local function survived()
+      local key = installed.crash_pending
+      installed.crash_pending = nil
+      installed.survives[key] = true
+      write_crash("")
+      say("error: the game went on after " .. key .. "'s error (a mod above caught it); counted from now on")
+    end
+    installed.clear_crash = function()
+      if installed.crash_pending ~= nil then
+        installed.crash_pending = nil
+        write_crash("")
+      end
+    end
+    local function run_tick(failed)
+      local started = now()
+      local ok_tick, err = pcall(tick, failed)
+      installed.tick_cost = now() - started
+      if not ok_tick and not installed.told_tick then
+        installed.told_tick = true
+        say("tick error: " .. tostring(err))
+      end
+    end
+    local function after(ok, ...)
+      installed.depth = 0
+      if installed.generation == generation then run_tick(not ok) end
+      if ok then return ... end
+      error((...), 0)
+    end
+    -- xpcall passes the arguments on in LuaJIT (the game's VM); a VM whose
+    -- xpcall does not gets them through a closure.
+    if installed.xpcall_args == nil then
+      local ok_args, got = xpcall(function(a) return a end, function(e) return e end, 1)
+      installed.xpcall_args = ok_args and got == 1
+    end
+    local unpack_fn = rawget(_G, "unpack")
+    wrapper = function(...)
+      -- A mod below that calls _G.update again inside the frame (a substep)
+      -- comes back here: passed on as it is (review [7]).
+      if installed.depth > 0 or installed.generation ~= generation then
+        return previous_update(...)
+      end
       frame_dt = (...)
       frame_argc = select("#", ...)
-      if installed.generation == generation then
-        if installed.owed then
-          pcall(blame, frame_no)
-          run_tick()
-        end
-        frame_no = frame_no + 1
-        installed.owed = true
-        installed.last_tick_at = clock()
-        installed.tick_calls = installed.mw_calls
-        installed.entries = installed.entries + 1
+      if installed.crash_pending ~= nil then pcall(survived) end
+      installed.last_tick_at = clock()
+      installed.tick_calls = installed.mw_calls
+      installed.depth = 1
+      if installed.xpcall_args then
+        return after(xpcall(previous_update, on_error, ...))
       end
-      return after(previous_update(...))
+      local n, args = select("#", ...), { ... }
+      return after(xpcall(function() return previous_update(unpack_fn(args, 1, n)) end, on_error))
     end
     -- The slot our own previous lives in, found by name in our own closure.
     installed.previous_slot = nil
@@ -3227,11 +3342,7 @@ local function arm()
       local name, value = getupvalue(wrapper, index)
       if name == nil then break end
       if name == "previous_update" then
-        local target = value
-        for _ = 1, 8 do                       -- a stale spy or shim of ours: see upvalue_slots
-          if type(ours[target]) ~= "function" then break end
-          target = ours[target]
-        end
+        local target = through_ours(value)
         if target ~= value then setupvalue(wrapper, index, target) end
         installed.previous_slot = { kind = "uv", holder = wrapper, key = index,
                                     name = name, original = target }
@@ -3245,10 +3356,17 @@ local function arm()
     -- window either (v0.13.3, review [4]: its span covered the gap, so every
     -- mod's ms/s read low -- about half after a 30 s gap).
     last_tick_time, pending = nil, nil
-    installed.owed = false
+    installed.depth = 0
     if installed.generation > 1 then
       live.bucket, live.ring = nil, {}
-      window = { mods = {}, started = now(), frames = 0, hitches = 0 }
+      -- The minute so far goes into the log and the session first (review
+      -- [5]: it was dropped, with its error counts). With no tick yet the
+      -- window stays unstarted, so the first tick still notes the deploy
+      -- (review [20]).
+      if window.started ~= nil then
+        if window.last_at ~= nil then write_summary(window.last_at) end
+        window = { mods = {}, started = now(), frames = 0, hitches = 0 }
+      end
     end
     rawset(_G, "update", wrapper)
     say("update armed generation=" .. installed.generation)
@@ -3263,6 +3381,7 @@ local function arm()
       if installed.shutdown_done then return previous_shutdown(...) end
       installed.shutdown_done = true
       pcall(function()
+        if installed.clear_crash then installed.clear_crash() end
         write_summary(now())
         say(session_line("game over"))
         say("shutdown")
@@ -3353,6 +3472,18 @@ local function main()
   say(string.format("names: %s (%.0f ms)", ok_names and tostring(told) or ("failed: " .. tostring(told)),
                     (now() - named_at) * 1000))
   say("timer: " .. timer_kind)
+  if log_path ~= nil then
+    installed.crash_path = string.gsub(log_path, "mod_lag_finder%.log$", "mod_lag_finder_crash.txt")
+    local last = read_all(installed.crash_path)
+    local key = last and string.match(last, "key=([^\r\n]*)") or nil
+    if key ~= nil and key ~= "" then
+      say(string.format("last crash: the game closed on a Lua error from %s (%s): %s", key,
+                        string.match(last, "date=([^\r\n]*)") or "?", string.match(last, "message=([^\r\n]*)") or "?"))
+      ui.crash_note = { key = key }
+      local file = io.open(installed.crash_path, "w")
+      if file ~= nil then file:close() end
+    end
+  end
   local ok_gpu, gpu_told = pcall(gpu.open)
   if not ok_gpu then gpu.read = nil end
   say("vram: " .. (ok_gpu and tostring(gpu_told) or ("off (" .. tostring(gpu_told) .. ")")))

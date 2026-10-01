@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.14.0"
+RELEASE = "Mod Lag Watchdog v0.15.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1703,51 +1703,6 @@ end)
 """
 
 
-# Hooked above the Watchdog: keeps the traceback of an error from below, as
-# the engine would see it, and passes the error on.
-REVIEW_TOPCAP = r"""
-local previous = rawget(_G, "update")
-rawset(_G, "update", function(...)
-  local ok, trace = xpcall(previous, debug.traceback, ...)
-  if not ok then
-    TRACE = TRACE or trace
-    error(trace, 0)
-  end
-end)
-"""
-
-
-def review_errors_case():
-    """1. An error from a mod below the Watchdog reaches the engine every
-    frame, as it would without the Watchdog, with its own traceback (v0.13.3,
-    review [10]: v0.12.7-v0.13.2 caught and re-raised it, so the trace began
-    in this module). Errors for 400 frames with a mod hooked above us cause
-    no re-arm, no stall when they stop, and the Watchdog ticks on after.
-    v0.12.6 swallowed the error; v0.13.2 re-raised it from its own code."""
-    print("review: errors from below")
-    with session() as s:
-        check(s.load_mod(source=REVIEW_THROWER, name="mods/test/thrower"), "thrower loads")
-        load(s, ["finder"])
-        s.frames(60)
-        check(s.load_mod(source=REVIEW_TOPCAP, name="mods/test/topcap"), "topcap loads (above us)")
-        s.frames(60)
-        s.lua("THROW = true")
-        s.frames(400)
-        s.lua("THROW = false")
-        s.frames(3800)
-        r = s.report()
-        thrown = [u for u in r["uncaught"] if "thrower broke" in u["error"]]
-        check(len(thrown) >= 390, "every frame's error reaches the engine: %d of 400" % len(thrown))
-        trace = s.eval("TRACE") or ""
-        check("mods/test/thrower" in trace, "with the thrower's own traceback: %r" % trace[:300])
-        check(not log_lines(s, r"update armed generation=2"), "no re-arm while the errors last: %r"
-              % log_lines(s, "armed"))
-        hitches = [int(v) for v in re.findall(r"hitch (\d+) ms", s.file(LOG, "") or "")]
-        check(not [h for h in hitches if h >= 500], "no stall for the frames that raised: %r" % hitches)
-        check(bool(log_lines(s, r"summary 60 s: frames=\d{4}")), "the Watchdog ticks on after: %r"
-              % log_lines(s, "summary")[:1])
-
-
 def review_remap_case():
     """2. Right after a (re)map the newest link has no finished frame yet:
     nothing is charged until every shim has run twice. v0.12.6 charged the
@@ -2371,124 +2326,398 @@ def review_builder_case():
         check(raised, "the gate failure stops the build")
         check(not os.path.exists(out) and not os.path.exists(zip_path),
               "and nothing is left behind: %r" % os.listdir(scratch))
+        # review [10]: a write before the gate that fails (here the archive
+        # template) leaves nothing behind either; v0.14.0 left the folder.
+        saved_write = builder.write_module
+
+        def failing_write(*args):
+            raise SystemExit("test: the template is bad")
+
+        builder.write_module = failing_write
+        try:
+            builder.build()
+        except SystemExit:
+            pass
+        finally:
+            builder.write_module = saved_write
+        check(not os.path.exists(out), "a failed write leaves no folder: %r" % os.listdir(scratch))
     finally:
         builder.modpaths.out_paths, builder.gate_release = saved
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-# Runs the chain below it, then its own code fails, every frame: the game
-# plays on, but nothing after it in the frame runs.
+# Hooked above the Watchdog (loaded once it has armed): catches any error
+# from below, as some mods do, so the game lives on.
+CATCHER = r"""
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  local ok = pcall(previous, ...)
+  if not ok then CAUGHT = (CAUGHT or 0) + 1 end
+end)
+"""
+# Runs the chain below it, then fails, every frame from LATE_ON.
 LATE_THROWER = r"""
 local previous = rawget(_G, "update")
 rawset(_G, "update", function(...)
   local result = previous(...)
-  error("late broke", 0)
+  if LATE_ON then error("late broke", 0) end
   return result
 end)
 """
-
-
-def late_error_case():
-    """A mod below that raises every frame after the rest of its chain ran
-    (a player's report on v0.13.3, 2026-10-01: Home no longer opened the
-    window): the Watchdog still ticks, one tick a frame, at the start of the
-    next frame. Home opens the window, a stall is still seen, the minute
-    summary counts the frames that did not finish, the error still reaches
-    the engine every frame, and the chain below still runs every frame.
-    (Which mod a stall is in is not known while frames do not finish: the
-    timings of the links between us and the error freeze -- review [5],
-    open; v0.11.0 read them as 0 as well.) Fails on v0.13.3."""
-    print("late error below")
-    with session() as s:
-        s.lua(GUI_STUB)
-        check(s.load_mod(source=LATE_THROWER, name="mods/test/late"), "late loads")
-        load(s, ["slow", "heavy", "finder"])
-        s.frames(320)
-        s.lua("FAKE.press('home')")
-        s.frames(3)
-        shown = s.eval("SHOWN()")
-        check(re.search(r"last \d+ s: frame", shown) is not None, "Home opens the window: %r" % shown)
-        check(bool(log_lines(s, r"hitch 4\d\d ms")), "slow's 400 ms stall is still seen: %r" % log_lines(s, "hitch")[:2])
-        s.frames(3600)
-        check(bool(log_lines(s, r"errors: mods/test/late raised a Lua error in \d{3,} frames")),
-              "the summary names the mod and counts its frames (v0.14.0): %r" % log_lines(s, "errors:")[:2])
-        r = s.report()
-        late = [u for u in r["uncaught"] if "late broke" in u["error"]]
-        check(len(late) >= 3900, "the error still reaches the engine every frame: %d" % len(late))
-        counts = s.eval("string.format('%d %d', COUNTS.heavy or 0, FAKE.frame)")
-        heavy, frames = (int(v) for v in counts.split())
-        check(heavy == frames, "the chain below still runs every frame: heavy %d of %d" % (heavy, frames))
-
-
-# Raises before it calls the rest of the chain, from ERR_FROM on.
+# Fails before it calls the rest of the chain, every frame from EARLY_ON.
 EARLY_THROWER = r"""
 local previous = rawget(_G, "update")
-local n = 0
 rawset(_G, "update", function(...)
-  n = n + 1
-  if n >= (ERR_FROM or 1e9) then error("early broke", 0) end
+  if EARLY_ON then error("early broke", 0) end
   return previous(...)
 end)
 """
-# Raises after the rest of the chain ran, once every 100 frames.
+# Fails after the rest of its chain, in frames n % EVERY == FROM (RARE_ON).
 RARE_THROWER = r"""
 local previous = rawget(_G, "update")
 local n = 0
 rawset(_G, "update", function(...)
   n = n + 1
   local result = previous(...)
-  if n % 100 == 0 then error("rare broke", 0) end
+  if RARE_ON and n % (EVERY or 100) == 0 then error("rare broke", 0) end
   return result
 end)
 """
+# Fails with a position in the message (error() at level 1).
+POSITIONED = r"""
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  if P_ON then error("p broke") end
+  return previous(...)
+end)
+"""
+# Catches the error from below and raises it again as it was (level 0).
+RERAISER = r"""
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  local ok, err = pcall(previous, ...)
+  if not ok then error(err, 0) end
+end)
+"""
+# The game's own update calling a callback once a frame (not a mod: its
+# chunk is "scenario"); a mod or the game can fill it in.
+GAME_CALLS = r"""
+local game_step = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  if CALLBACK then CALLBACK() end
+  return game_step(...)
+end)
+"""
+CALLBACK_MOD = r"""
+CALLBACK = function() if CB_ON then error("cb broke", 0) end end
+"""
+# Calls the global update once more inside its own (a substep), every frame.
+SUBSTEP = r"""
+local previous = rawget(_G, "update")
+local inside = false
+rawset(_G, "update", function(...)
+  COUNT("substep")
+  if not inside then
+    inside = true
+    rawget(_G, "update")(...)
+    inside = false
+  end
+  return previous(...)
+end)
+"""
+# Stalls 400 ms in frames n % 51 == 49: with RARE_THROWER at EVERY = 3
+# (loaded in the same frame, so the same n) neither that frame nor the next
+# raises, so the stall is broken down and gets its LAG line.
+LAGGY = r"""
+local previous = rawget(_G, "update")
+local n = 0
+rawset(_G, "update", function(...)
+  n = n + 1
+  if LAGGY_ON and n % 51 == 49 then CLOCK = CLOCK + 0.4 end
+  return previous(...)
+end)
+"""
+CRASH_FILE = "mod_lag_finder_crash.txt"
 
 
-def blame_case():
-    """Which mod raises (v0.14.0). A mod in the middle of the chain that
-    raises every frame after its chain ran is named -- not the mods above
-    it, which it cut short, nor the ones below: in the log every minute, an
-    amber ERROR line in the window, and one alert in missions. One that
-    raises before calling on is named just the same. One that raises once
-    every 100 frames is logged but gets no alert. Fails on v0.13.4."""
-    print("blame")
+def error_keys(s):
+    """Every mod the minute summaries name: (.+?) also catches keys with
+    spaces, "(the game)" and the like (review [9])."""
+    return [m.group(1) for m in (re.search(r"errors: (.+?) raised a Lua error in \d+ frames", l)
+                                 for l in log_lines(s, r"errors: .+ raised a Lua error in"))]
+
+
+def crash_case():
+    """v0.15.0: a Lua error from a mod below closes the game, as it would
+    without the Watchdog (proven 2026-10-01; the fake now dies of it too),
+    and reaches the engine unchanged. Before it goes on, the log names the
+    mod with its message -- on disk at once, not 10 s later -- and
+    mod_lag_finder_crash.txt holds it for the next launch. Fails on v0.14.0
+    (nothing logged, no file)."""
+    print("crash")
+    with session() as s:
+        check(s.load_mod(source=EARLY_THROWER, name="mods/test/early"), "early loads")
+        load(s, ["heavy"])
+        load(s, ["finder"], flush=False)
+        s.frames(300)
+        s.lua("EARLY_ON = true")
+        alive = s.frames(5)
+        r = s.report()
+        check(not alive and r["dead"] is not None and r["dead"]["evidence"] == "proven",
+              "the game closes on it: %s" % s.explain(r).replace("\n", " | "))
+        check([u["error"] for u in r["uncaught"]] == ["early broke"],
+              "the error reaches the engine unchanged: %r" % r["uncaught"])
+        check(bool(log_lines(s, r"error: mods/test/early raised a Lua error: early broke")),
+              "the log names it first, on disk: %r" % log_lines(s, "error"))
+        crash = s.file(CRASH_FILE, "") or ""
+        check("key=mods/test/early" in crash and "message=early broke" in crash
+              and re.search(r"date=\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", crash) is not None,
+              "the crash file holds it: %r" % crash)
+
+
+def culprit_case():
+    """Which mod (v0.15.0): the position in the message when it is a mods/
+    script -- kept through a mod that catches and raises it again -- else the
+    first mods/ function on the stack. An error in a callback the game's own
+    update calls is the mod's that set it (review [18]: v0.14.0 named the
+    game); one in the game's own script is "(game script ...)". Fails on
+    v0.14.0."""
+    print("culprit")
+
+    def crash_with(setup, mods, flag):
+        with session() as s:
+            setup(s)
+            for name, source in mods:
+                check(s.load_mod(source=source, name=name), "%s loads" % name)
+            load(s, ["finder"])
+            s.frames(300)
+            s.lua(flag + " = true")
+            s.frames(3)
+            check(s.report()["dead"] is not None, "the game closes (%s)" % flag)
+            return [m.group(1) for m in (re.search(r"error: (.+?) raised a Lua error", l)
+                                         for l in log_lines(s, r"error: .+ raised a Lua error"))]
+
+    named = crash_with(lambda s: None, [("mods/test/p", POSITIONED), ("mods/test/r", RERAISER)], "P_ON")
+    check(named == ["mods/test/p"], "re-raised by another mod, the message's position names it: %r" % named)
+    named = crash_with(lambda s: s.lua(GAME_CALLS), [("mods/test/cb", CALLBACK_MOD)], "CB_ON")
+    check(named == ["mods/test/cb"], "in a callback the game calls, the mod that set it: %r" % named)
+    named = crash_with(lambda s: s.lua(GAME_CALLS + 'CALLBACK = function() if GAME_ON then error("x", 0) end end'),
+                       [], "GAME_ON")
+    check(named == ["(game script scenario)"], "in the game's own script, that script: %r" % named)
+
+
+def last_session(s, pattern):
+    """log_lines over this launch only (the log is appended across launches)."""
+    text = (s.file(LOG, "") or "").split("== mod-lag-finder")[-1]
+    return [l for l in text.splitlines() if re.search(pattern, l)]
+
+
+def next_launch_case():
+    """The next launch (v0.15.0; the user chose the log and one line on the
+    ship): the log says which mod's error closed the game, and "LAST CRASH:
+    <name> raised a Lua error" shows once, 20 s after the first frame with
+    the world settled -- with the alerts switched off too -- and goes after
+    12 s. The file is emptied, so the launch after says nothing."""
+    print("next launch")
+    scratch = tempfile.mkdtemp(prefix="mlf_crash_")
+
+    def game():
+        s = Session(backend=BACKEND, scratch=scratch, keep_scratch=True)
+        s.lua(CLOCK)
+        s.lua("FAKE.mission()")
+        s.lua(GUI_STUB)
+        return s
+
+    try:
+        with game() as s:
+            check(s.load_mod(source=EARLY_THROWER, name="mods/test/early"), "early loads")
+            load(s, ["finder"])
+            s.frames(300)
+            s.lua("EARLY_ON = true")
+            s.frames(3)
+            check(s.report()["dead"] is not None, "the first game closes on the error")
+            path = os.path.join(s.game_dir, "mod_lag_finder_window.txt")
+        with open(path, "w") as f:
+            f.write("1056 620 0 0\n")                 # alerts switched off
+        with game() as s:
+            load(s, ["finder"])
+            check(bool(last_session(s, r"last crash: the game closed on a Lua error from mods/test/early "
+                                       r"\(\d{4}-[^)]*\): early broke$")),
+                  "the log says which mod: %r" % last_session(s, "last crash"))
+            check((s.file(CRASH_FILE, "") or "") == "", "the file is emptied: %r" % s.file(CRASH_FILE))
+            s.frames(900)                             # ~14 s
+            check("LAST CRASH" not in s.eval("SHOWN()"), "not before 20 s: %r" % s.eval("SHOWN()"))
+            s.frames(600)                             # ~24 s
+            shown = s.eval("SHOWN()")
+            check("LAST CRASH: early raised a Lua error" in shown,
+                  "shown on the ship, alerts off or not: %r" % shown)
+            check(len(last_session(s, r"last crash shown: LAST CRASH: early raised a Lua error$")) == 1,
+                  "and logged when: %r" % last_session(s, "last crash shown"))
+            s.frames(900)
+            check("LAST CRASH" not in s.eval("SHOWN()"), "gone after 12 s, and not again")
+        with game() as s:
+            load(s, ["finder"])
+            s.frames(1600)
+            check(not last_session(s, r"last crash") and "LAST CRASH" not in s.eval("SHOWN()"),
+                  "the launch after says nothing: %r" % last_session(s, "last crash"))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def caught_case():
+    """A mod above the Watchdog catches the error (v0.15.0): the game lives.
+    The crash file written for the first error is emptied on the next frame
+    and the log says so; then the errors are counted (v0.14.0): the minute
+    line names only that mod, an amber ERROR window line, one alert in
+    missions. The Watchdog ticks once a frame, so Home opens the window when
+    every frame raises (review [2]: v0.13.4/v0.14.0 ticked twice and Home
+    closed it again), a stall is still seen, and the chain below runs every
+    frame. Fails on v0.14.0."""
+    print("caught")
     with session() as s:
         s.lua(GUI_STUB)
-        load(s, ["std"])                                    # below the thrower
+        load(s, ["std"])                                     # below the thrower
         check(s.load_mod(source=LATE_THROWER, name="mods/test/late"), "late loads")
-        load(s, ["heavy", "finder"])                        # heavy above it
+        load(s, ["slow", "heavy", "finder"])                 # above it
+        s.frames(60)
+        check(s.load_mod(source=CATCHER, name="mods/test/catcher"), "catcher loads (above us)")
+        s.frames(300)
+        s.lua("LATE_ON = true")
+        s.frames(5)
+        check(s.report()["dead"] is None, "the game lives")
+        check(len(log_lines(s, r"error: passed on to the game")) == 1
+              and len(log_lines(s, r"error: the game went on after mods/test/late's error")) == 1,
+              "the first error is passed on, then seen caught: %r" % log_lines(s, "error:"))
+        check((s.file(CRASH_FILE, "") or "") == "", "the crash file is emptied: %r" % s.file(CRASH_FILE))
         s.frames(400)
         shown = s.eval("SHOWN()")
         check("ERROR late keeps raising Lua errors" in shown, "one alert in missions names it: %r" % shown)
-        s.frames(600)
         s.lua("FAKE.press('home')")
         s.frames(3)
         shown = s.eval("SHOWN()")
+        check(re.search(r"last \d+ s: frame", shown) is not None, "Home opens the window: %r" % shown)
         check(re.search(r"ERROR late \d+ frames/min", shown) is not None and "ERROR heavy" not in shown
-              and "ERROR std" not in shown, "the window names it, and only it: %r" % shown)
-        s.frames(3000)
+              and "ERROR std" not in shown and "ERROR slow" not in shown,
+              "the window names it, and only it: %r" % shown)
+        s.frames(3400)
         told = log_lines(s, r"errors: .* keeps raising Lua errors")
         check(len(told) == 1 and "mods/test/late" in told[0], "the alert is given once: %r" % told)
-        named = log_lines(s, r"errors: (\S+) raised a Lua error in \d+ frames")
-        check(bool(named) and all("mods/test/late " in l for l in named),
-              "the minute summaries name only it: %r" % named[:3])
-    with session() as s:
-        load(s, ["std"])                                    # below (std would swallow it from above)
-        check(s.load_mod(source=EARLY_THROWER, name="mods/test/early"), "early loads")
-        load(s, ["heavy", "finder"])
-        s.frames(400)                                       # mapped before it starts
-        s.lua("ERR_FROM = 0")
-        s.frames(3800)
-        named = log_lines(s, r"errors: (\S+) raised a Lua error in \d+ frames")
-        check(bool(named) and all("mods/test/early " in l for l in named),
-              "raising before it calls on, it is named just the same: %r" % named[:3])
+        keys = error_keys(s)
+        check(bool(keys) and all(k == "mods/test/late" for k in keys), "the minute lines name only it: %r" % keys)
+        check(len(log_lines(s, r"error: mods/test/late raised a Lua error: late broke")) == 1,
+              "its message is logged once: %r" % log_lines(s, "late broke")[:3])
+        check(bool(log_lines(s, r"hitch 4\d\d ms")), "slow's stalls are still seen: %r" % log_lines(s, "hitch")[:2])
+        check(not log_lines(s, r"update armed generation=2"), "no re-arm: %r" % log_lines(s, "armed"))
+        counts = s.eval("string.format('%d %d', COUNTS.std or 0, CAUGHT or 0)")
+        std, caught = (int(v) for v in counts.split())
+        check(caught >= 3800 and std >= caught, "the chain below runs every frame: std %d, caught %d" % (std, caught))
+        check(not log_lines(s, r"tick error|walk failed|stall report failed"), "no internal failure")
+
+
+def cut_short_case():
+    """Frames a Lua error cut short (v0.15.0) charge nothing: a mod that
+    raises before it calls on leaves heavy below it unrun, and heavy drops
+    out of the window (review [4]: v0.14.0 kept charging its frozen time).
+    At 30 fps an error now and then is no stall (review [16]: v0.14.0's
+    owed tick measured two frames). Fails on v0.14.0."""
+    print("cut short")
     with session() as s:
         s.lua(GUI_STUB)
+        load(s, ["heavy"])
+        check(s.load_mod(source=EARLY_THROWER, name="mods/test/early"), "early loads")
+        load(s, ["finder"])
+        s.frames(60)
+        s.load_mod(source=CATCHER, name="mods/test/catcher")
+        s.frames(300)
+        s.lua("EARLY_ON = true")
+        s.frames(2400)                                       # 38 s: the window is past heavy
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        check(re.search(r"\|heavy +\d", shown) is None, "heavy, never run, is not charged: %r" % shown)
+        named = log_lines(s, r"error: (.+?) raised a Lua error")
+        check(len(named) == 1 and "error: mods/test/early raised" in named[0], "early is named: %r" % named)
+    with session() as s:
+        s.lua("FAKE.before_frame = function() CLOCK = CLOCK + 0.033 end")
         check(s.load_mod(source=RARE_THROWER, name="mods/test/rare"), "rare loads")
-        load(s, ["heavy", "finder"])
+        load(s, ["finder"])
+        s.frames(60)
+        s.load_mod(source=CATCHER, name="mods/test/catcher")
+        s.frames(300)
+        s.lua("RARE_ON = true")
+        s.frames(2000)
+        check(int(s.eval("CAUGHT or 0")) >= 15, "it raised now and then: %s" % s.eval("CAUGHT"))
+        check(not log_lines(s, r"hitch \d+ ms"), "and no stall: %r" % log_lines(s, "hitch")[:3])
+
+
+def substep_case():
+    """A mod below that calls _G.update again inside the frame is no Lua
+    error and no second tick (review [7]: v0.14.0 counted it as one every
+    frame and warned after 60). Fails on v0.14.0."""
+    print("substep")
+    with session() as s:
+        s.lua(GUI_STUB)
+        check(s.load_mod(source=SUBSTEP, name="mods/test/substep"), "substep loads")
+        load(s, ["finder"])
         s.frames(3900)
-        named = log_lines(s, r"errors: mods/test/rare raised a Lua error in \d+ frames")
-        check(bool(named), "an error every 100 frames is logged: %r" % log_lines(s, "errors:")[:2])
-        check(not log_lines(s, r"keeps raising Lua errors"), "but gets no alert: %r" % log_lines(s, "keeps raising"))
+        check(not log_lines(s, r"error|keeps raising"), "no error: %r" % log_lines(s, "error")[:3])
+        summary = log_lines(s, r"summary 60 s: frames=(\d+)")
+        frames = int(re.search(r"frames=(\d+)", summary[0]).group(1)) if summary else 0
+        check(3600 <= frames <= 3800, "one tick a frame: %r" % summary[:1])
+        check(s.report()["dead"] is None, "nothing dies")
+
+
+def alert_kept_case():
+    """The once-a-session ERROR alert is not replaced by a LAG line in the
+    seconds it shows (review [17]: v0.14.0 marked it given, then a LAG toast
+    took its place, and it never came again). Fails on v0.14.0."""
+    print("alert kept")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["std"])
+        s.lua("EVERY = 3")
+        check(s.load_mod(source=LAGGY, name="mods/test/laggy"), "laggy loads")
+        check(s.load_mod(source=RARE_THROWER, name="mods/test/rare"), "rare loads")
+        load(s, ["finder"])
+        s.frames(60)
+        s.load_mod(source=CATCHER, name="mods/test/catcher")
+        s.frames(300)
+        s.lua("RARE_ON = true; LAGGY_ON = true")
+        for _ in range(400):
+            s.frames(1)
+            if log_lines(s, r"errors: .* keeps raising Lua errors"):
+                break
+        check(bool(log_lines(s, r"errors: mods/test/rare keeps raising Lua errors")), "the alert is due")
+        s.frames(300)                                        # ~5 s, LAG stalls in it
+        check(bool(log_lines(s, r"hitch 4\d\d ms")), "stalls came meanwhile")
+        check("ERROR rare keeps raising Lua errors" in s.eval("SHOWN()"),
+              "the alert is still the one shown: %r" % s.eval("SHOWN()"))
+
+
+def rearm_summary_case():
+    """A re-arm writes the minute under way first (review [5]: v0.14.0
+    dropped it, and its error counts), and one before the first tick still
+    notes the deploy (review [20]). Fails on v0.14.0."""
+    print("re-arm summary")
+    with session() as s:
+        s.lua("GAME_UP = rawget(_G, 'update')")
+        load(s, ["heavy", "finder"])
+        s.frames(2500)                                       # 40 s into the minute
+        s.lua("rawset(_G, 'update', GAME_UP)")
+        s.frames(400)
+        text = s.file(LOG, "") or ""
+        armed = text.find("update armed generation=2")
+        summary = re.search(r"summary (\d+) s: frames=", text)
+        check(armed >= 0 and summary is not None and summary.start() < armed and int(summary.group(1)) >= 35,
+              "the 40 s so far are written before the re-arm: %r" % log_lines(s, "summary|armed"))
+    with session() as s:
+        s.lua("GAME_UP = rawget(_G, 'update')")
+        load(s, ["heavy", "finder"])
+        s.frames(1)                                          # armed, never ticked
+        s.lua("rawset(_G, 'update', GAME_UP)")
+        s.frames(400)
+        check(bool(log_lines(s, r"update armed generation=2")), "re-armed: %r" % log_lines(s, "armed"))
+        check(bool(log_lines(s, r"^t=\S+ deploy: ")), "the deploy is still noted: %r" % log_lines(s, "deploy"))
 
 
 def report_case():
@@ -2506,6 +2735,9 @@ def report_case():
             s.lua(GUI_STUB)
             s.lua(menu_stub())
             s.lua("__hd2_native_test.clipboard = function(text) CLIP = text return true end")
+            # A boot patch under every mod, with no Arsenal list: it counts as a
+            # mod that hooks the update (review [11]: v0.14.0 said 3).
+            check(s.load_mod(source=HUD_BOOT_012, name="boot"), "boot patch loads")
             load(s, ["slow", "heavy", "finder"])
             s.frames(3800)                              # past a 60 s summary, a few stalls
             s.lua("MENU_STATE(1, 0)")                   # escape menu, GAME tab
@@ -2523,9 +2755,9 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 8, "8 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.14\.0, 3 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog v0\.15\.0, 4 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
-            check(re.match(r"Session: 1 min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
+            check(re.match(r"Session: \d+ min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
             check(re.match(r"Cost: \d+\.\d ms/s average, \d+\.\d ms/s in the worst minute, worst frame 4\d\d ms",
                            lines[3] if len(lines) > 3 else "") is not None, "its cost: %r" % lines[3:4])
@@ -2733,7 +2965,7 @@ def soak_case(seed=20260930, chunks=200):
         self_hooks = [l for l in text.splitlines() if re.search(r"(rehook|more than once).*mod_lag_finder", l)]
         check(not self_hooks, "the finder never counts itself as hooked twice: %r" % self_hooks[:2])
         failures = [l for l in text.splitlines()
-                    if re.search(r"tick error|walk failed|check failed|raised an error", l)]
+                    if re.search(r"tick error|walk failed|check failed|stall report failed", l)]
         check(not failures, "no internal failure logged: %r" % failures[:3])
         check(s.eval("GUI_BAD") == "0", "never a GUI call into a gone world")
         check(int(s.eval("LIVE_COUNT()")) <= 1, "one GUI at a time: %s" % s.eval("LIVE_COUNT()"))
@@ -2978,9 +3210,14 @@ def main():
     review_stale_middle_case()
     review_mem_miss_case()
     review_builder_case()
-    late_error_case()
-    blame_case()
-    review_errors_case()
+    crash_case()
+    culprit_case()
+    next_launch_case()
+    caught_case()
+    cut_short_case()
+    substep_case()
+    alert_kept_case()
+    rearm_summary_case()
     review_remap_case()
     review_no_shutdown_case()
     review_rearm_gap_case()

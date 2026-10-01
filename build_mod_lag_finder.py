@@ -24,7 +24,7 @@ TEMPLATE = os.path.join(HERE, "lua_archive_template.bin")
 ADDON = "mods/patpatpatrick/mod_lag_finder"
 LUA_T = 0xA14E8DFA2CD117E2
 PAYLOAD_FLAG = 2
-VERSION = "v0.14.0"
+VERSION = "v0.15.0"
 MOD = "Mod Lag Watchdog"
 # A build is a local test build unless the user says it goes to Nexus (the
 # user, 2026-09-30): then the release name has no "Nexus" and the manifest
@@ -64,7 +64,8 @@ Shows which Lua mod is making your game stutter.
 - Click a mod in that window to copy a short report for its author.
 - If the game uses more video memory than Windows gives it (which causes
   stutter), a line says so.
-- If a mod keeps raising Lua errors, a line names it.
+- If a mod's Lua error closes the game, the log names the mod first, and
+  the next launch shows it once on the ship.
 
 The pause-menu window needs the game version this release was made for.
 After a game update, Home still works.
@@ -124,19 +125,19 @@ def build():
 
     OUT, zip_path = modpaths.out_paths(MOD, RELEASE)
     os.makedirs(OUT)
-    write_module(os.path.join(OUT, FOLDER), ADDON, source)
-    with open(os.path.join(OUT, "manifest.json"), "w", encoding="utf-8") as out:
-        json.dump(MANIFEST, out, indent=2, ensure_ascii=False)
-        out.write("\n")
-    with open(os.path.join(OUT, "README.txt"), "w", encoding="utf-8",
-              newline="\r\n") as out:
-        out.write(README)
-
+    # No ungated or half-written folder may stay behind for modpaths.find to
+    # pick up, or block the next build of this version (v0.13.3, review [15];
+    # v0.15.0, review [10]: from the first write on, and on any exit).
     try:
+        write_module(os.path.join(OUT, FOLDER), ADDON, source)
+        with open(os.path.join(OUT, "manifest.json"), "w", encoding="utf-8") as out:
+            json.dump(MANIFEST, out, indent=2, ensure_ascii=False)
+            out.write("\n")
+        with open(os.path.join(OUT, "README.txt"), "w", encoding="utf-8",
+                  newline="\r\n") as out:
+            out.write(README)
         gate_release(OUT)      # raises GateFailed: do not zip
-    except Exception:
-        # No ungated folder may stay behind for modpaths.find to pick up,
-        # or block the next build of this version (v0.13.3, review [15]).
+    except BaseException:
         shutil.rmtree(OUT, ignore_errors=True)
         raise
 
