@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.19.0 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.19.1 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.19.0"
+local MARKER = "mod-lag-finder-v0.19.1"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1469,6 +1469,18 @@ read_names = function()
   if type(data) ~= "table" then return "Arsenal mod list unreadable: " .. tostring(why or "not an object") end
   local profile = type(data.modsList) == "table" and data.modsList[data.selectedProfile or "default"]
   if type(profile) ~= "table" or type(profile.mods) ~= "table" then return "no active Arsenal profile" end
+  -- Every mod's name by its Arsenal uuid, enabled or not: MDL starts mods
+  -- from the library live and calls a legacy script "arsenal:<uuid>"
+  -- (v0.19.1: the user saw "mdl: arsenal:c9bea282-ab42-" in the table).
+  local by_uuid = {}
+  for _, list in ipairs({ profile.mods, type(data.modsLibrary) == "table" and data.modsLibrary or {} }) do
+    for _, mod in ipairs(list) do
+      if type(mod) == "table" and type(mod.uuid) == "string" and by_uuid[string.lower(mod.uuid)] == nil then
+        by_uuid[string.lower(mod.uuid)] = clean_label(mod.label) or false
+      end
+    end
+  end
+  installed.mdl_names = by_uuid
   local seen, archives = {}, 0
   local hashes, readable, owner_of = {}, {}, {}
   local claims, claim_order = {}, {}     -- row hash -> { [mod index] = claim }, rows in order
@@ -3330,9 +3342,13 @@ end
 local function mdl_label(record)
   local info = rawget(record, "info")
   local name = type(info) == "table" and rawget(info, "name") or nil
-  if type(name) ~= "string" or name == "" or string.find(name, "[^\32-\126]") then
-    name = tostring(rawget(record, "id") or "?")
-    name = string.gsub(name, "^(arsenal:%x%x%x%x%x%x%x%x).*$", "%1")
+  local id = tostring(rawget(record, "id") or "?")
+  -- A legacy script's info.name is its id, "arsenal:<uuid>": the mod
+  -- manager's name for that uuid instead (v0.19.1).
+  if type(name) ~= "string" or name == "" or name == id or string.find(name, "[^\32-\126]") then
+    local uuid = string.match(id, "^arsenal:([%x%-]+)$")
+    local named = uuid and type(installed.mdl_names) == "table" and installed.mdl_names[string.lower(uuid)] or nil
+    name = named or (string.gsub(id, "^(arsenal:%x%x%x%x%x%x%x%x).*$", "%1"))
   end
   name = string.gsub(name, "/", "-")
   if #name > 22 then name = string.sub(name, 1, 22) end

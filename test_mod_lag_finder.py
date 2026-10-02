@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.19.0"
+RELEASE = "Mod Lag Watchdog v0.19.1"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -628,6 +628,49 @@ def mdl_case():
         check(0 <= runtime <= 50, "MDL's own row keeps only its 1 ms (~36 ms/s): %s" % runtime)
         check("mdl: Idle" not in rows, "a script that never ran has no row")
         clean(s, "mdl")
+
+
+def mdl_arsenal_case():
+    """A legacy script MDL started live from the Arsenal library reports its
+    id, "arsenal:<uuid>", as its name: the row takes the mod manager's name
+    for that uuid, even for a mod not enabled in the profile (v0.19.1; the
+    user saw "mdl: arsenal:c9bea282-ab42-"). A name the font cannot draw
+    still falls back to the short id. Fails on v0.19.0."""
+    import json
+    print("mdl arsenal names")
+    scratch = tempfile.mkdtemp(prefix="mlf_mdlnames_")
+    arsenal = os.path.join(scratch, "hd2arsenal")
+    os.makedirs(arsenal)
+    uuid, uuid_cn = "c9bea282-ab42-4c11-9d2e-1234567890ab", "d0d0d0d0-1111-2222-3333-444444444444"
+    profile = {"label": "Test", "mods": [
+        {"uuid": uuid, "label": "Demo Heavy 12345 1.0 2026-10-02T01-02Z AbCdEf", "path": os.path.join(scratch, "x"),
+         "enabled": False, "options": []},
+        {"uuid": uuid_cn, "label": "\u5c0f\u70ae\u53f0\u9ad8\u4eae", "path": os.path.join(scratch, "y"),
+         "enabled": False, "options": []}]}
+    with open(os.path.join(arsenal, "hd2a_data.json"), "w", encoding="utf-8") as f:
+        json.dump({"selectedProfile": "p1", "modsList": {"p1": profile}}, f)
+    stub = (
+        "MDL = { perf = 1, manager = { mods = {\n"
+        "  { id = 'arsenal:%s', info = { name = 'arsenal:%s' }, cost = 0.004 },\n"
+        "  { id = 'arsenal:%s', info = { name = 'arsenal:%s' }, cost = 0.002 },\n"
+        "} } }\n" % (uuid, uuid, uuid_cn, uuid_cn))
+    try:
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            s.lua(stub)
+            s.load_mod(source=MDL_RUNTIME, name="mods/mdl/runtime")
+            load(s, ["heavy", "finder"])
+            s.frames(2700)
+            rows = {m.group(1).strip() for m in
+                    (re.match(r"^t=\S+\s+(.+?)\s+(\d+\.\d+) ms/s", l) for l in log_lines(s, r"ms/s")) if m}
+            check("mdl: Demo Heavy" in rows, "the uuid's name from Arsenal: %r" % sorted(rows))
+            check("mdl: arsenal:d0d0d0d0" in rows, "a Chinese name keeps the short id: %r" % sorted(rows))
+            check(not any(r.startswith("mdl: arsenal:c9bea282") for r in rows), "no raw id for a named mod")
+            clean(s, "mdl arsenal names")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def deploy_case():
@@ -3576,6 +3619,7 @@ def main():
     stall_case()
     rehook_case()
     mdl_case()
+    mdl_arsenal_case()
     names_case()
     deploy_case()
     writes_case()
