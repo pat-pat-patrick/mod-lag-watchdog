@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.18.0"
+RELEASE = "Mod Lag Watchdog v0.19.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1975,6 +1975,123 @@ def bunker_case():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+# v0.19.0: two enabled mods ship the same Lua resource and only one copy runs
+# (Heavy Kill HUD and HUD Ballistic Trajectory Overlay both ship
+# mods/codex/gun_calibration as text, 2026-10-02; a Bilibili player's v0.7.1
+# showed "gun_calibration"). The copies differ in where they hook update.
+SHARED_NAME = "mods/codex/gun_calibration"
+SHARED_HEAVY = """-- HD2-Addon: mods/codex/gun_calibration
+local previous = rawget(_G, "update")
+local n = 0
+-- a Heavy Kill HUD stand-in
+rawset(_G, "update", function(...)
+  CLOCK = CLOCK + 0.004
+  return previous(...)
+end)
+"""
+SHARED_OVERLAY = """-- HD2-Addon: mods/codex/gun_calibration
+local previous = rawget(_G, "update")
+local a, b, c = 1, 2, 3
+local d = 4
+local e = 5
+local f = 6
+rawset(_G, "update", function(...)
+  CLOCK = CLOCK + 0.004
+  return previous(...)
+end)
+"""
+SHARED_TWIN = SHARED_HEAVY.replace("-- a Heavy Kill HUD stand-in", "-- a twin with the same lines")
+
+
+def shared_case():
+    """One resource in two enabled mods (v0.19.0): the window names the mod
+    whose copy runs, found by the hook's first and last lines in each copy's
+    text; the mod list puts the other under "replaced by"; when the lines fit
+    both copies, the short name stays and the mod list says it is unknown.
+    The first two fail on v0.18.0 ("gun_calibration", both mods timed)."""
+    import json
+    print("shared")
+
+    def game(label, other_source, running, row_label, timed, shared_line):
+        scratch = tempfile.mkdtemp(prefix="mlf_shared_")
+        root = os.path.join(scratch, "Arsenal Mods")
+        arsenal = os.path.join(scratch, "hd2arsenal")
+        os.makedirs(arsenal)
+        copies = [("Heavy Kill HUD", "HeavyKill_AR1", SHARED_HEAVY),
+                  ("Ballistic Overlay v2", "Overlay_AR2", other_source)]
+        for _, name, source in copies:
+            path = os.path.join(root, name, "Main")
+            os.makedirs(path)
+            with open(os.path.join(path, "9ba626afa44a3aa3.patch_0"), "wb") as f:
+                f.write(lua_archive([source], names=[SHARED_NAME]))
+        profile = {"label": "Test", "mods": [
+            {"label": mod, "path": os.path.join(root, name), "enabled": True,
+             "options": [{"name": "Main", "enabled": True, "include": ["Main"], "suboptions": []}]}
+            for mod, name, _ in copies]}
+        with open(os.path.join(arsenal, "hd2a_data.json"), "w", encoding="utf-8") as f:
+            json.dump({"selectedProfile": "p1", "modsList": {"p1": profile}}, f)
+        try:
+            with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+                s.lua(CLOCK)
+                s.lua("FAKE.mission()")
+                s.lua(GUI_STUB)
+                s.lua(menu_stub())
+                s.lua("__hd2_native_test.clipboard = function(text) CLIP = text return true end")
+                check(s.load_mod(source=running, name=SHARED_NAME), "%s: the running copy loads" % label)
+                load(s, ["finder"])
+                s.frames(400)
+                s.lua("FAKE.press('home')")
+                s.frames(3)
+                shown = s.eval("SHOWN()")
+                row = re.search(r"\|%s +(\d+\.\d) " % re.escape(row_label), shown)
+                check(row is not None and float(row.group(1)) > 100,
+                      "%s: its row is %r: %r" % (label, row_label, shown))
+                check(bool(log_lines(s, r"shared: mods/codex/gun_calibration is in Heavy Kill HUD and "
+                                        r"Ballistic Overlay v2 -- one Lua resource, only one of them runs")),
+                      "%s: the log names both mods" % label)
+                s.lua("FAKE.press('home')")
+                s.lua("MENU_STATE(1, 0)")
+                s.frames(6)
+                pos = s.eval("POS('copy mod list')")
+                check(pos != "none", "%s: 'copy mod list' is on the menu window" % label)
+                clip = ""
+                if pos != "none":
+                    x, y = (int(v) for v in pos.split(","))
+                    s.lua("CLIP = nil; MOUSE.x, MOUSE.y = %d, %d; PRESS(1)" % (x + 20, y + 4))
+                    s.frames(2)
+                    s.lua("RELEASE(1)")
+                    s.frames(2)
+                    clip = s.eval("CLIP") or ""
+                lines = clip.split("\r\n")
+
+                def group(title):
+                    for index, line in enumerate(lines):
+                        if line.startswith(title):
+                            body = []
+                            for more in lines[index + 1:]:
+                                if not more.startswith("  "):
+                                    break
+                                body.append(more.strip())
+                            return line, " ".join(body)
+                    return None, ""
+
+                head, body = group("Timed one by one")
+                check(body == timed, "%s: timed %r, not %r" % (label, timed, body))
+                head, body = group("Ship the same Lua resource as another mod")
+                check(head is not None and body == shared_line,
+                      "%s: shared %r, not %r %r" % (label, shared_line, head, body))
+                clean(s, "shared " + label)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    game("Heavy Kill runs", SHARED_OVERLAY, SHARED_HEAVY, "Heavy Kill HUD", "Heavy Kill HUD",
+         "Ballistic Overlay v2 (replaced by Heavy Kill HUD)")
+    game("the overlay runs", SHARED_OVERLAY, SHARED_OVERLAY, "Ballistic Overlay", "Ballistic Overlay v2",
+         "Heavy Kill HUD (replaced by Ballistic Overlay v2)")
+    game("lines fit both", SHARED_TWIN, SHARED_HEAVY, "gun_calibration", "Ballistic Overlay v2, Heavy Kill HUD",
+         "Heavy Kill HUD / Ballistic Overlay v2 (which one runs: unknown)")
+
+
 def option_names_case():
     """Which name a mod's resources get (v0.13.1), in the layouts of the
     user's own profile (2026-09-30 20:06, where v0.13.0 got them wrong):
@@ -3482,6 +3599,7 @@ def main():
     hash_case()
     patch_case()
     bunker_case()
+    shared_case()
     option_names_case()
     window_span_case()
     units_flicker_case()

@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.18.0 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.19.0 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.18.0"
+local MARKER = "mod-lag-finder-v0.19.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -384,7 +384,8 @@ local function source_of(fn)
   local source = tostring(info.source or "?")
   if string.sub(source, 1, 1) == "@" then source = string.sub(source, 2) end
   source = string.gsub(source, "%.lua$", "")
-  return source, tonumber(info.linedefined) or 0, tostring(info.what or "?")
+  return source, tonumber(info.linedefined) or 0, tostring(info.what or "?"),
+         tonumber(info.lastlinedefined) or 0
 end
 
 -- A stale spy or shim of ours (a mod unhooked and left one in the chain, and
@@ -644,8 +645,8 @@ local function restore_all()
 end
 
 local function new_link(fn, slot)
-  local source, line = source_of(fn)
-  return { fn = fn, slot = slot, source = source, line = line,
+  local source, line, _, last = source_of(fn)
+  return { fn = fn, slot = slot, source = source, line = line, last = last,
            upname = slot and slot.name or "_G.update",
            last_incl = 0, prev_incl = 0 }
 end
@@ -1113,6 +1114,15 @@ end
 -- A name with any character outside ASCII keeps the short name: the debug
 -- font this module draws with has Latin letters only.
 local names = {}
+-- One Lua resource in two or more enabled mods (v0.19.0). Only one of them
+-- runs: the game loads one copy of a resource. Bingus Shared Loader v18
+-- requires a fixed list of names, so authors borrow one: Heavy Kill HUD,
+-- HUD Ballistic Trajectory Overlay and Codex Module Bridge all ship
+-- mods/codex/gun_calibration (2026-10-02). installed.shared[key] = the mods
+-- whose copy has that key, each { plain, clean, listed, key, funcs, ends };
+-- installed.shared_rows = one list of such mods per resource. (On installed:
+-- the main chunk is at Lua's limit of 200 locals.)
+installed.shared, installed.shared_rows, installed.shared_seen = {}, {}, {}
 local read_names
 do
 local LUA_TYPE = "\226\023\209\044\250\141\078\161"   -- 0xA14E8DFA2CD117E2, little-endian
@@ -1380,7 +1390,7 @@ local function archive_addons(path)
           end
         end
         found[#found + 1] = { key = (addon and murmur64(addon)) or (chunk and murmur64(chunk)) or row_hash,
-                              row = row_hash, readable = addon }
+                              row = row_hash, readable = addon, offset = le(tables, row + 16, 8) }
       end
     end
   end)
@@ -1418,6 +1428,35 @@ local function clean_label(label)
   return label
 end
 
+-- Which lines of a Lua resource's text hold the word "function", and which
+-- the word "end" (v0.19.0). A hook's first line (linedefined) holds the
+-- first, its last line (lastlinedefined) the second: matched against the
+-- copies of a shared resource, that tells which copy is running. Read once,
+-- at load, only for resources two enabled mods ship as text.
+local function line_marks(path, offset)
+  local file = io.open(path, "rb")
+  if file == nil then return nil end
+  local funcs, ends = nil, nil
+  pcall(function()
+    file:seek("set", offset)
+    local head = file:read(8)
+    if head == nil or #head < 8 then return end
+    local size = le(head, 1, 4)
+    if size <= 0 or size > 16 * 1024 * 1024 then return end
+    local text = file:read(size)
+    if text == nil or #text < size then return end
+    funcs, ends = {}, {}
+    local n = 0
+    for line in string.gmatch(text .. "\n", "([^\n]*)\n") do
+      n = n + 1
+      if string.find(line, "%f[%w_]function%f[^%w_]") then funcs[n] = true end
+      if string.find(line, "%f[%w_]end%f[^%w_]") then ends[n] = true end
+    end
+  end)
+  file:close()
+  return funcs, ends
+end
+
 read_names = function()
   -- The enabled mods and how each runs, for "copy mod list" (v0.17.1).
   installed.mod_list, installed.mod_list_why = nil, "no Arsenal mod list was read"
@@ -1432,6 +1471,9 @@ read_names = function()
   if type(profile) ~= "table" or type(profile.mods) ~= "table" then return "no active Arsenal profile" end
   local seen, archives = {}, 0
   local hashes, readable, owner_of = {}, {}, {}
+  local claims, claim_order = {}, {}     -- row hash -> { [mod index] = claim }, rows in order
+  local shared, shared_rows = {}, {}
+  installed.shared, installed.shared_rows, installed.shared_seen = shared, shared_rows, {}
   for mod_index, mod in ipairs(profile.mods) do
     if type(mod) == "table" and mod.enabled == true and type(mod.path) == "string" then
       local listed = { label = plain_label(mod.label), keys = {}, lua = 0, scripts = 0 }
@@ -1479,6 +1521,17 @@ read_names = function()
         for _, entry in ipairs(addons or {}) do
           hashes[entry.key] = true
           hashes[entry.row] = true
+          local claim = claims[entry.row]
+          if claim == nil then
+            claim = { list = {} }
+            claims[entry.row], claim_order[#claim_order + 1] = claim, entry.row
+          end
+          if claim[mod_index] == nil then
+            claim[mod_index] = { plain = listed.label, clean = clean_label(mod.label), listed = listed,
+                                 key = entry.key, path = path, offset = entry.offset,
+                                 text = entry.readable ~= nil, readable = entry.readable }
+            claim.list[#claim.list + 1] = claim[mod_index]
+          end
           if entry.readable ~= nil then readable[entry.key] = entry.readable end
           if by_addon[entry.key] == nil then
             by_addon[entry.key] = {}
@@ -1515,6 +1568,28 @@ read_names = function()
   end
   installed.archive_hashes = hashes
   installed.mod_list, installed.mod_list_why = listed_mods, nil
+  -- Resources two or more enabled mods ship: only one copy runs (v0.19.0).
+  for _, row in ipairs(claim_order) do
+    local list = claims[row].list
+    if #list >= 2 then
+      local labels = {}
+      for _, claim in ipairs(list) do
+        labels[#labels + 1] = claim.plain
+        shared[claim.key] = shared[claim.key] or {}
+        table.insert(shared[claim.key], claim)
+      end
+      shared_rows[#shared_rows + 1] = list
+      say(string.format("shared: %s is in %s -- one Lua resource, only one of them runs",
+                        list[1].readable or ("#" .. row), table.concat(labels, " and ")))
+    end
+  end
+  for _, list in pairs(shared) do
+    if #list >= 2 then
+      for _, claim in ipairs(list) do
+        if claim.text then claim.funcs, claim.ends = line_marks(claim.path, claim.offset) end
+      end
+    end
+  end
   -- Two mods under the same name keep their short names; one mod's several
   -- resources may share its name.
   local uses = {}
@@ -1545,15 +1620,51 @@ end
 
 end   -- names
 
+-- Which mod's copy of a shared resource a link of the chain is (v0.19.0),
+-- or nil when that cannot be told. One copy under the link's name: that one
+-- (Codex Module Bridge's bytecode is named "module_bridge", not after its
+-- resource). Several: the one whose text has "function" on the hook's first
+-- line and "end" on its last; none or more than one of them: nil.
+installed.shared_owner = function(link)
+  local list = installed.shared[installed.hash_of(link.source)]
+  if list == nil then return nil end
+  if #list == 1 then return list[1] end
+  local at = string.format("%s:%d-%d", link.source, link.line or 0, link.last or 0)
+  local hit = installed.shared_seen[at]
+  if hit == nil then
+    local found = {}
+    for _, claim in ipairs(list) do
+      if claim.funcs and claim.funcs[link.line] and claim.ends[link.last] then found[#found + 1] = claim end
+    end
+    hit = #found == 1 and found[1] or false
+    installed.shared_seen[at] = hit
+    say(string.format("shared: %s is %s", at,
+                      hit and hit.plain or "not told apart (its lines fit both copies or neither)"))
+  end
+  return hit or nil
+end
+
 -- "mods/patpatpatrick/wheres_my_shit" -> "wheres_my_shit"; a bottom that
--- holds everything below it gets a "+".
+-- holds everything below it gets a "+". A resource two mods ship goes by the
+-- one whose copy is running, when that can be told (v0.19.0).
 local function short_name(key)
   local plus = ""
   if string.find(key, " (+ all below it)", 1, true) then
     key = string.gsub(key, " %(%+ all below it%)$", "")
     plus = "+"
   end
-  return (names[installed.hash_of(key)] or string.match(key, "([^/]+)$") or key) .. plus
+  local hash = installed.hash_of(key)
+  local name = names[hash]
+  if name == nil and installed.shared[hash] ~= nil and #installed.shared[hash] >= 2 then
+    for _, link in ipairs(links) do
+      if link.source == key then
+        local owner = installed.shared_owner(link)
+        name = owner and owner.clean or nil
+        break
+      end
+    end
+  end
+  return (name or string.match(key, "([^/]+)$") or key) .. plus
 end
 
 -- ------------------------------------------------------------ on screen
@@ -2597,17 +2708,47 @@ local function by_how_it_runs()
   for _, link in ipairs(links) do
     if type(link.source) == "string" then chain[installed.hash_of(link.source)] = link end
   end
-  local groups = { timed = {}, scripts = {}, other = {}, none = {}, loose = {} }
+  local groups = { timed = {}, scripts = {}, other = {}, none = {}, loose = {}, shared = {} }
+  -- A resource two mods ship (v0.19.0): the copy that runs is timed; the
+  -- others are listed as replaced by it. When the running copy cannot be
+  -- told, every one of them stays as it was and a line says so.
+  local replaced, lost = {}, {}         -- mod -> who replaced it; mod -> { its keys that do not run }
+  for _, list in ipairs(installed.shared_rows) do
+    local winner, undecided = nil, false
+    for _, claim in ipairs(list) do
+      local link = chain[claim.key]
+      if link ~= nil then
+        local owner = installed.shared_owner(link)
+        if owner ~= nil then winner = owner else undecided = true end
+      end
+    end
+    if winner ~= nil then
+      for _, claim in ipairs(list) do
+        if claim ~= winner then
+          replaced[claim.listed] = winner.plain
+          lost[claim.listed] = lost[claim.listed] or {}
+          lost[claim.listed][claim.key] = true
+        end
+      end
+    elseif undecided then
+      local labels = {}
+      for _, claim in ipairs(list) do labels[#labels + 1] = claim.plain end
+      groups.shared[#groups.shared + 1] = table.concat(labels, " / ") .. " (which one runs: unknown)"
+    end
+  end
   local claimed = {}
   for _, mod in ipairs(installed.mod_list or {}) do
     local timed = false
     for key in pairs(mod.keys) do
       if chain[key] ~= nil then
-        timed, claimed[key] = true, true
+        claimed[key] = true
+        if not (lost[mod] and lost[mod][key]) then timed = true end
       end
     end
     if timed then
       groups.timed[#groups.timed + 1] = mod.label
+    elseif replaced[mod] ~= nil then
+      groups.shared[#groups.shared + 1] = mod.label .. " (replaced by " .. replaced[mod] .. ")"
     elseif mod.lua == 0 then
       groups.none[#groups.none + 1] = mod.label
     elseif mod.scripts > 0 then
@@ -2676,8 +2817,9 @@ local function mod_list_text(at)
       { groups.scripts, "Replace the game's own scripts (their cost shows as \"(the game)\")" },
       { groups.other, "Lua that is not in the update" },
       { groups.none, "No Lua (models, textures, sounds)" },
-      { groups.loose, "In the update but not in Arsenal" } }) do
-    if #group[1] > 0 or group[1] ~= groups.loose then
+      { groups.loose, "In the update but not in Arsenal" },
+      { groups.shared, "Ship the same Lua resource as another mod (only one runs)" } }) do
+    if #group[1] > 0 or (group[1] ~= groups.loose and group[1] ~= groups.shared) then
       lines[#lines + 1] = string.format("%s: %d", group[2], #group[1])
       for _, line in ipairs(wrapped(group[1])) do lines[#lines + 1] = line end
     end
