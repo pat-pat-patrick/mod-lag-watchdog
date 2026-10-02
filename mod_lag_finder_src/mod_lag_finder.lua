@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.20.0"
+local MARKER = "mod-lag-finder-v0.21.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -521,28 +521,40 @@ end
 -- Each run is stamped with the frame it finished in (counter.frame_id,
 -- v0.16.1): a link a Lua error cut off did not run, and its time from an
 -- older frame must not be read as this one's.
+--
+-- v0.21.0: with the GC probe on (counter.gcp, see "gc probe") each run also
+-- keeps the collector's heap total and its mark (threshold * 8 + state) at
+-- entry and exit: two uint32 reads and a byte, no allocation. Off, they are 0.
 local function make_shim(link, target, handler, counter)
-  local function finish(t0, ...)
+  local gcp = counter.gcp
+  local P, B = gcp ~= nil and gcp.p32 or nil, gcp ~= nil and gcp.p8 or nil
+  local function gh() if P == nil then return 0 end return P[8] end
+  local function gm() if P == nil then return 0 end return P[9] * 8 + B[41] end
+  local function stamp(t0, h0, m0)
     local took = timer_now() - t0
     link.prev_incl, link.prev_frame = link.last_incl, link.last_frame
     link.last_incl, link.last_frame = took, counter.frame_id
+    link.prev_eh, link.prev_em, link.prev_xh, link.prev_xm =
+      link.last_eh, link.last_em, link.last_xh, link.last_xm
+    link.last_eh, link.last_em, link.last_xh, link.last_xm = h0, m0, gh(), gm()
+  end
+  local function finish(t0, h0, m0, ...)
+    stamp(t0, h0, m0)
     return ...
   end
   local shim
   if handler == nil then
     shim = function(...)
-      return finish(timer_now(), target(...))
+      return finish(timer_now(), gh(), gm(), target(...))
     end
   else
-    local function settle_up(t0, ok, ...)
-      local took = timer_now() - t0
-      link.prev_incl, link.prev_frame = link.last_incl, link.last_frame
-      link.last_incl, link.last_frame = took, counter.frame_id
+    local function settle_up(t0, h0, m0, ok, ...)
+      stamp(t0, h0, m0)
       if ok then return ... end
       error((...), 0)
     end
     shim = function(...)
-      return settle_up(timer_now(), xpcall(target, handler, ...))
+      return settle_up(timer_now(), gh(), gm(), xpcall(target, handler, ...))
     end
   end
   ours[shim] = target
@@ -580,6 +592,90 @@ installed.link_handler = function(err)
   local note = installed.note
   if note ~= nil then pcall(note, err) end
   return err
+end
+
+-- ------------------------------------------------------------ gc probe
+
+-- v0.21.0, log only (the user, 2026-10-03). A player found that removing the
+-- costliest mod made another one twice as costly, again and again. One
+-- suspect is Lua's garbage collector: every mod shares one heap, and the
+-- collector does its work inside whichever mod happens to allocate when a
+-- step is due, so that mod is charged for garbage another made. This
+-- measures, per minute in the log: how much of the mods' time was collector
+-- steps, which mods those steps landed on, and which mods make the garbage.
+--
+-- The VM says none of this, so it is read from LuaJIT's own state.
+-- Evidence: proven offline on the game's bin/lua51.dll (LuaJIT 2.1.0-alpha,
+-- not GC64, 2026-10-03): a thread object's glref (uint32 at +8) is the
+-- global_State; in it gc.total is the uint32 at +32 (follows
+-- collectgarbage("count") * 1024), gc.threshold at +36, gc.state the byte at
+-- +41 (0 pause, 1 propagate, 2 atomic, 3 sweepstring, 4 sweep, 5 finalize),
+-- gc.estimate at +76, stepmul +80, pause +84. Every collector step moves the
+-- threshold, so a changed mark means a step ran. Only the sweep phases free
+-- memory, so a heap rise with no sweep is what was allocated.
+-- The layout is checked through ReadProcessMemory before any direct read; a
+-- build it does not match turns the probe off and says why. A test hands
+-- the real ffi in __hd2_native_test.ffi (hd2fake with ffi allowed).
+installed.gc_why = "no ffi"
+do
+  local seam = rawget(_G, "__hd2_native_test")
+  local ffi = nil
+  if type(seam) == "table" then
+    ffi = seam.ffi
+  else
+    local loader = rawget(_G, "require")
+    if type(loader) == "function" then
+      local ok, lib = pcall(loader, "ffi")
+      if ok and type(lib) == "table" then ffi = lib end
+    end
+  end
+  if type(ffi) == "table" and type(collect) == "function" then
+    local ok, err = pcall(function()
+      if ffi.abi("gc64") or not ffi.abi("64bit") then
+        installed.gc_why = "not the game's LuaJIT (GC64 or 32-bit)"
+        return
+      end
+      for _, decl in ipairs({ "void *GetCurrentProcess(void);",
+                              "int ReadProcessMemory(void *process, const void *address," ..
+                                " void *buffer, size_t size, size_t *read);" }) do
+        pcall(ffi.cdef, decl)
+      end
+      local kernel = ffi.load("kernel32")
+      local rpm = ffi.cast("int (*)(void *, const void *, void *, size_t, size_t *)",
+                           kernel.ReadProcessMemory)
+      local process = kernel.GetCurrentProcess()
+      local words, got = ffi.new("uint32_t[24]"), ffi.new("size_t[1]")
+      local function safe(address, count)
+        got[0] = 0
+        local r = rpm(process, ffi.cast("const void *", address), words, count * 4, got)
+        return r ~= 0 and tonumber(got[0]) == count * 4
+      end
+      local co = coroutine.create(function() end)
+      local thread = tonumber(string.match(tostring(co), "0x(%x+)") or "", 16)
+      if thread == nil or not safe(thread, 4) then
+        installed.gc_why = "no thread address"
+        return
+      end
+      local g = words[2]
+      if g == 0 or not safe(g, 24) then
+        installed.gc_why = "global state not readable"
+        return
+      end
+      local total = words[8]
+      local state, stepmul, pause = math.floor(words[10] / 256) % 256, words[20], words[21]
+      local count = collect("count") * 1024
+      if math.abs(total - count) > 65536 or state > 5 or stepmul < 10 or stepmul > 100000
+         or pause < 10 or pause > 100000 then
+        installed.gc_why = string.format("layout not recognised (total %d vs %d, state %d, " ..
+                                         "stepmul %d, pause %d)", total, count, state, stepmul, pause)
+        return
+      end
+      installed.gcp = { p32 = ffi.cast("uint32_t *", g), p8 = ffi.cast("uint8_t *", g),
+                        ffi = ffi, keep = co }
+      installed.gc_why = nil
+    end)
+    if not ok then installed.gc_why = "probe failed: " .. tostring(err) end
+  end
 end
 
 local links = {}              -- mapped chain, top first
@@ -1016,6 +1112,165 @@ local function owner(link)
   return link.source
 end
 
+-- The GC probe's minute (v0.21.0, see "gc probe"). For each link, from its
+-- shim's readings in the frame selfs() settled: the heap rise and whether a
+-- collector step ran in its own part -- [entry, entry of the link below] and
+-- [exit of the link below, exit] -- the same split as its own time. A step
+-- in its own part makes that frame's time above the link's usual time (an
+-- average over its frames with no step) collector time. Rises in frames
+-- with no sweep are its garbage; the rest are estimated from those.
+-- Likely: a mod's own time varies from frame to frame, so the split is
+-- statistical, good over a minute, not for one frame.
+installed.gcw = { rows = {}, chain = 0, frames = 0, chain_gc_frames = 0,
+                  vm = { frames = 0, clean = 0, alloc = 0, stepped = 0, cycles = 0 },
+                  worst_atomic = 0, worst_atomic_key = nil, note = nil }
+
+-- (In a block: the main chunk is at Lua's limit of 200 locals.)
+do
+local function gc_settled(link, frame)
+  if link.last_frame == frame then return link.last_eh, link.last_em, link.last_xh, link.last_xm end
+  if link.prev_frame == frame then return link.prev_eh, link.prev_em, link.prev_xh, link.prev_xm end
+  return nil
+end
+
+-- A window from mark a to mark b: did a step run, did it sweep (free), did
+-- it pass the atomic step (the one step that is not incremental).
+local function gc_window(a, b)
+  if a == b then return false, false, false end
+  local sa, sb = a % 8, b % 8
+  local wrap = sb < sa
+  return true, wrap or sa >= 3 or sb >= 3, sa <= 2 and (sb >= 3 or wrap)
+end
+
+installed.gc_frame = function(frame_selfs)
+  local w = installed.gcw
+  w.note = nil
+  if installed.gcp == nil or frame_selfs == nil then return end
+  local frame = installed.frame_id - 1
+  local n = #links
+  local any, notes = false, nil
+  for index = n, 2, -1 do
+    local entry = frame_selfs[index]
+    local link = links[index]
+    local eh, em, xh, xm = gc_settled(link, frame)
+    if entry ~= nil and eh ~= nil and em ~= 0 then
+      local neh, nem, nxh, nxm = nil, nil, nil, nil
+      if index < n then neh, nem, nxh, nxm = gc_settled(links[index + 1], frame) end
+      local alloc, stepped, swept, atomic
+      if neh ~= nil then
+        alloc = (xh - eh) - (nxh - neh)
+        local s1, w1, a1 = gc_window(em, nem)
+        local s2, w2, a2 = gc_window(nxm, xm)
+        stepped, swept, atomic = s1 or s2, w1 or w2, a1 or a2
+      else
+        alloc = xh - eh
+        stepped, swept, atomic = gc_window(em, xm)
+      end
+      local key = owner(link)
+      local row = w.rows[key]
+      if row == nil then
+        row = { frames = 0, clean = 0, alloc = 0, stepped = 0, gc = 0 }
+        w.rows[key] = row
+      end
+      row.frames = row.frames + 1
+      w.chain = w.chain + entry.own
+      if not swept then
+        row.clean = row.clean + 1
+        row.alloc = row.alloc + math.max(0, alloc)
+      end
+      local base = link.gc_base
+      if not stepped then
+        link.gc_base = base == nil and entry.own or base + (entry.own - base) * 0.05
+      else
+        any = true
+        row.stepped = row.stepped + 1
+        local extra = math.max(0, entry.own - (base or entry.own))
+        row.gc = row.gc + extra
+        if atomic and extra > w.worst_atomic then
+          w.worst_atomic, w.worst_atomic_key = extra, key
+        end
+        if extra >= 0.001 then
+          notes = (notes and notes .. ", " or "") .. string.format("%s +%s ms%s", key, ms(extra),
+                                                                   atomic and " (atomic)" or "")
+        end
+      end
+    end
+  end
+  w.frames = w.frames + 1
+  if any then w.chain_gc_frames = w.chain_gc_frames + 1 end
+  if notes ~= nil then w.note, w.note_frame = "gc steps in " .. notes, frame end
+end
+
+-- Whole-VM readings once a frame, from tick: everything Lua did between two
+-- ticks, the mods' update and all Lua outside it.
+installed.gc_tick = function()
+  local gcp = installed.gcp
+  if gcp == nil then return end
+  local v = installed.gcw.vm
+  local h, m = gcp.p32[8], gcp.p32[9] * 8 + gcp.p8[41]
+  if v.h ~= nil then
+    v.frames = v.frames + 1
+    local stepped, swept, atomic = gc_window(v.m, m)
+    if stepped then v.stepped = v.stepped + 1 end
+    if atomic then v.cycles = v.cycles + 1 end
+    if not swept then
+      v.clean = v.clean + 1
+      v.alloc = v.alloc + math.max(0, h - v.h)
+    end
+  end
+  v.h, v.m = h, m
+end
+
+installed.gc_summary = function(span)
+  local gcp, w = installed.gcp, installed.gcw
+  if gcp == nil then
+    if not installed.gc_told then
+      installed.gc_told = true
+      say("  gc: probe off: " .. tostring(installed.gc_why))
+    end
+    return
+  end
+  local rows, gc_total, made = {}, 0, {}
+  for key, row in pairs(w.rows) do
+    gc_total = gc_total + row.gc
+    local per_frame = row.clean > 0 and row.alloc / row.clean or 0
+    rows[#rows + 1] = { key = key, gc = row.gc, kbs = per_frame * row.frames / 1024 / span }
+  end
+  local v = w.vm
+  local vm_kbs = v.clean > 0 and (v.alloc / v.clean) * v.frames / 1024 / span or 0
+  say(string.format("  gc: ~%.1f ms/s of the mods' %.1f ms/s (%.0f%%); steps in %d of %d frames " ..
+                    "(inside mods in %d); %d cycles; heap %.1f MB, live after last cycle %.1f MB; " ..
+                    "pause %d stepmul %d",
+                    gc_total * 1000 / span, w.chain * 1000 / span,
+                    w.chain > 0 and gc_total * 100 / w.chain or 0,
+                    v.stepped, v.frames, w.chain_gc_frames, v.cycles,
+                    gcp.p32[8] / 1048576, gcp.p32[19] / 1048576, gcp.p32[21], gcp.p32[20]))
+  if w.worst_atomic_key ~= nil then
+    say(string.format("  gc: worst atomic step %s ms, in %s", ms1(w.worst_atomic), w.worst_atomic_key))
+  end
+  table.sort(rows, function(a, b) return a.gc > b.gc end)
+  local parts = {}
+  for k = 1, math.min(8, #rows) do
+    if rows[k].gc * 1000 / span >= 0.05 then
+      parts[#parts + 1] = string.format("%s %.2f ms/s", rows[k].key, rows[k].gc * 1000 / span)
+    end
+  end
+  say("  gc landed on: " .. (#parts > 0 and table.concat(parts, ", ") or "nothing measurable"))
+  table.sort(rows, function(a, b) return a.kbs > b.kbs end)
+  parts = {}
+  for k = 1, math.min(8, #rows) do
+    if rows[k].kbs >= 1 then
+      parts[#parts + 1] = string.format("%s %.0f KB/s", rows[k].key, rows[k].kbs)
+    end
+  end
+  say(string.format("  garbage: whole Lua VM ~%.0f KB/s; mods: %s", vm_kbs,
+                    #parts > 0 and table.concat(parts, ", ") or "none over 1 KB/s"))
+  installed.gcw = { rows = {}, chain = 0, frames = 0, chain_gc_frames = 0,
+                    vm = { frames = 0, clean = 0, alloc = 0, stepped = 0, cycles = 0, h = v.h, m = v.m },
+                    worst_atomic = 0, worst_atomic_key = nil, note = nil }
+end
+end
+
 local window = { mods = {}, started = nil, frames = 0, hitches = 0 }
 
 -- The panel's rolling window: one bucket per second, the last WINDOW_S kept.
@@ -1083,6 +1338,10 @@ local function write_summary(at)
                       g.vram_max / 1073741824, g.budget / 1073741824, g.took * 1000))
   end
   gpu.minute = nil
+  do
+    local ok, err = pcall(installed.gc_summary, span)
+    if not ok then say("  gc: summary failed: " .. tostring(err)) end
+  end
   say(session_line("  so far"))
   -- For the report: the whole session, not only this minute.
   session.time = (session.time or 0) + span
@@ -3484,6 +3743,10 @@ local function report(hitch, frame_selfs)
                          ms(mine), ms(math.max(0, hitch.interval - explained - unmeasured_mine)),
                          links[1].source)
   end
+  if frame_selfs ~= nil and installed.gcw.note ~= nil
+     and installed.gcw.note_frame == installed.frame_id - 1 then
+    body = body .. "; " .. installed.gcw.note    -- v0.21.0, the GC probe
+  end
   say(string.format("hitch %s ms (dt %s, next %s ms)%s: %s", ms(hitch.interval),
                     hitch.dt and ms(hitch.dt) or "?", frame_dt and ms(frame_dt) or "?",
                     heap, body))
@@ -3550,6 +3813,15 @@ local function tick(failed)
       installed.settling = installed.settling - 1
     else
       frame_selfs = selfs()
+    end
+  end
+  do
+    local ok, err = pcall(installed.gc_frame, frame_selfs)
+    if ok then ok, err = pcall(installed.gc_tick) end
+    if not ok then
+      installed.gcp = nil
+      installed.gc_why = "failed: " .. tostring(err)
+      say("gc: probe failed, off for this session: " .. tostring(err))
     end
   end
   add_mdl(frame_selfs)

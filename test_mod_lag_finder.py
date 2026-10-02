@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.20.0"
+RELEASE = "Mod Lag Watchdog v0.21.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -3684,6 +3684,105 @@ def static():
           "declared for loader discovery")
 
 
+GC_MODS = {
+    # ~200 small tables a frame, each garbage a frame later. (Kept until
+    # then: LuaJIT's allocation sinking removes tables that never escape, so
+    # "local t = {...}" in a compiled loop makes no garbage at all.)
+    "litter": r"""
+local previous = rawget(_G, "update")
+local keep = {}
+rawset(_G, "update", function(...)
+  for i = 1, 200 do keep[i] = { i, i, i, i } end
+  return previous(...)
+end)
+""",
+    # one small table a frame
+    "tidy": r"""
+local previous = rawget(_G, "update")
+local keep = nil
+rawset(_G, "update", function(...)
+  keep = { 1 }
+  return previous(...)
+end)
+""",
+}
+
+# os.clock for the GC case: the usual 16 ms a frame, plus real time from
+# QueryPerformanceCounter, so the collector's real steps take time the
+# Watchdog can see while a 60 s summary still comes after ~3750 frames.
+GC_CLOCK = r"""
+local ffi = require("ffi")
+pcall(ffi.cdef, "int QueryPerformanceCounter(int64_t *count);")
+pcall(ffi.cdef, "int QueryPerformanceFrequency(int64_t *frequency);")
+local k = ffi.load("kernel32")
+local qpc = ffi.cast("int (*)(void *)", k.QueryPerformanceCounter)
+local qpf = ffi.cast("int (*)(void *)", k.QueryPerformanceFrequency)
+local w = ffi.new("uint32_t[2]")
+qpf(w)
+local per = 1 / (w[1] * 4294967296 + w[0])
+qpc(w)
+local origin = w[1] * 4294967296 + w[0]
+os.clock = function()
+  qpc(w)
+  return CLOCK + (w[1] * 4294967296 + w[0] - origin) * per
+end
+__hd2_native_test.ffi = ffi
+"""
+
+
+def gc_case():
+    """The GC probe (v0.21.0, log only). On the game's lua51.dll, with the
+    real ffi handed over through the seam: it finds the collector's state,
+    every summary has a "gc:" line with steps and cycles, the garbage line
+    puts the mod making ~1 MB/s first and far above one making a table a
+    frame, and collector time landed somewhere in the mods. Without ffi it
+    says once why it is off. v0.20.0 has none of these lines."""
+    print("gc")
+    with session(ffi="allow") as s:
+        s.lua(menu_stub())
+        s.lua(GC_CLOCK)
+        s.lua("__mlf_test_flush = true")
+        for name in ["tidy", "litter"]:
+            check(s.load_mod(source=GC_MODS[name], name="mods/test/" + name), "%s loads" % name)
+        check(s.load_mod(source=finder_source(), name="mods/patpatpatrick/mod_lag_finder"),
+              "finder loads")
+        s.frames(60 * 130)
+        off = log_lines(s, r"gc: probe off")
+        if BACKEND == "game":
+            check(not off, "on the game's lua51.dll the probe is on: %r" % off)
+        elif off:
+            print("  (luajit21: %s)" % off[0])
+            clean(s, "gc off on luajit21")
+            return
+        head = log_lines(s, r"^t=[\d.]+\s+gc: ~")
+        check(len(head) >= 2, "each summary has a gc line: %r" % head[:2])
+        m = re.search(r"steps in (\d+) of (\d+) frames \(inside mods in (\d+)\); (\d+) cycles; "
+                      r"heap ([\d.]+) MB, live after last cycle ([\d.]+) MB; pause (\d+) stepmul (\d+)",
+                      head[-1] if head else "")
+        check(m is not None and int(m.group(1)) > 0 and int(m.group(4)) >= 1
+              and int(m.group(7)) == 200 and int(m.group(8)) == 200,
+              "steps, at least one cycle, the VM's pause/stepmul (200/200): %r" % head[-1:])
+        garbage = log_lines(s, r"^t=[\d.]+\s+garbage: ")
+        g = re.search(r"whole Lua VM ~(\d+) KB/s; mods: mods/test/litter (\d+) KB/s", garbage[-1] if garbage else "")
+        check(g is not None and 300 <= int(g.group(2)) <= 5000 and int(g.group(1)) >= int(g.group(2)) * 0.8,
+              "litter makes the most garbage, a plausible ~1 MB/s, within the VM's total: %r" % garbage[-1:])
+        tidy = re.search(r"mods/test/tidy (\d+) KB/s", garbage[-1] if garbage else "")
+        check(tidy is None or g is None or int(tidy.group(1)) * 10 < int(g.group(2)),
+              "tidy makes far less: %r" % garbage[-1:])
+        landed = log_lines(s, r"^t=[\d.]+\s+gc landed on: ")
+        check(bool(landed) and "nothing measurable" not in landed[-1],
+              "collector time landed on some mod: %r" % landed[-1:])
+        clean(s, "gc")
+    with session() as s:                                # ffi blocked: no seam ffi
+        s.lua(menu_stub())
+        load(s, ["std", "finder"])
+        s.frames(60 * 65)
+        off = log_lines(s, r"gc: probe off")
+        check(len(off) == 1 and "no ffi" in off[0], "without ffi it says so, once: %r" % off)
+        check(not log_lines(s, r"gc landed on|garbage: "), "and logs no gc numbers")
+        clean(s, "gc off")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -3691,6 +3790,9 @@ def main():
     if "--source" in sys.argv:
         SOURCE = os.path.join(HERE, "mod_lag_finder_src", "mod_lag_finder.lua")
     static()
+    if "--only" in sys.argv:
+        globals()[sys.argv[sys.argv.index("--only") + 1] + "_case"]()
+        sys.exit(1 if FAILURES else 0)
     map_case()
     retry_case()
     stall_case()
@@ -3751,6 +3853,7 @@ def main():
     soak_case()
     timer_case()
     gpu_case()
+    gc_case()
     gpu_native_case()
     native_case()
     real_case()
