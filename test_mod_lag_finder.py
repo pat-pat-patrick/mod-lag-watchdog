@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.16.2"
+RELEASE = "Mod Lag Watchdog v0.17.1"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -235,8 +235,8 @@ def finder_source():
     return lua_from_release(modpaths.find(RELEASE), FOLDER)
 
 
-def session():
-    s = Session(backend=BACKEND)
+def session(**options):
+    s = Session(backend=BACKEND, **options)
     s.lua(CLOCK)
     s.lua("FAKE.mission()")
     return s
@@ -801,14 +801,14 @@ def same_case():
 
 def restore_case():
     print("restore")
-    with session() as s:
+    with session(engine_main_world_calls=2) as s:  # re-arms from other mods' main_world calls
         load(s, ["heavy", "std", "finder"])
         s.frames(200)
         before = chain(s)
         check(len(before) == 4, "mapped before: %r %r" % (before, log_lines(s, "bottom at")))
         check(s.eval("tostring(UV(T.std.wrapper, 'previous_update') ~= T.std.prev)")
               == "true", "std's previous slot holds a shim while mapped")
-        s.lua("FAKE.transition({ gap = 120 })")
+        s.lua("FAKE.transition({ gap = 120, replace_update = true })")
         s.frames(300)
         check(s.eval("tostring(UV(T.std.wrapper, 'previous_update') == T.std.prev)")
               == "true", "the old chain's slot has its original back")
@@ -1743,7 +1743,7 @@ def review_rearm_gap_case():
     """4. The time out of the chain before a re-arm is no frame: no stall is
     counted for it. v0.12.6 logged the whole gap as a hitch."""
     print("review: re-arm gap")
-    with session() as s:
+    with session(engine_main_world_calls=2) as s:  # re-arms from other mods' main_world calls
         s.lua("GAME_UP = rawget(_G, 'update')")
         load(s, ["heavy", "finder"])
         s.frames(200)
@@ -1775,7 +1775,7 @@ def review_shutdown_once_case():
     over ours and two re-arms, the exit summary runs once. v0.12.6 stacked a
     wrapper per re-arm and wrote "game over" three times."""
     print("review: shutdown once")
-    with session() as s:
+    with session(engine_main_world_calls=2) as s:  # re-arms from other mods' main_world calls
         s.lua("GAME_UP = rawget(_G, 'update')")
         load(s, ["heavy", "finder"])
         s.frames(100)
@@ -2227,7 +2227,7 @@ def review_rearm_window_case():
     afresh: heavy's ms/s stays its real ~240. v0.13.2 counted the gap in
     the window and read about half."""
     print("review: window after a re-arm")
-    with session() as s:
+    with session(engine_main_world_calls=2) as s:  # re-arms from other mods' main_world calls
         s.lua(GUI_STUB)
         load(s, ["heavy"])
         s.lua("BELOW = rawget(_G, 'update')")
@@ -2802,7 +2802,7 @@ def rearm_summary_case():
     dropped it, and its error counts), and one before the first tick still
     notes the deploy (review [20]). Fails on v0.14.0."""
     print("re-arm summary")
-    with session() as s:
+    with session(engine_main_world_calls=2) as s:  # re-arms from other mods' main_world calls
         s.lua("GAME_UP = rawget(_G, 'update')")
         load(s, ["heavy", "finder"])
         s.frames(2500)                                       # 40 s into the minute
@@ -2813,7 +2813,7 @@ def rearm_summary_case():
         summary = re.search(r"summary (\d+) s: frames=", text)
         check(armed >= 0 and summary is not None and summary.start() < armed and int(summary.group(1)) >= 35,
               "the 40 s so far are written before the re-arm: %r" % log_lines(s, "summary|armed"))
-    with session() as s:
+    with session(engine_main_world_calls=2) as s:  # re-arms from other mods' main_world calls
         s.lua("GAME_UP = rawget(_G, 'update')")
         load(s, ["heavy", "finder"])
         s.frames(1)                                          # armed, never ticked
@@ -2821,6 +2821,110 @@ def rearm_summary_case():
         s.frames(400)
         check(bool(log_lines(s, r"update armed generation=2")), "re-armed: %r" % log_lines(s, "armed"))
         check(bool(log_lines(s, r"^t=\S+ deploy: ")), "the deploy is still noted: %r" % log_lines(s, "deploy"))
+
+
+def modlist_case():
+    """"copy mod list" (v0.17.1): every enabled Arsenal mod by how it runs --
+    timed in the update, replacing game scripts (counted as "(the game)"),
+    other Lua, no Lua -- plus links no Arsenal mod ships. A Lua resource in a
+    later patch index counts. A Chinese name survives. The "(the game)" report
+    names the script-replacing mods instead of a hook line. Fails on v0.16.2
+    (no such line in the window)."""
+    import json
+    print("mod list")
+    scratch = tempfile.mkdtemp(prefix="mlf_modlist_")
+    root = os.path.join(scratch, "Arsenal Mods")
+    arsenal = os.path.join(scratch, "hd2arsenal")
+    os.makedirs(arsenal)
+
+    def folder(name, archives):
+        path = os.path.join(root, name, "Main")
+        os.makedirs(path)
+        for patch, rows in archives.items():
+            with open(os.path.join(path, "9ba626afa44a3aa3.patch_%d" % patch), "wb") as f:
+                f.write(lua_archive([src for _, src in rows], names=[n for n, _ in rows]))
+
+    folder("Slow_AR1", {0: [("mods/test/slow", "-- HD2-Addon: mods/test/slow\nreturn {}\n")]})
+    folder("Script_AR2", {0: [("scripts/game/some_game_script", "return {}")]})
+    folder("Helper_AR3", {0: [("mods/test/helper", "-- HD2-Addon: mods/test/helper\nreturn {}\n")]})
+    folder("Texture_AR4", {})
+    folder("Late_AR5", {3: [("scripts/game/other_script", "return {}"),
+                            ("scripts/game/third_script", "return {}")]})
+    folder("Chinese_AR6", {})
+    labels = [("Slow Mod", "Slow_AR1"), ("Script Mod", "Script_AR2"), ("Helper Mod", "Helper_AR3"),
+              ("Texture Mod", "Texture_AR4"), ("Late Mod 11334 1.1 2026-07-08T07-48Z IzUPRhJPM", "Late_AR5"),
+              ("\u5c0f\u70ae\u53f0\u9ad8\u4eae", "Chinese_AR6")]
+    profile = {"label": "Test", "mods": [
+        {"label": label, "path": os.path.join(root, name), "enabled": True,
+         "options": [{"name": "Main", "enabled": True, "include": ["Main"], "suboptions": []}]}
+        for label, name in labels]}
+    with open(os.path.join(arsenal, "hd2a_data.json"), "w", encoding="utf-8") as f:
+        json.dump({"selectedProfile": "p1", "modsList": {"p1": profile}}, f)
+
+    def click(s, prefix):
+        pos = s.eval("POS('%s')" % prefix)
+        check(pos != "none", "%r is on the menu window: %r" % (prefix, s.eval("SHOWN()")))
+        if pos == "none":
+            return ""
+        x, y = (int(v) for v in pos.split(","))
+        s.lua("CLIP = nil; MOUSE.x, MOUSE.y = %d, %d; PRESS(1)" % (x + 20, y + 4))
+        s.frames(2)
+        s.lua("RELEASE(1)")
+        s.frames(2)
+        return s.eval("CLIP") or ""
+
+    try:
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            s.lua(menu_stub())
+            s.lua("__hd2_native_test.clipboard = function(text) CLIP = text return true end")
+            load(s, ["heavy", "slow", "finder"])          # heavy: in the update, in no Arsenal mod
+            s.frames(400)
+            s.lua("MENU_STATE(1, 0)")
+            s.frames(6)
+            clip = click(s, "copy mod list")
+            lines = clip.split("\r\n")
+            check(lines[0].startswith("Mod Lag Watchdog mod list (" + RELEASE.split()[-1] + ", game build 6AB3B43F)"),
+                  "the header: %r" % lines[:1])
+            check("Enabled in Arsenal: 6 mods" in lines, "six enabled mods: %r" % clip)
+
+            def group(title):
+                for index, line in enumerate(lines):
+                    if line.startswith(title):
+                        body = []
+                        for more in lines[index + 1:]:
+                            if not more.startswith("  "):
+                                break
+                            body.append(more.strip())
+                        return line, " ".join(body)
+                return None, ""
+
+            head, body = group("Timed one by one")
+            check(head == "Timed one by one (hook the game's update): 1" and body == "Slow Mod",
+                  "timed: %r %r" % (head, body))
+            head, body = group("Replace the game's own scripts")
+            check(head is not None and head.endswith(": 2") and body == "Late Mod (2 scripts), Script Mod (1 script)",
+                  "game scripts, patch_3 counted, the download tail gone: %r %r" % (head, body))
+            head, body = group("Lua that is not in the update")
+            check(head is not None and head.endswith(": 1") and body == "Helper Mod", "other Lua: %r %r" % (head, body))
+            head, body = group("No Lua")
+            check(head is not None and head.endswith(": 2") and "Texture Mod" in body
+                  and "\u5c0f\u70ae\u53f0\u9ad8\u4eae" in body, "no Lua, the Chinese name kept: %r %r" % (head, body))
+            head, body = group("In the update but not in Arsenal")
+            check(head is not None and body == "heavy", "loose links: %r %r" % (head, body))
+            check(scratch.replace("\\", "/") not in clip.replace("\\", "/") and "Users" not in clip, "no path in it")
+            check("mod list copied (6 mods)" in s.eval("SHOWN()"), "and says so: %r" % s.eval("SHOWN()"))
+            check(bool(log_lines(s, r"mod list: copied \(6 mods\)")), "logged")
+
+            report = click(s, "(the game)").split("\r\n")
+            check(len(report) == 8 and report[7] ==
+                  "Mods that replace game scripts (counted here): Late Mod (2 scripts), Script Mod (1 script)",
+                  "the game's report names them: %r" % report[-1:])
+            clean(s, "mod list")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def report_case():
@@ -3296,6 +3400,7 @@ def main():
     memory_case()
     units_case()
     report_case()
+    modlist_case()
     switch_case()
     alerts_case()
     small_case()

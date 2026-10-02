@@ -35,7 +35,7 @@ from hd2fake import Session                      # noqa: E402
 from hd2fake.sources import lua_from_release     # noqa: E402
 import modpaths                                  # noqa: E402
 
-CURRENT = "Mod Lag Watchdog v0.16.2"
+CURRENT = "Mod Lag Watchdog v0.17.1"
 CONTROL = "Mod Lag Watchdog v0.16.1"
 FOLDER = "Mod Lag Watchdog"
 NAME = "mods/patpatpatrick/mod_lag_finder"
@@ -54,7 +54,8 @@ FAKE.before_frame = function(f)
 end
 FAKE.frames(240)
 local t0 = FAKE.time
-FAKE.transition({ gap = 0 })
+-- Something replaced the chain (a re-arm test; hd2fake keeps it by default).
+FAKE.transition({ gap = 0, replace_update = true })
 local after = rawget(_G, "update")
 local n = 0
 while rawget(_G, "update") == after and n < 36000 do

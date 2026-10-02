@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.16.2 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.17.1 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -9,8 +9,10 @@
 --     escape menu (below);
 --   * once a second, dxgi's QueryVideoMemoryInfo: this process's video memory
 --     and the budget Windows gives it (v0.12.1);
---   * only when the player clicks a mod's row: user32's clipboard calls
---     (OpenClipboard, EmptyClipboard, SetClipboardData, CloseClipboard) and
+--   * only when the player clicks a mod's row or "copy mod list": user32's
+--     clipboard calls (OpenClipboard, EmptyClipboard, SetClipboardData,
+--     CloseClipboard), kernel32's MultiByteToWideChar (v0.17.1: the text goes
+--     as Unicode, so Chinese mod names survive) and
 --     kernel32's GlobalAlloc/GlobalLock/GlobalUnlock/GlobalFree for the text
 --     handed to the clipboard (v0.11.0; see "report").
 -- The first three only read. None of them writes to the game's memory.
@@ -118,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.16.2"
+local MARKER = "mod-lag-finder-v0.17.1"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1104,6 +1106,21 @@ local read_names
 do
 local LUA_TYPE = "\226\023\209\044\250\141\078\161"   -- 0xA14E8DFA2CD117E2, little-endian
 local LUA_ARCHIVE = "9ba626afa44a3aa3.patch_0"
+-- Every Lua resource of the game and of every mod is in this archive; an
+-- option may ship its Lua under a later patch index (HD2 HUD+ 0.1.13: its
+-- squad fragment in patch_5). Those count for the mod list (v0.17.1) but
+-- not for names, which go by patch_0 as before.
+
+-- The mod manager's name as it is, for the mod list on the clipboard (any
+-- characters; only the "<id> <version> <date>T..Z <tag>" tail some
+-- downloads carry goes).
+local function plain_label(label)
+  if type(label) ~= "string" then return "?" end
+  label = string.gsub(label, "%s+%d+%s+%S+%s+%d%d%d%d%-%d%d%-%d%dT.*$", "")
+  label = string.match(label, "^%s*(.-)%s*$")
+  if label == "" then return "?" end
+  return label
+end
 
 -- Returns the value, or nil and why. Never raises: a broken list is an
 -- ordinary answer, not an error.
@@ -1357,6 +1374,9 @@ local function clean_label(label)
 end
 
 read_names = function()
+  -- The enabled mods and how each runs, for "copy mod list" (v0.17.1).
+  installed.mod_list, installed.mod_list_why = nil, "no Arsenal mod list was read"
+  local listed_mods = {}
   local ok_env, localappdata = pcall(os.getenv, "LOCALAPPDATA")
   if not ok_env or type(localappdata) ~= "string" then return "no LOCALAPPDATA" end
   local text = read_all(localappdata .. "\\hd2arsenal\\hd2a_data.json")
@@ -1369,6 +1389,8 @@ read_names = function()
   local hashes, readable, owner_of = {}, {}, {}
   for mod_index, mod in ipairs(profile.mods) do
     if type(mod) == "table" and mod.enabled == true and type(mod.path) == "string" then
+      local listed = { label = plain_label(mod.label), keys = {}, lua = 0, scripts = 0 }
+      listed_mods[#listed_mods + 1] = listed
       local folders = {}
       local function add(option)
         for _, include in ipairs(type(option.include) == "table" and option.include or {}) do
@@ -1394,6 +1416,21 @@ read_names = function()
         local addons = archive_addons(path)
         if addons ~= nil then archives = archives + 1 end
         if addons ~= nil and #addons > 0 then lua_folders = lua_folders + 1 end
+        -- The mod list sees every patch index of the folder.
+        local every = {}
+        for _, entry in ipairs(addons or {}) do every[#every + 1] = entry end
+        for patch = 1, 15 do
+          local more = archive_addons((string.gsub(path, "patch_0$", "patch_" .. patch)))
+          for _, entry in ipairs(more or {}) do
+            every[#every + 1] = entry
+            hashes[entry.key], hashes[entry.row] = true, true
+          end
+        end
+        for _, entry in ipairs(every) do
+          listed.keys[entry.key], listed.keys[entry.row] = true, true
+          listed.lua = listed.lua + 1
+          if entry.readable == nil then listed.scripts = listed.scripts + 1 end
+        end
         for _, entry in ipairs(addons or {}) do
           hashes[entry.key] = true
           hashes[entry.row] = true
@@ -1432,6 +1469,7 @@ read_names = function()
     end
   end
   installed.archive_hashes = hashes
+  installed.mod_list, installed.mod_list_why = listed_mods, nil
   -- Two mods under the same name keep their short names; one mod's several
   -- resources may share its name.
   local uses = {}
@@ -2436,10 +2474,6 @@ end   -- units
 -- No paths, user names or hardware in it; the other mods only as a count.
 local export_report
 do
-local function ascii(text)
-  return (string.gsub(text, "[^\32-\126\r\n]", "?"))
-end
-
 local function copy_to_clipboard(text)
   local seam = rawget(_G, "__hd2_native_test")
   if type(seam) == "table" then
@@ -2454,6 +2488,8 @@ local function copy_to_clipboard(text)
   local done, why = pcall(function()
     for _, decl in ipairs({ "int OpenClipboard(void *owner);", "int EmptyClipboard(void);",
                             "int CloseClipboard(void);",
+                            "int MultiByteToWideChar(unsigned int page, unsigned long flags, " ..
+                              "const char *text, int bytes, void *wide, int chars);",
                             "void *SetClipboardData(unsigned int format, void *memory);",
                             "void *GlobalAlloc(unsigned int flags, size_t bytes);",
                             "void *GlobalLock(void *memory);", "int GlobalUnlock(void *memory);",
@@ -2469,21 +2505,31 @@ local function copy_to_clipboard(text)
     local lock = ffi.cast("void *(*)(void *)", kernel32.GlobalLock)
     local unlock = ffi.cast("int (*)(void *)", kernel32.GlobalUnlock)
     local free = ffi.cast("void *(*)(void *)", kernel32.GlobalFree)
-    local memory = alloc(0x0002, #text + 1)                 -- GMEM_MOVEABLE
+    local wide = ffi.cast("int (*)(unsigned int, unsigned long, const char *, int, void *, int)",
+                          kernel32.MultiByteToWideChar)
+    -- UTF-8 to UTF-16 (CF_UNICODETEXT, v0.17.1): CF_TEXT is read in the
+    -- system's ANSI code page, which turned Chinese mod names into "?".
+    local chars = wide(65001, 0, text, -1, nil, 0)           -- with its NUL
+    if chars <= 0 then error("MultiByteToWideChar failed") end
+    local memory = alloc(0x0002, chars * 2)                  -- GMEM_MOVEABLE
     if memory == nil then error("GlobalAlloc failed") end
     local target = lock(memory)
     if target == nil then
       free(memory)
       error("GlobalLock failed")
     end
-    ffi.copy(target, text)                                   -- with its NUL
+    if wide(65001, 0, text, -1, target, chars) <= 0 then
+      unlock(memory)
+      free(memory)
+      error("MultiByteToWideChar failed")
+    end
     unlock(memory)
     if open(nil) == 0 then
       free(memory)
       error("the clipboard is busy")
     end
     empty()
-    if set(1, memory) == nil then                            -- CF_TEXT; Windows owns it now
+    if set(13, memory) == nil then                           -- CF_UNICODETEXT; Windows owns it now
       free(memory)
       close()
       error("SetClipboardData failed")
@@ -2492,6 +2538,106 @@ local function copy_to_clipboard(text)
   end)
   if done then return true end
   return nil, tostring(why)
+end
+
+-- How each enabled mod runs (v0.17.1; a player whose "(the game)" read
+-- 272.6 ms/s with only 4 mods in the update, 2026-10-01): a mod whose Lua
+-- resource is a link of the update chain is timed one by one; one that only
+-- ships Lua with no HD2-Addon line, none of it in the chain, replaces the
+-- game's own scripts (likely: the game calls them, so their time is counted
+-- as "(the game)"); Lua with that line but not in the chain runs some other
+-- way; no Lua at all is models, textures and sounds.
+local function by_how_it_runs()
+  local chain = {}
+  for _, link in ipairs(links) do
+    if type(link.source) == "string" then chain[installed.hash_of(link.source)] = link end
+  end
+  local groups = { timed = {}, scripts = {}, other = {}, none = {}, loose = {} }
+  local claimed = {}
+  for _, mod in ipairs(installed.mod_list or {}) do
+    local timed = false
+    for key in pairs(mod.keys) do
+      if chain[key] ~= nil then
+        timed, claimed[key] = true, true
+      end
+    end
+    if timed then
+      groups.timed[#groups.timed + 1] = mod.label
+    elseif mod.lua == 0 then
+      groups.none[#groups.none + 1] = mod.label
+    elseif mod.scripts > 0 then
+      groups.scripts[#groups.scripts + 1] = mod.label ..
+        (mod.scripts == 1 and " (1 script)" or string.format(" (%d scripts)", mod.scripts))
+    else
+      groups.other[#groups.other + 1] = mod.label
+    end
+  end
+  -- Links of the update no Arsenal mod ships (another manager, a manual install).
+  for hash, link in pairs(chain) do
+    if not claimed[hash] and link.bottom ~= "game" and link.fn ~= installed.wrapper and is_mod_source(link.source) then
+      groups.loose[#groups.loose + 1] = short_name(link.source)
+    end
+  end
+  for _, list in pairs(groups) do
+    table.sort(list, function(a, b) return string.lower(a) < string.lower(b) end)
+  end
+  return groups
+end
+
+-- A key's cost so far: ms/s over the session, and the session's length.
+local function session_cost(key, at)
+  local partial = window.started and math.max(0, at - window.started) or 0
+  local seconds = (session.time or 0) + partial
+  local total = session.mods and session.mods[key] or nil
+  local now_row = window.mods[key]
+  local time = (total and total.time or 0) + (now_row and now_row.time or 0)
+  local frames = (session.frames or 0) + window.frames
+  return seconds > 0 and time * 1000 / seconds or 0, seconds, frames
+end
+
+-- Names joined with ", ", wrapped at about 100 characters, each line indented.
+local function wrapped(list)
+  local out, line = {}, ""
+  for index, name in ipairs(list) do
+    local piece = name .. (index < #list and "," or "")
+    if line ~= "" and #line + 1 + #piece > 100 then
+      out[#out + 1] = "  " .. line
+      line = piece
+    else
+      line = line == "" and piece or (line .. " " .. piece)
+    end
+  end
+  if line ~= "" then out[#out + 1] = "  " .. line end
+  return out
+end
+
+local function mod_list_text(at)
+  local version = string.match(MARKER, "(v[%d%.]+)$") or MARKER
+  local game, seconds, frames = session_cost("(the game)", at)
+  local lines = {
+    string.format("Mod Lag Watchdog mod list (%s, game build %s)", version,
+                  native.stamp and string.format("%08X", native.stamp) or "unknown"),
+    string.format("Session: %.0f min, %.0f FPS average; \"(the game)\" %.1f ms/s average",
+                  seconds / 60, seconds > 0 and frames / seconds or 0, game),
+  }
+  if installed.mod_list == nil then
+    lines[#lines + 1] = "No Arsenal mod list: " .. tostring(installed.mod_list_why)
+  else
+    lines[#lines + 1] = string.format("Enabled in Arsenal: %d mods", #installed.mod_list)
+  end
+  local groups = by_how_it_runs()
+  for _, group in ipairs({
+      { groups.timed, "Timed one by one (hook the game's update)" },
+      { groups.scripts, "Replace the game's own scripts (their cost shows as \"(the game)\")" },
+      { groups.other, "Lua that is not in the update" },
+      { groups.none, "No Lua (models, textures, sounds)" },
+      { groups.loose, "In the update but not in Arsenal" } }) do
+    if #group[1] > 0 or group[1] ~= groups.loose then
+      lines[#lines + 1] = string.format("%s: %d", group[2], #group[1])
+      for _, line in ipairs(wrapped(group[1])) do lines[#lines + 1] = line end
+    end
+  end
+  return table.concat(lines, "\r\n"), installed.mod_list and #installed.mod_list or 0
 end
 
 local function report_text(key, at)
@@ -2538,6 +2684,22 @@ local function report_text(key, at)
     if r.source == key then copies = r.n end
   end
   local on_top = #links > 0 and links[1].source == key and links[1].fn ~= installed.wrapper
+  local last = string.format("Update hook: hooked %d time%s, %s%s", copies, copies == 1 and "" or "s",
+                             on_top and "on top (its own time not measured)" or "not on top",
+                             (installed.errors_session[key] or 0) > 0
+                               and string.format("; Lua errors in %d frames", installed.errors_session[key]) or "")
+  -- The game's own row has no hook of its own: the mods counted in it go
+  -- there instead (v0.17.1).
+  if key == "(the game)" then
+    local scripts = by_how_it_runs().scripts
+    if installed.mod_list == nil then
+      last = "Mods that replace game scripts: unknown (no Arsenal mod list)"
+    elseif #scripts == 0 then
+      last = "Mods that replace game scripts (counted here): none in Arsenal"
+    else
+      last = "Mods that replace game scripts (counted here): " .. table.concat(scripts, ", ")
+    end
+  end
   local lines = {
     string.format("Mod Lag Watchdog report: %s (%s)", name, key),
     string.format("Game build %s, Watchdog %s, %d mods hook the update",
@@ -2549,12 +2711,9 @@ local function report_text(key, at)
     stall_text,
     memory_text,
     units_text,
-    string.format("Update hook: hooked %d time%s, %s%s", copies, copies == 1 and "" or "s",
-                  on_top and "on top (its own time not measured)" or "not on top",
-                  (installed.errors_session[key] or 0) > 0
-                    and string.format("; Lua errors in %d frames", installed.errors_session[key]) or ""),
+    last,
   }
-  return ascii(table.concat(lines, "\r\n"))
+  return table.concat(lines, "\r\n")
 end
 
 export_report = function(key, at)
@@ -2574,6 +2733,30 @@ export_report = function(key, at)
     end
     say(string.format("report: clipboard unavailable (%s); written to %s", tostring(why), file_name))
     toast = { text = "report saved: " .. file_name, until_at = at + 8, colour = AMBER }
+  end
+  ui.dirty = true
+end
+
+-- "copy mod list" in the escape-menu window (v0.17.1): every enabled mod,
+-- by how it runs, for a bug report. Like the report, the clipboard is used
+-- on the click only; without it the list goes to mod_lag_mod_list.txt.
+installed.export_mod_list = function(at)
+  local text, count = mod_list_text(at)
+  local ok, why = copy_to_clipboard(text)
+  if ok then
+    say(string.format("mod list: copied (%d mods)", count))
+    toast = { text = string.format("mod list copied (%d mods)", count), until_at = at + 5, colour = WHITE }
+  else
+    local path = log_path and string.gsub(log_path, "mod_lag_finder%.log$", "mod_lag_mod_list.txt") or nil
+    local file = path and io.open(path, "w") or nil
+    if file ~= nil then
+      file:write((string.gsub(text, "\r\n", NL)), NL)
+      file:close()
+    end
+    say(string.format("mod list: clipboard unavailable (%s); %s", tostring(why),
+                      file ~= nil and "written to mod_lag_mod_list.txt" or "not written"))
+    toast = { text = file ~= nil and "mod list saved: mod_lag_mod_list.txt" or "mod list: no clipboard",
+              until_at = at + 8, colour = AMBER }
   end
   ui.dirty = true
 end
@@ -2726,7 +2909,7 @@ local function items(at)
   local list = {}
   local window_shown = ui.in_menu or ui.panel
   local lines = window_shown and panel_lines(at) or {}
-  local g = geometry(#lines + (ui.in_menu and 4 or 1))
+  local g = geometry(#lines + (ui.in_menu and 5 or 1))
   ui.geometry = g
   local s = g.s
   if window_shown and ui.in_menu then
@@ -2761,6 +2944,11 @@ local function items(at)
                         x = g.x + PAD * s, y = y, size = TEXT_SIZE * s,
                         c = ui.alerts_off and GREY or WHITE }
     ui.rows[#ui.rows + 1] = { key = ALERTS, bottom = y - 6 * s, top = y - 6 * s + LINE * s }
+    y = y - LINE * s
+    -- Every enabled mod and how it runs, for a bug report (v0.17.1).
+    list[#list + 1] = { text = "copy mod list (for a bug report)",
+                        x = g.x + PAD * s, y = y, size = TEXT_SIZE * s, c = WHITE }
+    ui.rows[#ui.rows + 1] = { key = "\0mod list", bottom = y - 6 * s, top = y - 6 * s + LINE * s }
     y = y - LINE * s
     list[#list + 1] = { text = "drag the title bar; right-click it: default place",
                         x = g.x + PAD * s, y = y, size = TEXT_SIZE * s, c = GREY }
@@ -2864,6 +3052,8 @@ local function handle_mouse()
             ui.dirty = true
             save_place()
             say(ui.alerts_off and "alerts off in missions (menu switch)" or "alerts on in missions (menu switch)")
+          elseif row.key == "\0mod list" then
+            pcall(installed.export_mod_list, now())
           else
             pcall(export_report, row.key, now())
           end
