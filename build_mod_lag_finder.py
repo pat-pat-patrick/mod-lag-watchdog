@@ -24,7 +24,7 @@ TEMPLATE = os.path.join(HERE, "lua_archive_template.bin")
 ADDON = "mods/patpatpatrick/mod_lag_finder"
 LUA_T = 0xA14E8DFA2CD117E2
 PAYLOAD_FLAG = 2
-VERSION = "v0.19.1"
+VERSION = "v0.20.0"
 MOD = "Mod Lag Watchdog"
 # A build is a local test build unless the user says it goes to Nexus (the
 # user, 2026-09-30): then the release name has no "Nexus" and the manifest
@@ -57,7 +57,8 @@ Shows which Lua mod is making your game stutter.
 
 - When one mod causes a long stall, a line names it for a few seconds.
 - Open the pause menu (GAME tab) for a table of each mod's cost. Drag it by
-  its title bar; right-click the title bar to put it back.
+  its title bar; right-click the title bar to put it back. Click [-] on the
+  title bar to fold it away, [+] to open it again.
 - Two switches in that window: "show table in missions" (or press Home)
   and "show alerts in missions". With both off nothing is drawn in a mission.
 - In the pause menu every mod is listed; those under 10 ms/s in grey.

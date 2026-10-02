@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.19.1 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.20.0 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.19.1"
+local MARKER = "mod-lag-finder-v0.20.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1736,18 +1736,20 @@ local function load_place()
   if file == nil then return end
   local text = file:read("*l")
   file:close()
-  local x, top, shown, alerts = string.match(text or "", "^%s*(%-?%d+)%s+(%-?%d+)%s*(%d?)%s*(%d?)")
+  local x, top, shown, alerts, folded =
+    string.match(text or "", "^%s*(%-?%d+)%s+(%-?%d+)%s*(%d?)%s*(%d?)%s*(%d?)")
   if x ~= nil then ui.place = { x = tonumber(x), top = tonumber(top) } end
   if shown == "1" then ui.panel = true end
   if alerts == "0" then ui.alerts_off = true end
+  if folded == "1" then ui.folded = true end     -- v0.20.0; older files have no fifth field
 end
 
 local function save_place()
   if place_path == nil then return end
   local file = io.open(place_path, "w")
   if file == nil then return end
-  file:write(string.format("%d %d %d %d", ui.place.x, ui.place.top, ui.panel and 1 or 0,
-                           ui.alerts_off and 0 or 1) .. NL)
+  file:write(string.format("%d %d %d %d %d", ui.place.x, ui.place.top, ui.panel and 1 or 0,
+                           ui.alerts_off and 0 or 1, ui.folded and 1 or 0) .. NL)
   file:close()
 end
 
@@ -3107,17 +3109,34 @@ end
 local function items(at)
   local list = {}
   local window_shown = ui.in_menu or ui.panel
-  local lines = window_shown and panel_lines(at) or {}
-  local g = geometry(#lines + (ui.in_menu and 5 or 1))
+  -- On the menu the window can be folded to its title bar (v0.20.0, the
+  -- user: some find it in the way); the table in play is not affected.
+  local folded = ui.in_menu and ui.folded
+  local lines = (window_shown and not folded) and panel_lines(at) or {}
+  local g = geometry(folded and 0 or (#lines + (ui.in_menu and 5 or 1)))
   ui.geometry = g
+  ui.button = nil
   local s = g.s
-  if window_shown and ui.in_menu then
+  if window_shown and folded then
+    list[#list + 1] = { rect = true, x = g.x, y = g.top - HEADER * s, w = g.w, h = HEADER * s,
+                        z = 91, c = BAND }
+    list[#list + 1] = { text = "MOD LAG WATCHDOG", x = g.x + PAD * s,
+                        y = g.top - HEADER * s + 8 * s, size = TITLE_SIZE * s, c = WHITE }
+    list[#list + 1] = { text = "[+]", x = g.x + g.w - (PAD + 28) * s,
+                        y = g.top - HEADER * s + 8 * s, size = TITLE_SIZE * s, c = WHITE }
+    ui.button = g.x + g.w - (PAD + 36) * s
+    ui.rows = {}
+  elseif window_shown and ui.in_menu then
     -- On the menu: a window to drag, with a background and a title bar.
     list[#list + 1] = { rect = true, x = g.x, y = g.top - g.h, w = g.w, h = g.h, z = 90, c = BACK }
     list[#list + 1] = { rect = true, x = g.x, y = g.top - HEADER * s, w = g.w, h = HEADER * s,
                         z = 91, c = BAND }
     list[#list + 1] = { text = "MOD LAG WATCHDOG", x = g.x + PAD * s,
                         y = g.top - HEADER * s + 8 * s, size = TITLE_SIZE * s, c = WHITE }
+    -- At the title bar's right end, like a window's minimize button.
+    list[#list + 1] = { text = "[-]", x = g.x + g.w - (PAD + 28) * s,
+                        y = g.top - HEADER * s + 8 * s, size = TITLE_SIZE * s, c = WHITE }
+    ui.button = g.x + g.w - (PAD + 36) * s
     local y = g.top - HEADER * s - PAD * s - LINE * s + 6 * s
     ui.rows = {}
     for _, line in ipairs(lines) do
@@ -3213,7 +3232,8 @@ local function draw(list)
   ui.signature = key
 end
 
--- On the menu: drag by the title bar, right-click it for the default place.
+-- On the menu: drag by the title bar, right-click it for the default place,
+-- [-] / [+] at its right end folds and unfolds the window (v0.20.0).
 local function handle_mouse()
   local g = ui.geometry
   if g == nil then return end
@@ -3262,7 +3282,12 @@ local function handle_mouse()
     end
     return
   end
-  if mouse_clicked("left") then
+  if mouse_clicked("left") and ui.button ~= nil and mx >= ui.button then
+    ui.folded = not ui.folded
+    ui.dirty = true
+    save_place()
+    say(ui.folded and "window folded" or "window unfolded")
+  elseif mouse_clicked("left") then
     ui.moving = { mx = mx, my = my, px = ui.place.x, ptop = ui.place.top }
   elseif mouse_clicked("right") then
     ui.place = { x = DEFAULT_X, top = DEFAULT_TOP }

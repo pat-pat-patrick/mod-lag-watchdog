@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.19.1"
+RELEASE = "Mod Lag Watchdog v0.20.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1093,7 +1093,7 @@ def menu_case():
                   "the window follows the mouse: %s" % s.eval("POS('MOD LAG WATCHDOG')"))
             s.lua("RELEASE(1)")
             s.frames(2)
-            check((s.file("mod_lag_finder_window.txt") or "").strip() == "856 520 0 1",
+            check((s.file("mod_lag_finder_window.txt") or "").strip() == "856 520 0 1 0",
                   "the place is saved when the button is let go: %r"
                   % s.file("mod_lag_finder_window.txt"))
 
@@ -1141,6 +1141,83 @@ def menu_case():
                   "right-clicking the title bar puts it back: %s"
                   % s.eval("POS('MOD LAG WATCHDOG')"))
             clean(s, "menu reload")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def fold_case():
+    """[-] at the right end of the menu window's title bar folds the window to
+    its title bar, [+] opens it again (v0.20.0, the user: some find it in the
+    way). Remembered with the place; the table in play (Home) is not folded;
+    a click on the button does not drag. Fails on v0.19.1 (no button)."""
+    print("fold")
+    scratch = tempfile.mkdtemp(prefix="mlf_fold_")
+
+    def click(s, x, y):
+        s.lua("MOUSE.x, MOUSE.y = %d, %d; PRESS(1)" % (x, y))
+        s.frames(2)
+        s.lua("RELEASE(1)")
+        s.frames(2)
+
+    def at(s, text):
+        pos = s.eval("POS('%s')" % text)
+        return None if pos == "none" else tuple(int(v) for v in pos.split(","))
+
+    try:
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            s.lua(menu_stub())
+            load(s, ["heavy", "finder"])
+            s.frames(120)
+            s.lua("MENU_STATE(1, 0)")
+            s.frames(6)
+            title = s.eval("POS('MOD LAG WATCHDOG')")
+            button = at(s, "[-]")
+            check(button is not None and "show table in missions" in s.eval("SHOWN()"),
+                  "an open window with [-] on its title bar: %r" % s.eval("SHOWN()"))
+            if button is not None:
+                click(s, button[0] + 4, button[1] + 4)
+            shown = s.eval("SHOWN()")
+            check("MOD LAG WATCHDOG" in shown and "[+]" in shown and "show table" not in shown
+                  and "heavy" not in shown and "click a mod" not in shown,
+                  "folded: the title bar alone, with [+]: %r" % shown)
+            check(s.eval("POS('MOD LAG WATCHDOG')") == title, "the click did not drag it")
+            check((s.file("mod_lag_finder_window.txt") or "").strip() == "1056 620 0 1 1",
+                  "saved: %r" % s.file("mod_lag_finder_window.txt"))
+            check(bool(log_lines(s, r"window folded")), "logged")
+            s.lua("MENU_STATE(4, 0)")          # back to play
+            s.frames(3)
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            check(re.search(r"heavy\s+\d+\.\d", s.eval("SHOWN()")) is not None,
+                  "Home in play still shows the whole table: %r" % s.eval("SHOWN()"))
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            clean(s, "fold")
+
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            s.lua(menu_stub())
+            load(s, ["heavy", "finder"])
+            s.frames(120)
+            s.lua("MENU_STATE(1, 0)")
+            s.frames(6)
+            button = at(s, "[+]")
+            check(button is not None and "show table" not in s.eval("SHOWN()"),
+                  "the next game opens it folded: %r" % s.eval("SHOWN()"))
+            if button is not None:
+                click(s, button[0] + 4, button[1] + 4)
+            shown = s.eval("SHOWN()")
+            check("[-]" in shown and "show table in missions" in shown
+                  and re.search(r"heavy\s+\d+\.\d", shown) is not None,
+                  "[+] opens it again: %r" % shown)
+            check((s.file("mod_lag_finder_window.txt") or "").strip() == "1056 620 0 1 0",
+                  "saved open: %r" % s.file("mod_lag_finder_window.txt"))
+            clean(s, "unfold")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -1471,7 +1548,7 @@ def switch_case():
                     shown = s.eval("SHOWN()")
                     check(re.search(r"heavy\s+\d+\.\d", shown) is not None and "in missions" not in shown,
                           "in the mission the table stays up, without the switch line: %r" % shown)
-                    check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 1 1"),
+                    check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 1 1 0"),
                           "and it is saved: %r" % s.file("mod_lag_finder_window.txt"))
                 else:
                     shown = s.eval("SHOWN()")
@@ -1480,7 +1557,7 @@ def switch_case():
                     s.lua("FAKE.press('home')")
                     s.frames(3)
                     check(s.eval("SHOWN()") == "", "Home still turns it off: %r" % s.eval("SHOWN()"))
-                    check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 0 1"),
+                    check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 0 1 0"),
                           "and that is saved too")
                 clean(s, "switch")
         game(True)
@@ -3630,6 +3707,7 @@ def main():
     screen_case()
     quiet_case()
     menu_case()
+    fold_case()
     patched_case()
     memory_case()
     units_case()
