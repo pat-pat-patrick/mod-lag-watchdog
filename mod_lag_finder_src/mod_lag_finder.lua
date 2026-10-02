@@ -1,5 +1,5 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
--- Mod Lag Watchdog v0.17.1 (was Mod Lag Finder; the addon, log and window
+-- Mod Lag Watchdog v0.18.0 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
 -- Native calls, all through LuaJIT's ffi, each bound once at load:
@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.17.1"
+local MARKER = "mod-lag-finder-v0.18.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -731,7 +731,10 @@ local function begin_step()
     local named = {}
     for _, slot in ipairs(upvalue_slots(link.fn, avoid_set())) do
       local lower = string.lower(slot.name or "")
-      for _, hint in ipairs({ "orig", "prev", "upstream", "chain", "wrapped" }) do
+      -- v0.18.0 adds old/base/next/update (name_score's words): the game's
+      -- own bottoms seen in logs (LJC:0, boot:0) are main chunks, which have
+      -- no upvalues at all.
+      for _, hint in ipairs({ "orig", "prev", "upstream", "chain", "wrapped", "old", "base", "next", "update" }) do
         if string.find(lower, hint, 1, true) then
           named[#named + 1] = slot
           break
@@ -855,9 +858,17 @@ local function step_mapping()
   end
   local link = mapping.links[#mapping.links]
   if link.boot_probe then                   -- nothing named like a previous was called with dt
+    -- Something named like a stored previous is no game code (its bottoms
+    -- have no upvalues): a mod's link whose previous we could not follow --
+    -- shown under its own name with all below it, not as "(the game)"
+    -- (v0.18.0: a player's "solo_bunker_probe" holds "previous" and
+    -- "original_update", and read as "(the game)" at 150-550 ms/s in every
+    -- game of his log, 2026-10-01).
     link.boot_probe = nil
-    link.bottom = "game"
-    return finish_mapping("reached the game")
+    link.bottom = "nothing called with dt"
+    say("bottom at " .. link_label(link) .. ": named like a mod's previous, but none was called with dt " ..
+        tostring(mapping.watched))
+    return finish_mapping("bottom")
   end
   if mapping.phase == "upvalues" and (is_mod_source(link.source) or link.patch) then
     local fields = field_slots(link.fn, avoid_set())
@@ -1335,7 +1346,41 @@ local function archive_addons(path)
         file:seek("set", le(tables, row + 16, 8))
         local start = file:read(160) or ""
         local addon = string.match(start, "^........%-%- HD2%-Addon:%s*([%w_%-%./]+)")
-        found[#found + 1] = { key = addon and murmur64(addon) or row_hash, row = row_hash, readable = addon }
+        -- Compiled LuaJIT bytecode keeps the name it was compiled under, and
+        -- that is the name its functions report, not the resource's (v0.18.0:
+        -- Codex Module Bridge is "@module_bridge.lua" inside the resource of
+        -- mods/codex/gun_calibration, 2026-10-02; a player's "solo_bunker_probe"
+        -- hid as "(the game)" this way, likely). Header: ESC "LJ", version,
+        -- uleb flags (2 = stripped: no name), then uleb length and the name.
+        local chunk = nil
+        if addon == nil and string.sub(start, 9, 11) == "\27LJ" then
+          local at = 13
+          local function uleb()
+            local value, shift = 0, 0
+            repeat
+              local byte = string.byte(start, at)
+              if byte == nil then return nil end
+              at = at + 1
+              value = value + (byte % 128) * 2 ^ shift
+              shift = shift + 7
+            until byte < 128 or shift > 28
+            return value
+          end
+          local flags = uleb()
+          if flags ~= nil and math.floor(flags / 2) % 2 == 0 then
+            local length = uleb()
+            if length ~= nil and length > 0 and length <= 120 then
+              chunk = string.sub(start, at, at + length - 1)
+              if #chunk ~= length then chunk = nil end
+            end
+          end
+          if chunk ~= nil then
+            if string.sub(chunk, 1, 1) == "@" then chunk = string.sub(chunk, 2) end   -- as source_of reads it
+            chunk = string.gsub(chunk, "%.lua$", "")
+          end
+        end
+        found[#found + 1] = { key = (addon and murmur64(addon)) or (chunk and murmur64(chunk)) or row_hash,
+                              row = row_hash, readable = addon }
       end
     end
   end)

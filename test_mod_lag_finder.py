@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.17.1"
+RELEASE = "Mod Lag Watchdog v0.18.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1619,7 +1619,7 @@ def boot_case():
               and any("bottom: game" in l for l in chain),
               "the chain walks HUD+'s boot as a mod, then the game below it: %r" % chain)
         hud = re.search(r"\|HD2 HUD\+ +(\d+\.\d) ", shown)
-        game_row = re.search(r"\|\(the game\) +(\d+\.\d) ", shown)
+        game_row = re.search(r"(?:^|\|)\(the game\) +(\d+\.\d) ", shown)
         check(hud is not None and float(hud.group(1)) > 150,
               "HUD+ is its own row, under its name (~240 ms/s): %r" % shown)
         check(game_row is None or float(game_row.group(1)) < 50,
@@ -1889,7 +1889,7 @@ def patch_case():
                   "%s: its own row under its mod's name (4 ms a frame, ~140 ms/s here): %r" % (label, shown))
             check(re.search(r"\|heavy +\d+\.\d", shown) is not None,
                   "%s: the mod below it stays visible: %r" % (label, shown))
-            game_row = re.search(r"\|\(the game\) +(\d+\.\d) ", shown)
+            game_row = re.search(r"(?:^|\|)\(the game\) +(\d+\.\d) ", shown)
             check(game_row is None or float(game_row.group(1)) < 50,
                   "%s: (the game) keeps only the game: %r" % (label, shown))
             clean(s, "patch")
@@ -1898,6 +1898,79 @@ def patch_case():
         game("boot", PATCH_OLD_UPDATE, "Boot Mod")         # previous in "old_update"
         game("boot", PATCH_STRIPPED, "Boot Mod")           # stripped: no upvalue names at all
         game("sub_core/update", PATCH_SUBMODULE, "Sub Mod")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+# v0.18.0: a link named like no mod, holding its previous under names like
+# "previous" and "original_update", but not calling either with dt every frame
+# (a Bilibili player's "solo_bunker_probe:821", 2026-10-01: "(the game)" read
+# 150-550 ms/s in every game of his log). Here it alternates between the two.
+BUNKER = r"""
+local previous = rawget(_G, "update")
+local original_update = previous
+local n = 0
+rawset(_G, "update", function(...)
+  n = n + 1
+  CLOCK = CLOCK + 0.004
+  if n % 2 == 0 then return previous(...) end
+  return original_update(...)
+end)
+"""
+
+
+def bunker_case():
+    """A mod's link the walk cannot follow, with a non-"mods/" name, gets its
+    own row "<name>+" (it and all below it) instead of "(the game)" (v0.18.0):
+    with no Arsenal list under its chunk name, and with Arsenal under its
+    mod's name, found through the chunk name compiled into its bytecode
+    ("@solo_bunker_probe.lua" inside the resource of another name). Both
+    fail on v0.17.1, which showed it as "(the game)"."""
+    import json
+    print("bunker")
+    scratch = tempfile.mkdtemp(prefix="mlf_bunker_")
+    root = os.path.join(scratch, "Arsenal Mods")
+    arsenal = os.path.join(scratch, "hd2arsenal")
+
+    def game(label, row_label):
+        for base, _dirs, files in os.walk(scratch):
+            if "mod_lag_finder_window.txt" in files:
+                os.remove(os.path.join(base, "mod_lag_finder_window.txt"))
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            load(s, ["heavy"])                          # below it
+            check(s.load_mod(source=BUNKER, name="solo_bunker_probe"), "%s: it loads" % label)
+            load(s, ["slow", "finder"])
+            s.frames(400)
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            shown = s.eval("SHOWN()")
+            row = re.search(r"\|%s +(\d+\.\d) " % re.escape(row_label), shown)
+            check(row is not None and float(row.group(1)) > 100,
+                  "%s: its own row %r (4 ms a frame here): %r" % (label, row_label, shown))
+            game_row = re.search(r"(?:^|\|)\(the game\) +(\d+\.\d) ", shown)
+            check(game_row is None, "%s: no \"(the game)\" row taking its cost: %r" % (label, shown))
+            check(bool(log_lines(s, r"bottom at solo_bunker_probe:")), "%s: the log says why" % label)
+            clean(s, "bunker " + label)
+
+    try:
+        game("no Arsenal", "solo_bunker_probe+")
+        os.makedirs(arsenal)
+        path = os.path.join(root, "Solo Bunker_AR7", "Main")
+        os.makedirs(path)
+        chunk = "@solo_bunker_probe.lua"
+        bytecode = "\x1bLJ\x02\x00" + chr(len(chunk)) + chunk + "\x00\x00\x00"
+        with open(os.path.join(path, "9ba626afa44a3aa3.patch_0"), "wb") as f:
+            f.write(lua_archive([bytecode], names=["mods/someone/solo_bunker"]))
+        profile = {"label": "Test", "mods": [
+            {"label": "Solo Bunker 12345 1.0 2026-09-30T01-02Z AbCdEf", "path": os.path.join(root, "Solo Bunker_AR7"),
+             "enabled": True,
+             "options": [{"name": "Main", "enabled": True, "include": ["Main"], "suboptions": []}]}]}
+        with open(os.path.join(arsenal, "hd2a_data.json"), "w", encoding="utf-8") as f:
+            json.dump({"selectedProfile": "p1", "modsList": {"p1": profile}}, f)
+        game("Arsenal, bytecode", "Solo Bunker+")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -3408,6 +3481,7 @@ def main():
     bootstrap_case()
     hash_case()
     patch_case()
+    bunker_case()
     option_names_case()
     window_span_case()
     units_flicker_case()
