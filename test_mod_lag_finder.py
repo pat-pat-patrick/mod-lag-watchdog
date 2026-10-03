@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.26.0"
+RELEASE = "Mod Lag Watchdog v0.27.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -3931,6 +3931,27 @@ def gc_case():
             check(m is not None and 25.0 <= float(m.group(6)) <= 35.0,
                   "5 ms x 6 steps a second (60 frames a second, virtual) = ~30 ms/s: %r" % line[-1:])
             clean(s, "gc between frames")
+        # v0.27.0: as in game (2026-10-03), the engine steps the collector
+        # in every frame and the steps cost nothing extra here. v0.25.0 and
+        # v0.26.0 compared ~no frames with no step against all the rest and
+        # logged rounding noise as the collector's cost (0-9 ms/s in game).
+        with session(ffi="allow") as s:
+            s.lua(menu_stub())
+            s.lua(GC_CLOCK)
+            s.lua("__mlf_test_flush = true\n"
+                  "collectgarbage('stop')\n"
+                  "FAKE.before_frame = function()\n"
+                  "  CLOCK = CLOCK + 0.016\n"
+                  "  collectgarbage('step', 0) collectgarbage('stop')\n"
+                  "end")
+            load(s, ["std", "finder"], flush=False)
+            s.frames(60 * 65)
+            line = log_lines(s, r"gc between frames")
+            check(bool(line) and "a step in most frames" in line[-1] and "is not told apart" in line[-1]
+                  and "-> collector" not in line[-1],
+                  "steps in every frame: their cost is not claimed: %r" % line[-1:])
+            check(not log_lines(s, r"gc landed on"), "nothing landed on a mod: no such line")
+            clean(s, "gc steps every frame")
         # v0.23.0: in game v0.21.0/v0.22.0 logged "no thread address" every
         # session (2026-10-03); offline they did not. A global tostring that
         # another script replaced is one way that happens: the probe must

@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.26.0"
+local MARKER = "mod-lag-finder-v0.27.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1298,7 +1298,10 @@ installed.gc_summary = function(span)
       parts[#parts + 1] = string.format("%s %.2f ms/s", rows[k].key, rows[k].gc * 1000 / span)
     end
   end
-  say("  gc landed on: " .. (#parts > 0 and table.concat(parts, ", ") or "nothing measurable"))
+  -- In game the engine steps the collector between updates, so nothing
+  -- lands on a mod (v0.24.0-v0.26.0: always "nothing measurable"); the line
+  -- is only written when something did (v0.27.0).
+  if #parts > 0 then say("  gc landed on: " .. table.concat(parts, ", ")) end
   table.sort(rows, function(a, b) return a.kbs > b.kbs end)
   parts = {}
   for k = 1, math.min(8, #rows) do
@@ -1358,17 +1361,31 @@ local function gc_median(hist)
   return nil
 end
 
+-- v0.27.0: in game (2026-10-03, 77 min) the engine stepped the collector
+-- in ~98% of frames: ~90 frames a minute had no step, and the line read
+-- 0.0-9.0 ms/s minute to minute -- one 0.1 ms bucket times ~5000 frames,
+-- noise. When steps are in most frames, a step's own cost is in nearly
+-- every frame and cannot be told apart; only the end of marking is
+-- compared, against the frames with an ordinary step.
 installed.gc_outside_line = function(span, o)
   local plain, step, atomic = gc_median(o.plain), gc_median(o.step), gc_median(o.atomic)
-  if plain == nil then return end
-  local cost = 0
-  if step ~= nil then cost = cost + math.max(0, step - plain) * o.step.n end
-  if atomic ~= nil then cost = cost + math.max(0, atomic - plain) * o.atomic.n end
   local function shown(value) return value and string.format("%.1f ms", value) or "-" end
-  say(string.format("  gc between frames (median): no step %s (%d frames), a step %s (%d), " ..
-                    "end of marking %s (%d) -> collector ~%.1f ms/s",
-                    shown(plain), o.plain.n, shown(step), o.step.n, shown(atomic), o.atomic.n,
-                    cost / span))
+  if plain ~= nil and o.plain.n >= o.step.n then
+    local cost = 0
+    if step ~= nil then cost = cost + math.max(0, step - plain) * o.step.n end
+    if atomic ~= nil then cost = cost + math.max(0, atomic - plain) * o.atomic.n end
+    say(string.format("  gc between frames (median): no step %s (%d frames), a step %s (%d), " ..
+                      "end of marking %s (%d) -> collector ~%.1f ms/s",
+                      shown(plain), o.plain.n, shown(step), o.step.n, shown(atomic), o.atomic.n,
+                      cost / span))
+  elseif step ~= nil then
+    local cost = atomic ~= nil and math.max(0, atomic - step) * o.atomic.n or 0
+    say(string.format("  gc between frames (median): a step in most frames, %s (%d of %d; " ..
+                      "a step's own cost is in nearly every frame and is not told apart), " ..
+                      "no step %s (%d), end of marking %s (%d) -> end of marking ~%.1f ms/s",
+                      shown(step), o.step.n, o.plain.n + o.step.n + o.atomic.n, shown(plain),
+                      o.plain.n, shown(atomic), o.atomic.n, cost / span))
+  end
 end
 end
 
