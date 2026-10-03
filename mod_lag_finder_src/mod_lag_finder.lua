@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.21.0"
+local MARKER = "mod-lag-finder-v0.22.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1740,6 +1740,19 @@ read_names = function()
     end
   end
   installed.mdl_names = by_uuid
+  -- The mod's folder for the report (v0.22.0): relative to Arsenal's mods
+  -- folder, or its last part -- never the whole path, which can hold the
+  -- Windows user name. Arsenal names folders after the download, Nexus id
+  -- included ("Smarter Guard Dogs 4.0.0 16610 4.0.0 2026-09-29T02-49Z ...").
+  local mods_dir = type(data.userModsDir) == "string"
+                   and string.lower((string.gsub(data.userModsDir, "[\\/]+$", ""))) .. "\\" or nil
+  local function relative_folder(path)
+    path = string.gsub(path, "[\\/]+$", "")
+    if mods_dir ~= nil and string.lower(string.sub(path, 1, #mods_dir)) == mods_dir then
+      return string.sub(path, #mods_dir + 1)
+    end
+    return string.match(path, "([^\\/]+)$") or "?"
+  end
   local seen, archives = {}, 0
   local hashes, readable, owner_of = {}, {}, {}
   local claims, claim_order = {}, {}     -- row hash -> { [mod index] = claim }, rows in order
@@ -1747,7 +1760,8 @@ read_names = function()
   installed.shared, installed.shared_rows, installed.shared_seen = shared, shared_rows, {}
   for mod_index, mod in ipairs(profile.mods) do
     if type(mod) == "table" and mod.enabled == true and type(mod.path) == "string" then
-      local listed = { label = plain_label(mod.label), keys = {}, lua = 0, scripts = 0 }
+      local listed = { label = plain_label(mod.label), keys = {}, lua = 0, scripts = 0,
+                       folder = relative_folder(mod.path) }
       listed_mods[#listed_mods + 1] = listed
       local folders = {}
       local function add(option)
@@ -3160,6 +3174,32 @@ local function report_text(key, at)
       last = "Mods that replace game scripts (counted here): " .. table.concat(scripts, ", ")
     end
   end
+  -- Which mod in the mod manager this is (v0.22.0): a player who saw only a
+  -- short or borrowed name could not tell. The name as Arsenal has it, in
+  -- any language (the clipboard is Unicode; the screen font is not), and
+  -- its folder relative to Arsenal's mods folder.
+  local manager = nil
+  if key ~= "(the game)" and string.sub(key, 1, 5) ~= "mdl: " then
+    local hash = installed.hash_of((string.gsub(key, " %(%+ all below it%)$", "")))
+    if installed.mod_list == nil then
+      manager = "Mod manager: unknown (no Arsenal mod list)"
+    else
+      local found = {}
+      for _, listed in ipairs(installed.mod_list) do
+        if hash ~= nil and listed.keys[hash] then
+          found[#found + 1] = string.format("%s [folder: %s]", listed.label, listed.folder or "?")
+        end
+      end
+      if #found == 0 then
+        manager = "Mod manager: not among the mods enabled in Arsenal (installed another way?)"
+      elseif #found == 1 then
+        manager = "Mod manager: " .. found[1]
+      else
+        manager = string.format("Mod manager: %d mods ship this script, only one runs: %s",
+                                #found, table.concat(found, "; "))
+      end
+    end
+  end
   local lines = {
     string.format("Mod Lag Watchdog report: %s (%s)", name, key),
     string.format("Game build %s, Watchdog %s, %d mods hook the update",
@@ -3173,6 +3213,7 @@ local function report_text(key, at)
     units_text,
     last,
   }
+  if manager ~= nil then table.insert(lines, 2, manager) end
   return table.concat(lines, "\r\n")
 end
 

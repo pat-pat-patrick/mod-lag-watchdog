@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.21.0"
+RELEASE = "Mod Lag Watchdog v0.22.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -3239,7 +3239,8 @@ def modlist_case():
 
 def report_case():
     """A click on a mod's row in the escape-menu window copies that mod's
-    8-line report (v0.11.0): its name, the game build and the Watchdog
+    report (v0.11.0): its name, which mod it is in the mod manager (v0.22.0;
+    here no Arsenal list, so "unknown"), the game build and the Watchdog
     version, the session, its cost, the stalls it caused, its Lua memory,
     its helper units and its update hook. No path or user name in it. With
     no clipboard the report goes to mod_lag_report_<mod>.txt instead."""
@@ -3270,8 +3271,10 @@ def report_case():
             s.frames(2)
             clip = s.eval("CLIP") or ""
             lines = clip.split("\r\n")
-            check(len(lines) == 8, "8 lines: %r" % clip)
+            check(len(lines) == 9, "9 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
+            check(lines[1:2] == ["Mod manager: unknown (no Arsenal mod list)"], "no Arsenal list: %r" % lines[1:2])
+            del lines[1:2]
             check(re.match(r"Game build 6AB3B43F, Watchdog " + re.escape(RELEASE.split()[-1]) + r", 4 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: \d+ min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
@@ -3299,10 +3302,95 @@ def report_case():
             s.frames(2)
             saved = s.file("mod_lag_report_heavy.txt") or ""
             check(saved.startswith("Mod Lag Watchdog report: heavy (mods/test/heavy)")
-                  and len(saved.strip().splitlines()) == 8,
-                  "no clipboard: the 8 lines are written to a file: %r" % saved[:120])
+                  and len(saved.strip().splitlines()) == 9,
+                  "no clipboard: the 9 lines are written to a file: %r" % saved[:120])
             check("report saved: mod_lag_report_heavy.txt" in s.eval("SHOWN()"), "and says where")
             clean(s, "report")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def report_names_case():
+    """The report's "Mod manager:" line (v0.22.0): which Arsenal mod the row
+    is, under its Arsenal name in any language, with its folder relative to
+    Arsenal's mods folder (never the whole path, which can hold the Windows
+    user name; without userModsDir, the folder's last part). A script no
+    enabled mod ships says so; one that two mods ship names both. Fails on
+    v0.21.0 (no such line)."""
+    import json
+    print("report names")
+    scratch = tempfile.mkdtemp(prefix="mlf_rnames_")
+    root = os.path.join(scratch, "Arsenal Mods")
+    arsenal = os.path.join(scratch, "hd2arsenal")
+    os.makedirs(arsenal)
+    glow = "Turret Glow 16610 1.0 2026-09-29T02-49Z Ab_AR1"
+
+    def folder(name, rows):
+        path = os.path.join(root, name, "Main")
+        os.makedirs(path)
+        with open(os.path.join(path, "9ba626afa44a3aa3.patch_0"), "wb") as f:
+            f.write(lua_archive([src for _, src in rows], names=[n for n, _ in rows]))
+
+    slow = [("mods/test/slow", "-- HD2-Addon: mods/test/slow\nreturn {}\n")]
+    folder(glow, slow)
+    folder("Slow Copy_AR2", slow)
+    chinese = "\u5c0f\u70ae\u53f0\u9ad8\u4eae"
+
+    def write_list(mods, with_dir):
+        profile = {"label": "Test", "mods": [
+            {"label": label, "path": os.path.join(root, name), "enabled": True,
+             "options": [{"name": "Main", "enabled": True, "include": ["Main"], "suboptions": []}]}
+            for label, name in mods]}
+        data = {"selectedProfile": "p1", "modsList": {"p1": profile}}
+        if with_dir:
+            data["userModsDir"] = root + "\\"
+        with open(os.path.join(arsenal, "hd2a_data.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+
+    def report_of(s, prefix):
+        pos = s.eval("POS('%s')" % prefix)
+        check(pos != "none", "%r is on the menu window: %r" % (prefix, s.eval("SHOWN()")))
+        if pos == "none":
+            return []
+        x, y = (int(v) for v in pos.split(","))
+        s.lua("CLIP = nil; MOUSE.x, MOUSE.y = %d, %d; PRESS(1)" % (x + 20, y + 4))
+        s.frames(2)
+        s.lua("RELEASE(1)")
+        s.frames(2)
+        return (s.eval("CLIP") or "").split("\r\n")
+
+    def run(mods, with_dir):
+        write_list(mods, with_dir)
+        s = Session(backend=BACKEND, scratch=scratch, keep_scratch=True)
+        s.lua(CLOCK)
+        s.lua("FAKE.mission()")
+        s.lua(GUI_STUB)
+        s.lua(menu_stub())
+        s.lua("__hd2_native_test.clipboard = function(text) CLIP = text return true end")
+        load(s, ["heavy", "slow", "finder"])
+        s.frames(400)
+        s.lua("MENU_STATE(1, 0)")
+        s.frames(6)
+        return s
+
+    try:
+        with run([(chinese, glow)], True) as s:
+            lines = report_of(s, "slow ")
+            check(lines[1:2] == ["Mod manager: %s [folder: %s]" % (chinese, glow)],
+                  "its Arsenal name, Chinese kept, and the folder relative to the mods folder: %r" % lines[1:2])
+            joined = "\n".join(lines).replace("\\", "/")
+            check(scratch.replace("\\", "/") not in joined and "Arsenal Mods" not in joined,
+                  "no part of the mods folder's own path: %r" % lines[1:2])
+            lines = report_of(s, "heavy ")
+            check(lines[1:2] == ["Mod manager: not among the mods enabled in Arsenal (installed another way?)"],
+                  "a script no enabled mod ships: %r" % lines[1:2])
+            clean(s, "report names")
+        with run([("Glow A", glow), ("Glow B", "Slow Copy_AR2")], False) as s:
+            lines = report_of(s, "slow")
+            check(lines[1:2] == ["Mod manager: 2 mods ship this script, only one runs: "
+                                 "Glow A [folder: %s]; Glow B [folder: Slow Copy_AR2]" % glow],
+                  "two mods ship it: both, each by its folder's last part (no userModsDir): %r" % lines[1:2])
+            clean(s, "report names, shared")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -3814,6 +3902,7 @@ def main():
     memory_case()
     units_case()
     report_case()
+    report_names_case()
     modlist_case()
     switch_case()
     alerts_case()
