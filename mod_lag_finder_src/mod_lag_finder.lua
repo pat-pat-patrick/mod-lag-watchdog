@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.23.0"
+local MARKER = "mod-lag-finder-v0.24.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -249,13 +249,32 @@ local lines = 0
 -- and every stall pinned on Truth Whip's APW port fell on its heartbeat write.
 local writes = {}
 
+-- v0.24.0: the log stays open (writes.file) and each write is flushed.
+-- Opening, appending and closing every 10 s cost a frame of 10 ms or more in
+-- about half of all minutes in game (2026-10-03, ~1 MB log; a player saw
+-- the 1% low frames drop with the Watchdog on). Measured on the same PC
+-- (likely: an antivirus scan on close): open+append+close median 1.1 ms,
+-- worst 7-15 ms; kept open, write+flush median 0.05 ms, worst 1.2 ms.
 local function write_raw(text, mode)
   if log_path == nil then return end
   local ok_t, t0 = pcall(timer_now)
-  local file = io.open(log_path, mode)
-  if file == nil then return end
-  file:write(text)
-  file:close()
+  if mode == "w" and writes.file ~= nil then
+    pcall(writes.file.close, writes.file)
+    writes.file = nil
+  end
+  if writes.file == nil then
+    writes.file = io.open(log_path, mode)
+    if writes.file == nil then return end
+  end
+  local file = writes.file
+  local ok = pcall(function()
+    file:write(text)
+    file:flush()
+  end)
+  if not ok then
+    pcall(file.close, file)
+    writes.file = nil                       -- opened again on the next write
+  end
   local ok_t1, t1 = pcall(timer_now)
   if ok_t and ok_t1 and type(t0) == "number" and type(t1) == "number" then
     writes[#writes + 1] = { at = t1, took = t1 - t0 }
@@ -1336,6 +1355,11 @@ local function write_summary(at)
                       r.row.time * 1000 / math.max(window.frames, 1), ms1(r.row.worst)))
   end
   say(string.format("  log write worst %.0f ms", writes_worst() * 1000))
+  -- v0.24.0: what this module itself took, outside the shims (its tick: the
+  -- walk, summaries, the window, log writes).
+  say(string.format("  this module: %.2f ms/s, worst frame %.1f ms",
+                    (installed.own_time or 0) * 1000 / span, (installed.own_worst or 0) * 1000))
+  installed.own_time, installed.own_worst = 0, 0
   local raised = {}
   for key, n in pairs(installed.errors) do raised[#raised + 1] = { key = key, n = n } end
   table.sort(raised, function(a, b) return a.n > b.n end)
@@ -4150,6 +4174,9 @@ local function arm()
       local started = now()
       local ok_tick, err = pcall(tick, failed)
       installed.tick_cost = now() - started
+      -- v0.24.0: this module's own time, for the summary.
+      installed.own_time = (installed.own_time or 0) + installed.tick_cost
+      if installed.tick_cost > (installed.own_worst or 0) then installed.own_worst = installed.tick_cost end
       if not ok_tick and not installed.told_tick then
         installed.told_tick = true
         say("tick error: " .. tostring(err))

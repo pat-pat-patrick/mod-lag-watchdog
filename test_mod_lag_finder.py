@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.23.0"
+RELEASE = "Mod Lag Watchdog v0.24.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -740,12 +740,24 @@ __hd2_native_test = { cores = 16, pid = 4968, processes = function()
   PROCESSES_ASKED = PROCESSES_ASKED + 1
   return {}
 end }
+-- v0.24.0 keeps the log open, so the delay is in the write, and each open
+-- of the log is counted.
+LOG_OPENS = 0
 local open = io.open
 io.open = function(path, mode)
-  if SLOW_WRITE and string.find(path, "mod_lag_finder.log", 1, true) then
-    CLOCK = CLOCK + SLOW_WRITE
-  end
-  return open(path, mode)
+  local f = open(path, mode)
+  if f == nil or not string.find(path, "mod_lag_finder.log", 1, true) then return f end
+  if mode ~= "rb" then LOG_OPENS = LOG_OPENS + 1 end
+  return {
+    write = function(self, ...)
+      if SLOW_WRITE then CLOCK = CLOCK + SLOW_WRITE end
+      return f:write(...)
+    end,
+    flush = function(self) return f:flush() end,
+    close = function(self) return f:close() end,
+    read = function(self, ...) return f:read(...) end,
+    seek = function(self, ...) return f:seek(...) end,
+  }
 end
 """
 
@@ -788,6 +800,12 @@ def writes_case():
         worst = log_lines(s, r"log write worst 5\d\d ms")
         check(bool(worst), "the summary has the slowest log write: %r" % log_lines(s, "log write worst")[:2])
         check(s.eval("tostring(PROCESSES_ASKED)") == "0", "no process list is read")
+        # v0.24.0: opening and closing the log on every write cost a 10 ms
+        # frame in half of all minutes in game (2026-10-03).
+        opens = int(s.eval("LOG_OPENS"))
+        check(opens <= 2, "the log is opened once a session, not on every write (%d opens)" % opens)
+        own = log_lines(s, r"^t=[\d.]+\s+this module: [\d.]+ ms/s, worst frame [\d.]+ ms")
+        check(bool(own), "the summary says what this module itself took: %r" % own[:1])
         check(not log_lines(s, "anti-cheat|GameGuard"), "nothing about the anti-cheat is logged")
         clean(s, "writes")
 
