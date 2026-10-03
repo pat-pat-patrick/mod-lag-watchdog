@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.25.0"
+local MARKER = "mod-lag-finder-v0.26.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3284,25 +3284,45 @@ local function report_text(key, at)
   -- short or borrowed name could not tell. The name as Arsenal has it, in
   -- any language (the clipboard is Unicode; the screen font is not), and
   -- its folder relative to Arsenal's mods folder.
+  -- v0.26.0: when several mods ship the script, each is marked running or
+  -- not, from the same comparison of the running code with each copy that
+  -- names the row (installed.shared_owner, v0.19.0); the first line alone
+  -- said which, and a reader of the second could not tell.
   local manager = nil
   if key ~= "(the game)" and string.sub(key, 1, 5) ~= "mdl: " then
-    local hash = installed.hash_of((string.gsub(key, " %(%+ all below it%)$", "")))
+    local bare = string.gsub(key, " %(%+ all below it%)$", "")
+    local hash = installed.hash_of(bare)
     if installed.mod_list == nil then
       manager = "Mod manager: unknown (no Arsenal mod list)"
     else
       local found = {}
       for _, listed in ipairs(installed.mod_list) do
-        if hash ~= nil and listed.keys[hash] then
-          found[#found + 1] = string.format("%s [folder: %s]", listed.label, listed.folder or "?")
-        end
+        if hash ~= nil and listed.keys[hash] then found[#found + 1] = listed end
+      end
+      local function folder(listed)
+        return string.format("%s [folder: %s]", listed.label, listed.folder or "?")
       end
       if #found == 0 then
         manager = "Mod manager: not among the mods enabled in Arsenal (installed another way?)"
       elseif #found == 1 then
-        manager = "Mod manager: " .. found[1]
+        manager = "Mod manager: " .. folder(found[1])
       else
-        manager = string.format("Mod manager: %d mods ship this script, only one runs: %s",
-                                #found, table.concat(found, "; "))
+        local running = nil
+        for _, link in ipairs(links) do
+          if link.source == bare then
+            local claim = installed.shared_owner(link)
+            running = claim and claim.listed or nil
+            break
+          end
+        end
+        local parts = {}
+        for _, listed in ipairs(found) do
+          parts[#parts + 1] = folder(listed) ..
+            (running == nil and "" or (listed == running and " (running)" or " (not running)"))
+        end
+        manager = string.format("Mod manager: %d mods ship this script%s: %s", #found,
+                                running == nil and ", only one runs, not told which" or "",
+                                table.concat(parts, "; "))
       end
     end
   end

@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.25.0"
+RELEASE = "Mod Lag Watchdog v0.26.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -2146,11 +2146,13 @@ def shared_case():
     whose copy runs, found by the hook's first and last lines in each copy's
     text; the mod list puts the other under "replaced by"; when the lines fit
     both copies, the short name stays and the mod list says it is unknown.
-    The first two fail on v0.18.0 ("gun_calibration", both mods timed)."""
+    The first two fail on v0.18.0 ("gun_calibration", both mods timed).
+    v0.26.0: the row's copied report marks each of the two mods running or
+    not running, or says which runs could not be told (fails on v0.25.0)."""
     import json
     print("shared")
 
-    def game(label, other_source, running, row_label, timed, shared_line):
+    def game(label, other_source, running, row_label, timed, shared_line, manager_line):
         scratch = tempfile.mkdtemp(prefix="mlf_shared_")
         root = os.path.join(scratch, "Arsenal Mods")
         arsenal = os.path.join(scratch, "hd2arsenal")
@@ -2218,16 +2220,34 @@ def shared_case():
                 head, body = group("Ship the same Lua resource as another mod")
                 check(head is not None and body == shared_line,
                       "%s: shared %r, not %r %r" % (label, shared_line, head, body))
+                pos = s.eval("POS('%s')" % row_label)
+                check(pos != "none", "%s: its row is on the menu window" % label)
+                report = []
+                if pos != "none":
+                    x, y = (int(v) for v in pos.split(","))
+                    s.lua("CLIP = nil; MOUSE.x, MOUSE.y = %d, %d; PRESS(1)" % (x + 20, y + 4))
+                    s.frames(2)
+                    s.lua("RELEASE(1)")
+                    s.frames(2)
+                    report = (s.eval("CLIP") or "").split("\r\n")
+                check(report[1:2] == [manager_line],
+                      "%s: the report's second line %r, not %r" % (label, manager_line, report[1:2]))
                 clean(s, "shared " + label)
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 
     game("Heavy Kill runs", SHARED_OVERLAY, SHARED_HEAVY, "Heavy Kill HUD", "Heavy Kill HUD",
-         "Ballistic Overlay v2 (replaced by Heavy Kill HUD)")
+         "Ballistic Overlay v2 (replaced by Heavy Kill HUD)",
+         "Mod manager: 2 mods ship this script: Heavy Kill HUD [folder: HeavyKill_AR1] (running); "
+         "Ballistic Overlay v2 [folder: Overlay_AR2] (not running)")
     game("the overlay runs", SHARED_OVERLAY, SHARED_OVERLAY, "Ballistic Overlay", "Ballistic Overlay v2",
-         "Heavy Kill HUD (replaced by Ballistic Overlay v2)")
+         "Heavy Kill HUD (replaced by Ballistic Overlay v2)",
+         "Mod manager: 2 mods ship this script: Heavy Kill HUD [folder: HeavyKill_AR1] (not running); "
+         "Ballistic Overlay v2 [folder: Overlay_AR2] (running)")
     game("lines fit both", SHARED_TWIN, SHARED_HEAVY, "gun_calibration", "Ballistic Overlay v2, Heavy Kill HUD",
-         "Heavy Kill HUD / Ballistic Overlay v2 (which one runs: unknown)")
+         "Heavy Kill HUD / Ballistic Overlay v2 (which one runs: unknown)",
+         "Mod manager: 2 mods ship this script, only one runs, not told which: "
+         "Heavy Kill HUD [folder: HeavyKill_AR1]; Ballistic Overlay v2 [folder: Overlay_AR2]")
 
 
 def option_names_case():
@@ -3405,7 +3425,7 @@ def report_names_case():
             clean(s, "report names")
         with run([("Glow A", glow), ("Glow B", "Slow Copy_AR2")], False) as s:
             lines = report_of(s, "slow")
-            check(lines[1:2] == ["Mod manager: 2 mods ship this script, only one runs: "
+            check(lines[1:2] == ["Mod manager: 2 mods ship this script, only one runs, not told which: "
                                  "Glow A [folder: %s]; Glow B [folder: Slow Copy_AR2]" % glow],
                   "two mods ship it: both, each by its folder's last part (no userModsDir): %r" % lines[1:2])
             clean(s, "report names, shared")
