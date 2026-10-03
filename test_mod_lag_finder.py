@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.22.0"
+RELEASE = "Mod Lag Watchdog v0.23.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -3861,6 +3861,22 @@ def gc_case():
         check(bool(landed) and "nothing measurable" not in landed[-1],
               "collector time landed on some mod: %r" % landed[-1:])
         clean(s, "gc")
+    if BACKEND == "game":
+        # v0.23.0: in game v0.21.0/v0.22.0 logged "no thread address" every
+        # session (2026-10-03); offline they did not. A global tostring that
+        # another script replaced is one way that happens: the probe must
+        # not depend on it.
+        with session(ffi="allow") as s:
+            s.lua(menu_stub())
+            s.lua(GC_CLOCK)
+            s.lua("__mlf_test_flush = true\n"
+                  "local real = tostring\n"
+                  "tostring = function(v) if type(v) == 'thread' then return 'thread' end return real(v) end")
+            load(s, ["std", "finder"], flush=False)
+            s.frames(60 * 65)
+            check(not log_lines(s, r"gc: probe off") and bool(log_lines(s, r"^t=[\d.]+\s+gc: ~")),
+                  "a replaced tostring does not turn the probe off: %r" % log_lines(s, r"gc: "))
+            clean(s, "gc, tostring replaced")
     with session() as s:                                # ffi blocked: no seam ffi
         s.lua(menu_stub())
         load(s, ["std", "finder"])

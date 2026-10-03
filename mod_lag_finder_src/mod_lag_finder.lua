@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.22.0"
+local MARKER = "mod-lag-finder-v0.23.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -650,10 +650,21 @@ do
         local r = rpm(process, ffi.cast("const void *", address), words, count * 4, got)
         return r ~= 0 and tonumber(got[0]) == count * 4
       end
+      -- string.format, not tostring: v0.21.0/v0.22.0 got no address in game
+      -- on 2026-10-03 (offline it did), and a mod may replace the global
+      -- tostring; LuaJIT's "%s" formats a thread itself. What it saw is
+      -- logged, so a third miss says why.
       local co = coroutine.create(function() end)
-      local thread = tonumber(string.match(tostring(co), "0x(%x+)") or "", 16)
-      if thread == nil or not safe(thread, 4) then
-        installed.gc_why = "no thread address"
+      local text = string.format("%s", co)
+      local hex = string.match(text, "0x(%x+)") or string.match(text, "(%x%x%x%x%x%x%x%x+)%s*$")
+      local thread = hex and tonumber(hex, 16) or nil
+      if thread == nil then
+        installed.gc_why = string.format("no thread address in %q (tostring gives %q)",
+                                         string.sub(text, 1, 40), string.sub(tostring(co), 1, 40))
+        return
+      end
+      if not safe(thread, 4) then
+        installed.gc_why = string.format("thread at %x not readable (%q)", thread, string.sub(text, 1, 40))
         return
       end
       local g = words[2]
