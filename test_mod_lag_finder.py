@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.24.0"
+RELEASE = "Mod Lag Watchdog v0.25.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -3880,6 +3880,37 @@ def gc_case():
               "collector time landed on some mod: %r" % landed[-1:])
         clean(s, "gc")
     if BACKEND == "game":
+        # v0.25.0: the collector's cost between frames. Here the "engine"
+        # (the frame loop, outside update) runs one collector step every
+        # 10th frame and takes 5 ms more then; the automatic collector is
+        # stopped, as the game's never ran inside a mod. The line must find
+        # those ~5 ms, and ~0.1 of a frame's worth of steps per frame.
+        with session(ffi="allow") as s:
+            s.lua(menu_stub())
+            s.lua(GC_CLOCK)
+            s.lua("__mlf_test_flush = true\n"
+                  "collectgarbage('stop')\n"
+                  "FRAME_N = 0\n"
+                  "FAKE.before_frame = function()\n"
+                  "  CLOCK = CLOCK + 0.016\n"
+                  "  FRAME_N = FRAME_N + 1\n"
+                  "  if FRAME_N % 10 == 0 then\n"
+                  "    collectgarbage('step', 0) collectgarbage('stop')\n"
+                  "    CLOCK = CLOCK + 0.005\n"
+                  "  end\n"
+                  "end")
+            load(s, ["std", "finder"], flush=False)
+            s.frames(60 * 65)
+            line = log_lines(s, r"gc between frames")
+            m = re.search(r"no step ([\d.]+) ms \((\d+) frames\), a step ([\d.]+) ms \((\d+)\), "
+                          r"end of marking \S+(?: ms)? \((\d+)\) -> collector ~([\d.]+) ms/s", line[-1] if line else "")
+            check(m is not None and 4.0 <= float(m.group(3)) - float(m.group(1)) <= 6.0,
+                  "a step between frames costs the 5 ms the engine took: %r" % line[-1:])
+            check(m is not None and 0.07 <= (int(m.group(4)) + int(m.group(5))) / max(1, int(m.group(2)) + int(m.group(4)) + int(m.group(5))) <= 0.13,
+                  "about one frame in ten had a step: %r" % line[-1:])
+            check(m is not None and 25.0 <= float(m.group(6)) <= 35.0,
+                  "5 ms x 6 steps a second (60 frames a second, virtual) = ~30 ms/s: %r" % line[-1:])
+            clean(s, "gc between frames")
         # v0.23.0: in game v0.21.0/v0.22.0 logged "no thread address" every
         # session (2026-10-03); offline they did not. A global tostring that
         # another script replaced is one way that happens: the probe must

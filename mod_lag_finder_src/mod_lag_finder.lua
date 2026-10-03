@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.24.0"
+local MARKER = "mod-lag-finder-v0.25.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1153,7 +1153,8 @@ end
 -- statistical, good over a minute, not for one frame.
 installed.gcw = { rows = {}, chain = 0, frames = 0, chain_gc_frames = 0,
                   vm = { frames = 0, clean = 0, alloc = 0, stepped = 0, cycles = 0 },
-                  worst_atomic = 0, worst_atomic_key = nil, note = nil }
+                  worst_atomic = 0, worst_atomic_key = nil, note = nil,
+                  outside = { plain = { n = 0 }, step = { n = 0 }, atomic = { n = 0 } } }
 
 -- (In a block: the main chunk is at Lua's limit of 200 locals.)
 do
@@ -1233,14 +1234,26 @@ end
 
 -- Whole-VM readings once a frame, from tick: everything Lua did between two
 -- ticks, the mods' update and all Lua outside it.
+-- A step the engine runs and then stops the collector again leaves the
+-- threshold where it was (v0.25.0: in the test, 3 of ~390 such steps were
+-- seen by the mark alone). Every step moves at least one of the progress
+-- fields -- sweepstr (+44), sweep (+52), gray (+56) -- so between frames
+-- those are compared too (offline on the game's lua51.dll: 400 of 400
+-- stepped-and-stopped steps changed them).
+local function gc_progress(gcp)
+  local p = gcp.p32
+  return p[11] + p[13] * 4096 + p[14] * 67108864
+end
+
 installed.gc_tick = function()
   local gcp = installed.gcp
   if gcp == nil then return end
   local v = installed.gcw.vm
-  local h, m = gcp.p32[8], gcp.p32[9] * 8 + gcp.p8[41]
+  local h, m, g = gcp.p32[8], gcp.p32[9] * 8 + gcp.p8[41], gc_progress(gcp)
   if v.h ~= nil then
     v.frames = v.frames + 1
     local stepped, swept, atomic = gc_window(v.m, m)
+    if v.g ~= g then stepped = true end
     if stepped then v.stepped = v.stepped + 1 end
     if atomic then v.cycles = v.cycles + 1 end
     if not swept then
@@ -1248,7 +1261,7 @@ installed.gc_tick = function()
       v.alloc = v.alloc + math.max(0, h - v.h)
     end
   end
-  v.h, v.m = h, m
+  v.h, v.m, v.g = h, m, g
 end
 
 installed.gc_summary = function(span)
@@ -1295,9 +1308,67 @@ installed.gc_summary = function(span)
   end
   say(string.format("  garbage: whole Lua VM ~%.0f KB/s; mods: %s", vm_kbs,
                     #parts > 0 and table.concat(parts, ", ") or "none over 1 KB/s"))
+  installed.gc_outside_line(span, w.outside)
   installed.gcw = { rows = {}, chain = 0, frames = 0, chain_gc_frames = 0,
-                    vm = { frames = 0, clean = 0, alloc = 0, stepped = 0, cycles = 0, h = v.h, m = v.m },
-                    worst_atomic = 0, worst_atomic_key = nil, note = nil }
+                    vm = { frames = 0, clean = 0, alloc = 0, stepped = 0, cycles = 0, h = v.h, m = v.m, g = v.g },
+                    worst_atomic = 0, worst_atomic_key = nil, note = nil,
+                    outside = { plain = { n = 0 }, step = { n = 0 }, atomic = { n = 0 } } }
+end
+
+-- What the collector costs the game (v0.25.0, the user 2026-10-03). In
+-- game the collector never ran inside a mod: 0 of ~700 frames with a step a
+-- minute, stepmul 20 (not LuaJIT's 200), ~4 cycles a second with the heap
+-- far below its pause threshold -- likely the engine steps it itself,
+-- between update calls. So its cost is in the time between the end of one
+-- frame of ours and the start of the next. That time is put in one of
+-- three histograms (0.1 ms buckets: no sort, nearly no garbage) by what
+-- the collector did in it: nothing, a step, a step that ended a cycle's
+-- marking (atomic). The medians' differences, times how often each
+-- happened, are its cost in ms/s. Likely, not proven: a frame with a step
+-- may also differ in other ways; a frame waiting on the GPU hides the step.
+installed.gc_frame_out = function()
+  local gcp = installed.gcp
+  installed.gc_out_t, installed.gc_out_m = timer_now(), gcp.p32[9] * 8 + gcp.p8[41]
+  installed.gc_out_g = gc_progress(gcp)
+end
+
+installed.gc_frame_in = function()
+  local gcp, last_t, last_m = installed.gcp, installed.gc_out_t, installed.gc_out_m
+  if last_t == nil then return end
+  installed.gc_out_t = nil
+  local t, m = timer_now(), gcp.p32[9] * 8 + gcp.p8[41]
+  local outside = t - last_t
+  if outside < 0 or outside > 0.25 then return end      -- loading, menus, alt-tab
+  local stepped, _, atomic = gc_window(last_m, m)
+  if gc_progress(gcp) ~= installed.gc_out_g then stepped = true end
+  local o = installed.gcw.outside
+  local hist = atomic and o.atomic or (stepped and o.step or o.plain)
+  local bucket = math.floor(outside * 10000)
+  hist[bucket] = (hist[bucket] or 0) + 1
+  hist.n = hist.n + 1
+end
+
+local function gc_median(hist)
+  if hist.n == 0 then return nil end
+  local seen = 0
+  for bucket = 0, 2500 do
+    seen = seen + (hist[bucket] or 0)
+    if seen * 2 >= hist.n then return (bucket + 0.5) / 10 end
+  end
+  return nil
+end
+
+installed.gc_outside_line = function(span, o)
+  local plain, step, atomic = gc_median(o.plain), gc_median(o.step), gc_median(o.atomic)
+  if plain == nil then return end
+  local cost = 0
+  if step ~= nil then cost = cost + math.max(0, step - plain) * o.step.n end
+  if atomic ~= nil then cost = cost + math.max(0, atomic - plain) * o.atomic.n end
+  local function shown(value) return value and string.format("%.1f ms", value) or "-" end
+  say(string.format("  gc between frames (median): no step %s (%d frames), a step %s (%d), " ..
+                    "end of marking %s (%d) -> collector ~%.1f ms/s",
+                    shown(plain), o.plain.n, shown(step), o.step.n, shown(atomic), o.atomic.n,
+                    cost / span))
 end
 end
 
@@ -4185,6 +4256,7 @@ local function arm()
     local function after(ok, ...)
       installed.depth = 0
       if installed.generation == generation then run_tick(not ok or installed.frame_failed) end
+      if installed.gcp ~= nil then pcall(installed.gc_frame_out) end
       if ok then return ... end
       error((...), 0)
     end
@@ -4209,6 +4281,7 @@ local function arm()
       installed.last_tick_at = clock()
       installed.tick_calls = installed.mw_calls
       installed.depth = 1
+      if installed.gcp ~= nil then pcall(installed.gc_frame_in) end
       if installed.xpcall_args then
         return after(xpcall(previous_update, on_error, ...))
       end
