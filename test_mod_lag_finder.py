@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.27.0"
+RELEASE = "Mod Lag Watchdog v0.28.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1099,6 +1099,9 @@ def menu_case():
                   "on the GAME tab the window shows by itself: %r" % shown)
             title = s.eval("POS('MOD LAG WATCHDOG')")
             check(title == "1064,600", "at the default place (1056,620; title 8 px in, 8 px up from the bar's bottom): %s" % title)
+            # v0.28.0 (the user): the title carries the version.
+            check("MOD LAG WATCHDOG " + RELEASE.split()[3] in shown.split("|"),
+                  "the title is 'MOD LAG WATCHDOG %s': %r" % (RELEASE.split()[3], shown))
 
             # Drag the title bar 200 px left and 100 px down.
             s.lua("MOUSE.x, MOUSE.y = 1100, 605; PRESS(1)")

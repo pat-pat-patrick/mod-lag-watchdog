@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.27.0"
+local MARKER = "mod-lag-finder-v0.28.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3560,10 +3560,14 @@ local function items(at)
   ui.geometry = g
   ui.button = nil
   local s = g.s
+  -- The title carries the version (v0.28.0, the user): a screenshot says
+  -- which build it is. ~24 characters at 8.4 px (1080p) end well before
+  -- the [-] button.
+  ui.title = ui.title or ("MOD LAG WATCHDOG " .. (string.match(MARKER, "(v[%d%.]+)$") or ""))
   if window_shown and folded then
     list[#list + 1] = { rect = true, x = g.x, y = g.top - HEADER * s, w = g.w, h = HEADER * s,
                         z = 91, c = BAND }
-    list[#list + 1] = { text = "MOD LAG WATCHDOG", x = g.x + PAD * s,
+    list[#list + 1] = { text = ui.title, x = g.x + PAD * s,
                         y = g.top - HEADER * s + 8 * s, size = TITLE_SIZE * s, c = WHITE }
     list[#list + 1] = { text = "[+]", x = g.x + g.w - (PAD + 28) * s,
                         y = g.top - HEADER * s + 8 * s, size = TITLE_SIZE * s, c = WHITE }
@@ -3574,7 +3578,7 @@ local function items(at)
     list[#list + 1] = { rect = true, x = g.x, y = g.top - g.h, w = g.w, h = g.h, z = 90, c = BACK }
     list[#list + 1] = { rect = true, x = g.x, y = g.top - HEADER * s, w = g.w, h = HEADER * s,
                         z = 91, c = BAND }
-    list[#list + 1] = { text = "MOD LAG WATCHDOG", x = g.x + PAD * s,
+    list[#list + 1] = { text = ui.title, x = g.x + PAD * s,
                         y = g.top - HEADER * s + 8 * s, size = TITLE_SIZE * s, c = WHITE }
     -- At the title bar's right end, like a window's minimize button.
     list[#list + 1] = { text = "[-]", x = g.x + g.w - (PAD + 28) * s,
