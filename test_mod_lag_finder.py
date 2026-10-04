@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.28.0"
+RELEASE = "Mod Lag Watchdog v0.29.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1861,8 +1861,12 @@ def review_remap_case():
         worst = [float(v) for v in re.findall(
             r"mods/test/heavy\s+[\d.]+ ms/s\s+[\d.]+ ms/frame\s+worst frame ([\d.]+) ms",
             s.file(LOG, "") or "")]
+        # v0.29.0: a re-arm on top is taken without a walk (a restack); the
+        # same rule holds for it: nothing charged until each shim ran twice.
         maps = log_lines(s, r"chain mapped")
-        check(len(maps) >= 4, "it was remapped: %d maps" % len(maps))
+        took = re.findall(r"chain: (\d+) hooks came onto or left the top", s.file(LOG, "") or "")
+        check(len(maps) + (int(took[-1]) if took else 0) >= 4,
+              "it was remapped or restacked: %d maps, restacks %r" % (len(maps), took[-1:]))
         check(bool(worst) and max(worst) < 9, "heavy's worst frame stays its own 5 ms: %r" % worst)
         clean(s, "remap")
 
@@ -3980,6 +3984,74 @@ def gc_case():
         clean(s, "gc off")
 
 
+SCHEDULER = r"""
+-- HD2Runtime 0.20.1's runtime/scheduler as shipped: attach puts a callback
+-- on top of _G.update; once the last watch is done it puts update back.
+local watches = {}
+local callback, original
+local function pack(...) return { n = select('#', ...), ... } end
+local function tick(dt)
+  for i = #watches, 1, -1 do
+    watches[i].left = watches[i].left - 1
+    if watches[i].left <= 0 then table.remove(watches, i) end
+  end
+  if #watches == 0 and update == callback then update = original; callback = nil end
+end
+SCHED_ATTACH = function(watch)
+  watches[#watches + 1] = watch
+  if not callback then
+    original = update
+    callback = function(dt, ...)
+      local result = original and pack(original(dt, ...)) or { n = 0 }
+      tick(type(dt) == 'number' and dt >= 0 and dt < 10 and dt or 0)
+      return unpack(result, 1, result.n)
+    end
+    update = callback
+  end
+  return watch
+end
+"""
+
+
+def scheduler_case():
+    """A hook that comes and goes on top (v0.29.0): HD2Runtime's scheduler
+    hooks on top when it has work and unhooks when done, here every 4 s for
+    1 s. Up to v0.28.0 every change started a full walk, which never
+    finished (a player's window, 2026-10-04: the Watchdog itself at 38.9
+    ms/s, known heavy mods near nothing). Now each change only adds or drops
+    the top: one walk in the session, heavy keeps its ~220 ms/s, and the
+    summary counts the hooks taken."""
+    print("scheduler")
+    with session() as s:
+        load(s, ["heavy", "std", "slow", "finder"])
+        s.frames(300)
+        s.lua(SCHEDULER)
+        s.lua("local before = FAKE.before_frame\n"
+              "FRAME_N = 0\n"
+              "FAKE.before_frame = function()\n"
+              "  before()\n"
+              "  FRAME_N = FRAME_N + 1\n"
+              "  if FRAME_N % 240 == 0 then SCHED_ATTACH({ left = 60 }) end\n"
+              "end")
+        s.frames(60 * 130)
+        walks = [l for l in log_lines(s, r"chain mapped:") if "no new walk" not in l]
+        check(len(walks) == 1, "one walk in the whole session, not one per change: %d" % len(walks))
+        restacked = [l for l in log_lines(s, r"chain mapped:") if "no new walk" in l]
+        check(len(restacked) == 2, "the chain is written once as the hook came and once as it left: %r"
+              % restacked)
+        check(not log_lines(s, r"mapping again"), "no 'mapping again' for a hook on top")
+        heavy = [float(v) for v in re.findall(r"mods/test/heavy\s+([\d.]+) ms/s",
+                                                "\n".join(log_lines(s, r"mods/test/heavy\s")))]
+        # 5 ms in each ~21 ms frame is ~220 ms/s (as in the other cases);
+        # v0.28.0 read ~174 here (frames lost to 40 unfinished walks).
+        check(len(heavy) >= 2 and heavy[-1] > 200,
+              "heavy keeps its ~220 ms/s while the scheduler comes and goes: %r" % heavy)
+        told = log_lines(s, r"chain: \d+ hooks came onto or left the top")
+        check(bool(told) and int(re.search(r"chain: (\d+)", told[-1]).group(1)) >= 50,
+              "the summary counts the hooks taken without a walk: %r" % told[-1:])
+        clean(s, "scheduler")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -3994,6 +4066,7 @@ def main():
     retry_case()
     stall_case()
     rehook_case()
+    scheduler_case()
     mdl_case()
     mdl_arsenal_case()
     names_case()

@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.28.0"
+local MARKER = "mod-lag-finder-v0.29.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1017,25 +1017,9 @@ local function step_mapping()
   finish_mapping("bottom")
 end
 
-finish_mapping = function(why)
-  -- A link adopted this tick has no finished frame yet, and one adopted a
-  -- tick ago has only one: until every shim has run twice, the link above
-  -- the newest would be charged the whole frame below it (v0.12.7).
-  installed.settling = 2
-  -- Our start-up hook is walked through (its previous is timed by the shim
-  -- in its slot) but kept out of the chain: the link above it then counts
-  -- its few microseconds, and chains read as they did before v0.12.5.
-  links = {}
-  local carried = nil            -- the upvalue the hook was found in names the link below it
-  for _, link in ipairs(mapping.links) do
-    if link.bootstrap then
-      carried = link.upname
-    else
-      if carried ~= nil then link.upname, carried = carried, nil end
-      links[#links + 1] = link
-    end
-  end
-  mapping = nil
+-- After the chain's links change: where this module and MDL sit, and which
+-- mods are hooked more than once (shared by a full walk and a restack).
+installed.relinked = function()
   our_index = nil
   runtime_index = nil
   for index, link in ipairs(links) do
@@ -1061,6 +1045,32 @@ finish_mapping = function(why)
     say(string.format("rehook: %d links, hooked more than once: %s", #links,
                       table.concat(parts, ", ")))
   end
+end
+
+finish_mapping = function(why)
+  -- A link adopted this tick has no finished frame yet, and one adopted a
+  -- tick ago has only one: until every shim has run twice, the link above
+  -- the newest would be charged the whole frame below it (v0.12.7).
+  installed.settling = 2
+  -- Our start-up hook is walked through (its previous is timed by the shim
+  -- in its slot) but kept out of the chain: the link above it then counts
+  -- its few microseconds, and chains read as they did before v0.12.5.
+  links = {}
+  local carried = nil            -- the upvalue the hook was found in names the link below it
+  for _, link in ipairs(mapping.links) do
+    if link.bootstrap then
+      carried = link.upname
+    else
+      if carried ~= nil then link.upname, carried = carried, nil end
+      links[#links + 1] = link
+    end
+  end
+  mapping = nil
+  installed.relinked()
+  installed.log_chain(why)
+end
+
+installed.log_chain = function(why)
   if maps_logged >= MAP_LOGS then return end
   maps_logged = maps_logged + 1
   say(string.format("chain mapped: %d links (%s); top is %s, its own time is not measured",
@@ -1090,6 +1100,84 @@ local function start_mapping(top)
   local first = through_ours(top)
   mapping = { links = { new_link(first, nil) }, seen_mods = false, patched = {} }
   begin_step()
+end
+
+-- A hook that comes and goes on top (v0.29.0). HD2Runtime 0.20.1's
+-- scheduler (the "scheduler" row a player's window showed, 2026-10-04)
+-- puts a callback on _G.update while it has work and puts the update back
+-- when it has none, every few seconds. Each change made a full walk start
+-- again; 30 links take ~4 s to walk, so the walk never finished: the mods'
+-- rows fell to near 0 and the walking itself was this module's cost (the
+-- player saw it at 38.9 ms/s). Here the two shapes that change only the
+-- top are taken as they are, with no walk:
+--   on top: the new top holds the old top in one upvalue -> a shim goes in
+--     that upvalue (the old top's link is reused) and the new top is
+--     links[1];
+--   off the top: the new top is links[2] (or our shim of it, which is what
+--     the leaving hook restores) -> links[1] goes.
+-- Anything else is a full walk, as before. Likely, measured in the fake.
+installed.restacks = 0
+installed.restack_logged = {}
+-- The chain is written the first time each hook comes on or leaves the top
+-- (a scheduler that comes and goes every few seconds is written twice).
+installed.restack_log = function(kind, link, why)
+  local key = kind .. " " .. tostring(link.source)
+  if installed.restack_logged[key] then return end
+  installed.restack_logged[key] = true
+  installed.log_chain(why)
+end
+installed.restack = function(top)
+  if mapping ~= nil or #links < 2 or mapped_top == nil or installed.settling > 0 then return false end
+  local first = links[1]
+  if through_ours(top) == links[2].fn then
+    table.remove(links, 1)
+    local slot = links[1].slot
+    if slot ~= nil and slot_get(slot) == slot.shim then slot_set(slot, slot.original) end
+    for index = #shims, 1, -1 do
+      if shims[index] == slot then table.remove(shims, index) end
+    end
+    links[1].slot, links[1].upname = nil, "_G.update"
+    mapped_top = top
+    installed.settling = 2
+    installed.relinked()
+    installed.restacks = installed.restacks + 1
+    installed.restack_log("left", first, "a hook left the top, no new walk")
+    return true
+  end
+  if type(top) ~= "function" or ours[top] ~= nil then return false end
+  local found = nil
+  for index = 1, 255 do
+    local name, value = getupvalue(top, index)
+    if name == nil then break end
+    if value == mapped_top then
+      if found ~= nil then return false end             -- two of them: walk
+      found = { kind = "uv", holder = top, key = index, name = name }
+    end
+  end
+  if found == nil then return false end
+  if ours[mapped_top] ~= nil then
+    -- Our shim of the old top, put back by a hook that left: it still times
+    -- that link (the same link object), so it only gets its new slot.
+    found.original, found.shim = ours[mapped_top], mapped_top
+  else
+    found.original = mapped_top
+    found.shim = make_shim(first, mapped_top, installed.xpcall_args and installed.link_handler or nil, installed)
+    slot_set(found, found.shim)
+  end
+  shims[#shims + 1] = found
+  first.slot, first.upname = found, found.name
+  local link = new_link(top, nil)
+  table.insert(links, 1, link)
+  mapped_top = top
+  if type(jit_flush) == "function" then
+    pcall(jit_flush, top)
+    pcall(jit_flush, first.fn)
+  end
+  installed.settling = 2
+  installed.relinked()
+  installed.restacks = installed.restacks + 1
+  installed.restack_log("came", link, "a hook came on top, no new walk")
+  return true
 end
 
 -- ------------------------------------------------------------ log writes
@@ -1443,6 +1531,11 @@ local function write_summary(at)
                       r.row.time * 1000 / math.max(window.frames, 1), ms1(r.row.worst)))
   end
   say(string.format("  log write worst %.0f ms", writes_worst() * 1000))
+  if (installed.restacks or 0) > (installed.restacks_told or 0) then
+    say(string.format("  chain: %d hooks came onto or left the top so far, taken without a new walk",
+                      installed.restacks))
+    installed.restacks_told = installed.restacks
+  end
   -- v0.24.0: what this module itself took, outside the shims (its tick: the
   -- walk, summaries, the window, log writes).
   say(string.format("  this module: %.2f ms/s, worst frame %.1f ms",
@@ -3970,10 +4063,6 @@ local function tick(failed)
   end
   local top = rawget(_G, "update")
   if top ~= mapped_top then
-    if mapped_top ~= nil and (last_change_note == nil or at - last_change_note > 10) then
-      last_change_note = at
-      say("update chain changed; mapping again")
-    end
     -- A stall seen last tick is reported now, on the chain it happened in:
     -- its links still hold that frame's times (v0.12.7; it used to be
     -- dropped, no line, no count).
@@ -3988,7 +4077,18 @@ local function tick(failed)
       end)
       if not ok_report then say("stall report failed: " .. tostring(err)) end
     end
-    walk(start_mapping, top)
+    local restacked = false
+    do
+      local ok_r, done = pcall(installed.restack, top)
+      restacked = ok_r and done == true
+    end
+    if not restacked then
+      if mapped_top ~= nil and (last_change_note == nil or at - last_change_note > 10) then
+        last_change_note = at
+        say("update chain changed; mapping again")
+      end
+      walk(start_mapping, top)
+    end
   elseif mapping ~= nil and not failed then
     walk(step_mapping)
   end
