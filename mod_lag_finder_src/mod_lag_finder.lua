@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.29.0"
+local MARKER = "mod-lag-finder-v0.30.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -2193,6 +2193,7 @@ local ui = { gui = nil, world = nil, panel = false, key_id = nil,
              signature = nil, in_menu = false, moving = nil,
              place = { x = DEFAULT_X, top = DEFAULT_TOP }, geometry = nil,
              mouse_ids = {}, told = {} }
+ui.sort_key = {}              -- the key of the table's header line (v0.30.0; on ui: 200-locals limit)
 local toast = nil             -- { text, until_at, colour, keep, always }
 local last_stall = nil        -- { ms, who, at }
 
@@ -2225,20 +2226,21 @@ local function load_place()
   if file == nil then return end
   local text = file:read("*l")
   file:close()
-  local x, top, shown, alerts, folded =
-    string.match(text or "", "^%s*(%-?%d+)%s+(%-?%d+)%s*(%d?)%s*(%d?)%s*(%d?)")
+  local x, top, shown, alerts, folded, sort =
+    string.match(text or "", "^%s*(%-?%d+)%s+(%-?%d+)%s*(%d?)%s*(%d?)%s*(%d?)%s*(%d?)")
   if x ~= nil then ui.place = { x = tonumber(x), top = tonumber(top) } end
   if shown == "1" then ui.panel = true end
   if alerts == "0" then ui.alerts_off = true end
   if folded == "1" then ui.folded = true end     -- v0.20.0; older files have no fifth field
+  if sort == "1" then ui.sort_worst = true end   -- v0.30.0; older files have no sixth
 end
 
 local function save_place()
   if place_path == nil then return end
   local file = io.open(place_path, "w")
   if file == nil then return end
-  file:write(string.format("%d %d %d %d %d", ui.place.x, ui.place.top, ui.panel and 1 or 0,
-                           ui.alerts_off and 0 or 1, ui.folded and 1 or 0) .. NL)
+  file:write(string.format("%d %d %d %d %d %d", ui.place.x, ui.place.top, ui.panel and 1 or 0,
+                           ui.alerts_off and 0 or 1, ui.folded and 1 or 0, ui.sort_worst and 1 or 0) .. NL)
   file:close()
 end
 
@@ -3525,7 +3527,16 @@ local function panel_lines(at)
     end
   end
   for key, row in pairs(merged) do rows[#rows + 1] = { key = key, row = row } end
-  table.sort(rows, function(a, b) return a.row.time > b.row.time end)
+  -- v0.30.0 (a Nexus player: which mod had the worst frame in the window
+  -- shows what goes with a stutter): click "ms/s" or "worst" to sort by it.
+  if ui.sort_worst then
+    table.sort(rows, function(a, b)
+      if a.row.worst ~= b.row.worst then return a.row.worst > b.row.worst end
+      return a.row.time > b.row.time
+    end)
+  else
+    table.sort(rows, function(a, b) return a.row.time > b.row.time end)
+  end
 
   if frames > 0 then
     out[#out + 1] = { string.format("last %.0f s: frame %.1f ms avg, stalls >= %d ms: %d",
@@ -3553,7 +3564,11 @@ local function panel_lines(at)
         more = more + 1
       else
         if shown == 0 then
-          out[#out + 1] = { string.format("%-28s %8s %9s", "mod", "ms/s", "worst"), GREY }
+          -- The column it is sorted by carries a "v"; on the menu the line is
+          -- clicked by column (handle_mouse).
+          out[#out + 1] = { string.format("%-28s %8s %9s", "mod", ui.sort_worst and "ms/s" or "ms/s v",
+                                          ui.sort_worst and "worst v" or "worst"), GREY,
+                            all and ui.sort_key or nil }
         end
         shown = shown + 1
         local tint = (r.row.worst * 1000 >= TOAST_MS or per_second >= AMBER_MSS) and AMBER or WHITE
@@ -3710,7 +3725,7 @@ local function items(at)
     y = y - LINE * s
     list[#list + 1] = { text = "drag the title bar; right-click it: default place",
                         x = g.x + PAD * s, y = y, size = TEXT_SIZE * s, c = GREY }
-    list[#list + 1] = { text = "click a mod: copy its report",
+    list[#list + 1] = { text = "click a mod: copy its report; ms/s or worst: sort",
                         x = g.x + PAD * s, y = y - LINE * s, size = TEXT_SIZE * s, c = GREY }
   elseif window_shown then
     -- In play: the lines alone, shadowed, at exactly the places they have in
@@ -3801,7 +3816,19 @@ local function handle_mouse()
     if inside and ui.rows ~= nil and mouse_clicked("left") then
       for _, row in ipairs(ui.rows) do
         if my >= row.bottom and my <= row.top then
-          if row.key == SWITCH then
+          if row.key == ui.sort_key then
+            -- The header is "%-28s %8s %9s" in the debug font, 7.5 px a
+            -- character at 1080p (15 px at size 32, 3840x2160): "ms/s" ends
+            -- at character 37, "worst" starts at 38.
+            local column = (mx - (g.x + PAD * g.s)) / (TEXT_SIZE * g.s * 15 / 32)
+            local worst = column >= 37
+            if worst ~= (ui.sort_worst == true) then
+              ui.sort_worst = worst
+              ui.dirty = true
+              save_place()
+              say(worst and "table sorted by worst frame" or "table sorted by ms/s")
+            end
+          elseif row.key == SWITCH then
             ui.panel = not ui.panel
             ui.dirty = true
             save_place()

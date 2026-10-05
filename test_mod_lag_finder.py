@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.29.0"
+RELEASE = "Mod Lag Watchdog v0.30.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1114,7 +1114,7 @@ def menu_case():
                   "the window follows the mouse: %s" % s.eval("POS('MOD LAG WATCHDOG')"))
             s.lua("RELEASE(1)")
             s.frames(2)
-            check((s.file("mod_lag_finder_window.txt") or "").strip() == "856 520 0 1 0",
+            check((s.file("mod_lag_finder_window.txt") or "").strip() == "856 520 0 1 0 0",
                   "the place is saved when the button is let go: %r"
                   % s.file("mod_lag_finder_window.txt"))
 
@@ -1205,7 +1205,7 @@ def fold_case():
                   and "heavy" not in shown and "click a mod" not in shown,
                   "folded: the title bar alone, with [+]: %r" % shown)
             check(s.eval("POS('MOD LAG WATCHDOG')") == title, "the click did not drag it")
-            check((s.file("mod_lag_finder_window.txt") or "").strip() == "1056 620 0 1 1",
+            check((s.file("mod_lag_finder_window.txt") or "").strip() == "1056 620 0 1 1 0",
                   "saved: %r" % s.file("mod_lag_finder_window.txt"))
             check(bool(log_lines(s, r"window folded")), "logged")
             s.lua("MENU_STATE(4, 0)")          # back to play
@@ -1236,7 +1236,7 @@ def fold_case():
             check("[-]" in shown and "show table in missions" in shown
                   and re.search(r"heavy\s+\d+\.\d", shown) is not None,
                   "[+] opens it again: %r" % shown)
-            check((s.file("mod_lag_finder_window.txt") or "").strip() == "1056 620 0 1 0",
+            check((s.file("mod_lag_finder_window.txt") or "").strip() == "1056 620 0 1 0 0",
                   "saved open: %r" % s.file("mod_lag_finder_window.txt"))
             clean(s, "unfold")
     finally:
@@ -1569,7 +1569,7 @@ def switch_case():
                     shown = s.eval("SHOWN()")
                     check(re.search(r"heavy\s+\d+\.\d", shown) is not None and "in missions" not in shown,
                           "in the mission the table stays up, without the switch line: %r" % shown)
-                    check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 1 1 0"),
+                    check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 1 1 0 0"),
                           "and it is saved: %r" % s.file("mod_lag_finder_window.txt"))
                 else:
                     shown = s.eval("SHOWN()")
@@ -1578,7 +1578,7 @@ def switch_case():
                     s.lua("FAKE.press('home')")
                     s.frames(3)
                     check(s.eval("SHOWN()") == "", "Home still turns it off: %r" % s.eval("SHOWN()"))
-                    check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 0 1 0"),
+                    check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 0 1 0 0"),
                           "and that is saved too")
                 clean(s, "switch")
         game(True)
@@ -4052,6 +4052,93 @@ def scheduler_case():
         clean(s, "scheduler")
 
 
+def sort_case():
+    """Sort by a column (v0.30.0, a Nexus player: the mod with the worst
+    frame in the window is what goes with a stutter). On the menu a click on
+    "ms/s" or "worst" in the header sorts by it; the header marks it with a
+    "v"; the in-mission table (Home) follows; the choice is saved with the
+    window and read back next launch. heavy: ~220 ms/s, worst 5 ms; slow:
+    ~45 ms/s, worst 400 ms. Fails on v0.29.0 (no such click)."""
+    print("sort")
+    scratch = tempfile.mkdtemp(prefix="mlf_sort_")
+
+    # SHOWN() is sorted text, not screen order: rows go by their height on
+    # screen (y up, so the higher row has the larger y).
+    def order(_shown=None):
+        ys = {}
+        for name in ("heavy", "slow"):
+            pos = S_NOW[0].eval("POS('%s ')" % name)
+            if pos != "none":
+                ys[name] = int(pos.split(",")[1])
+        return sorted(ys, key=lambda n: -ys[n])
+
+    def click_header(s, chars):
+        pos = s.eval("POS('mod  ')")
+        check(pos != "none", "the header is on the menu window: %r" % s.eval("SHOWN()"))
+        if pos == "none":
+            return
+        x, y = (int(v) for v in pos.split(","))
+        s.lua("MOUSE.x, MOUSE.y = %d, %d; PRESS(1)" % (x + int(chars * 7.5), y + 4))
+        s.frames(2)
+        s.lua("RELEASE(1)")
+        s.frames(3)
+
+    S_NOW = [None]
+    try:
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            S_NOW[0] = s
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            s.lua(menu_stub())
+            load(s, ["heavy", "slow", "finder"])
+            s.frames(700)                                 # two of slow's stalls
+            s.lua("MENU_STATE(1, 0)")
+            s.frames(6)
+            shown = s.eval("SHOWN()")
+            check(order(shown) == ["heavy", "slow"], "by ms/s first: heavy, slow: %r" % shown)
+            check("ms/s v" in shown and "worst v" not in shown, "the header marks ms/s: %r" % shown)
+            check("ms/s or worst: sort" in shown, "the window says the header sorts: %r" % shown)
+            click_header(s, 41)                           # on "worst"
+            shown = s.eval("SHOWN()")
+            check(order(shown) == ["slow", "heavy"], "a click on worst: slow first: %r" % shown)
+            check("worst v" in shown and "ms/s v" not in shown, "the header marks worst: %r" % shown)
+            check(bool(log_lines(s, "table sorted by worst frame")), "logged")
+            check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 1"),
+                  "saved: %r" % s.file("mod_lag_finder_window.txt"))
+            click_header(s, 41)                           # again: no change
+            check(order(s.eval("SHOWN()")) == ["slow", "heavy"], "a second click on worst keeps it")
+            s.lua("MENU_STATE(4, 0)")                     # back in play, the table by Home
+            s.frames(6)
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            check(order(s.eval("SHOWN()")) == ["slow", "heavy"],
+                  "the table in play follows: %r" % s.eval("SHOWN()"))
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            s.lua("MENU_STATE(1, 0)")
+            s.frames(6)
+            click_header(s, 33)                           # on "ms/s"
+            check(order(s.eval("SHOWN()")) == ["heavy", "slow"], "a click on ms/s: back: %r" % s.eval("SHOWN()"))
+            click_header(s, 41)                           # worst again, kept for the next launch
+            clean(s, "sort")
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            S_NOW[0] = s
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            s.lua(menu_stub())
+            load(s, ["heavy", "slow", "finder"])
+            s.frames(700)
+            s.lua("MENU_STATE(1, 0)")
+            s.frames(6)
+            check(order(s.eval("SHOWN()")) == ["slow", "heavy"],
+                  "next launch: still by worst: %r" % s.eval("SHOWN()"))
+            clean(s, "sort, next launch")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -4080,6 +4167,7 @@ def main():
     quiet_case()
     menu_case()
     fold_case()
+    sort_case()
     patched_case()
     memory_case()
     units_case()
