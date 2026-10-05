@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.31.0"
+local MARKER = "mod-lag-finder-v0.31.1"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3589,10 +3589,12 @@ local function panel_lines(at)
         more = more + 1
       else
         if shown == 0 then
-          -- The column it is sorted by carries a "v"; on the menu the line is
+          -- The column it is sorted by carries a "v" in front (v0.31.1: after
+          -- the label it pushed "ms/s" and "worst" two characters left of
+          -- their numbers -- the user's screenshot); on the menu the line is
           -- clicked by column (handle_mouse).
-          out[#out + 1] = { string.format("%-28s %8s %9s", "mod", ui.sort_worst and "ms/s" or "ms/s v",
-                                          ui.sort_worst and "worst v" or "worst"), GREY,
+          out[#out + 1] = { string.format("%-28s %8s %9s", "mod", ui.sort_worst and "ms/s" or "v ms/s",
+                                          ui.sort_worst and "v worst" or "worst"), GREY,
                             all and ui.sort_key or nil }
         end
         shown = shown + 1

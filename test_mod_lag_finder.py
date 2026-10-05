@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.31.0"
+RELEASE = "Mod Lag Watchdog v0.31.1"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4097,12 +4097,19 @@ def sort_case():
             s.frames(6)
             shown = s.eval("SHOWN()")
             check(order(shown) == ["heavy", "slow"], "by ms/s first: heavy, slow: %r" % shown)
-            check("ms/s v" in shown and "worst v" not in shown, "the header marks ms/s: %r" % shown)
+            check("v ms/s" in shown and "v worst" not in shown, "the header marks ms/s: %r" % shown)
+            # v0.31.1: the labels stay over their numbers -- "ms/s" ends where
+            # the ms/s numbers end (character 37), "worst" where "ms" ends.
+            head = [part for part in shown.split("|") if part.startswith("mod  ")]
+            row = [part for part in shown.split("|") if re.match(r"heavy\s+\d", part)]
+            check(bool(head) and bool(row) and head[0].index("ms/s") + 4 == len(row[0][:37].rstrip())
+                  and len(head[0].rstrip()) == len(row[0].rstrip()),
+                  "the header's labels line up with their columns: %r / %r" % (head[:1], row[:1]))
             check("ms/s or worst: sort" in shown, "the window says the header sorts: %r" % shown)
             click_header(s, 41)                           # on "worst"
             shown = s.eval("SHOWN()")
             check(order(shown) == ["slow", "heavy"], "a click on worst: slow first: %r" % shown)
-            check("worst v" in shown and "ms/s v" not in shown, "the header marks worst: %r" % shown)
+            check("v worst" in shown and "v ms/s" not in shown, "the header marks worst: %r" % shown)
             check(bool(log_lines(s, "table sorted by worst frame")), "logged")
             check((s.file("mod_lag_finder_window.txt") or "").strip().endswith(" 1"),
                   "saved: %r" % s.file("mod_lag_finder_window.txt"))
