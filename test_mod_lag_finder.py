@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.30.0"
+RELEASE = "Mod Lag Watchdog v0.31.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4139,6 +4139,84 @@ def sort_case():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+FLUSHER = r"""
+-- On its 400th call LuaJIT's code cache is flushed (as the loader counts it)
+-- and the frame takes 600 ms longer, inside this mod.
+local previous = rawget(_G, "update")
+local n = 0
+rawset(_G, "update", function(...)
+  n = n + 1
+  if n == 400 then
+    CowboyBingusModLoader.jit.flushes = CowboyBingusModLoader.jit.flushes + 1
+    CLOCK = CLOCK + 0.6
+  end
+  return previous(...)
+end)
+"""
+
+
+def bsl_flush_case():
+    """LuaJIT cache flushes (v0.31.0, through Bingus Shared Loader v18+'s
+    counter): a stall in the frame of a flush says "LAG ... - LuaJIT cache
+    flush", not the mod that was running; the stall line and the summary say
+    so; slow's own stall later is still slow's. Fails on v0.30.0."""
+    print("bsl: jit flush")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua("CowboyBingusModLoader = { jit = { managed = true, flushes = 0, mcode_kb = 65536, traces = 8000 } }")
+        check(s.load_mod(source=FLUSHER, name="mods/test/flusher"), "flusher loads")
+        load(s, ["slow", "finder"])
+        s.frames(405)
+        shown = s.eval("SHOWN()")
+        check("LAG 6" in shown and "LuaJIT cache flush" in shown and "flusher" not in shown,
+              "the stall is the cache flush, not the mod it happened in: %r" % shown)
+        check(bool(log_lines(s, r"jit: LuaJIT code cache flushed \(1 this session; machine code 65536 KB, 8000 traces\)")),
+              "the flush is logged: %r" % log_lines(s, "jit:"))
+        check(any("LuaJIT code cache flushed in this frame" in l for l in log_lines(s, r"hitch 6\d\d ms")),
+              "and on the stall line: %r" % log_lines(s, r"hitch 6\d\d ms"))
+        s.frames(300)
+        check("LAG 4" in s.eval("SHOWN()") and "slow" in s.eval("SHOWN()"),
+              "slow's own stall, no flush near it, is still slow's: %r" % s.eval("SHOWN()"))
+        s.frames(3300)
+        check(bool(log_lines(s, r"^t=[\d.]+\s+jit: 1 LuaJIT code cache flush this minute")),
+              "the summary counts it: %r" % log_lines(s, "jit:"))
+        clean(s, "bsl flush")
+
+
+def bsl_startup_case():
+    """A launch that closed while a mod was loading (v0.31.0, from Bingus
+    Shared Loader v19's health header): "LAST CRASH: the game closed while
+    <mod> was loading" shows on the ship when a crash dump was written after
+    that launch began; without one (a player may have closed the game) the
+    log says so and nothing shows. Fails on v0.30.0."""
+    print("bsl: startup crash")
+    header = ("CowboyBingusModLoader = { health = { header = {\n"
+              "  'Started: 2026-10-05 12:10:00',\n"
+              "  'Previous session: started 2026-10-05 12:00:00 (loader-v19); its log ended while loading mods/test/slow',\n"
+              "  'Newest crash dump: %s, exception 0xC0000005 at helldivers2.exe+0x407C61 (module stamp 0x1); 3 dumps in total',\n"
+              "}, changes = {} } }")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(header % "2026-10-05 12:00:41")
+        load(s, ["finder"])
+        check(bool(log_lines(s, r"last crash: the previous launch \(2026-10-05 12:00:00\) closed while "
+                                r"mods/test/slow was loading; crash dump 2026-10-05 12:00:41")),
+              "the log says which mod was loading: %r" % log_lines(s, "last crash"))
+        s.frames(1500)                                # ~24 s, the world settled
+        shown = s.eval("SHOWN()")
+        check("LAST CRASH: the game closed while slow was loading" in shown, "shown on the ship: %r" % shown)
+        clean(s, "bsl startup crash")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(header % "2026-10-05 11:58:00")         # the newest dump is older than that launch
+        load(s, ["finder"])
+        check(bool(log_lines(s, r"ended while mods/test/slow was loading, with no crash dump after it began: not shown")),
+              "no newer dump: logged, not shown: %r" % log_lines(s, "last crash"))
+        s.frames(1500)
+        check("LAST CRASH" not in s.eval("SHOWN()"), "and nothing on screen: %r" % s.eval("SHOWN()"))
+        clean(s, "bsl startup, no dump")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -4196,6 +4274,8 @@ def main():
     crash_case()
     culprit_case()
     next_launch_case()
+    bsl_flush_case()
+    bsl_startup_case()
     caught_case()
     cut_short_case()
     substep_case()

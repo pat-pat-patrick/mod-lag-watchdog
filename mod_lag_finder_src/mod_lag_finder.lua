@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.30.0"
+local MARKER = "mod-lag-finder-v0.31.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1116,6 +1116,26 @@ end
 --   off the top: the new top is links[2] (or our shim of it, which is what
 --     the leaving hook restores) -> links[1] goes.
 -- Anything else is a full walk, as before. Likely, measured in the fake.
+-- LuaJIT code cache flushes, as Bingus Shared Loader v18+ counts them
+-- (CowboyBingusModLoader.jit.flushes, its trace watcher; v19 starts the
+-- cache at 64 MB). A flush throws away every mod's compiled code; the
+-- frames after it run uncompiled until each trace is compiled again.
+-- Likely, not measured in game: that is a stall no single mod causes.
+installed.jit_minute = 0
+installed.jit_watch = function(at)
+  local loader = rawget(_G, "CowboyBingusModLoader")
+  local cache = type(loader) == "table" and rawget(loader, "jit") or nil
+  local flushes = type(cache) == "table" and rawget(cache, "flushes") or nil
+  if type(flushes) ~= "number" then return end
+  local seen = installed.jit_seen
+  installed.jit_seen = flushes
+  if seen == nil or flushes <= seen then return end
+  installed.jit_flush_at = at
+  installed.jit_minute = installed.jit_minute + (flushes - seen)
+  say(string.format("jit: LuaJIT code cache flushed (%d this session; machine code %s KB, %s traces)",
+                    flushes, tostring(rawget(cache, "mcode_kb") or "?"), tostring(rawget(cache, "traces") or "?")))
+end
+
 installed.restacks = 0
 installed.restack_logged = {}
 -- The chain is written the first time each hook comes on or leaves the top
@@ -1531,6 +1551,11 @@ local function write_summary(at)
                       r.row.time * 1000 / math.max(window.frames, 1), ms1(r.row.worst)))
   end
   say(string.format("  log write worst %.0f ms", writes_worst() * 1000))
+  if (installed.jit_minute or 0) > 0 then
+    say(string.format("  jit: %d LuaJIT code cache flush%s this minute", installed.jit_minute,
+                      installed.jit_minute == 1 and "" or "es"))
+    installed.jit_minute = 0
+  end
   if (installed.restacks or 0) > (installed.restacks_told or 0) then
     say(string.format("  chain: %d hooks came onto or left the top so far, taken without a new walk",
                       installed.restacks))
@@ -3628,7 +3653,8 @@ local function panel_lines(at)
   end
   if last_stall ~= nil then
     out[#out + 1] = { string.format("last stall %s ms %s, %.0f s ago", ms(last_stall.ms),
-                                    last_stall.who and ("in " .. last_stall.who) or "outside every mod",
+                                    last_stall.cause and ("in " .. last_stall.cause)
+                                      or last_stall.who and ("in " .. last_stall.who) or "outside every mod",
                                     at - last_stall.at),
                       last_stall.who and RED or GREY }
   end
@@ -3875,7 +3901,8 @@ local function display(at)
   if note ~= nil and ui.first_tick ~= nil and at - ui.first_tick >= 20 and
      (not units.installed or (units.world ~= nil and units.candidate == nil and
                               at - (units.world_since or at) >= 10)) then
-    local text = string.sub(note.key, 1, 1) == "(" and "LAST CRASH: a Lua error outside every mod"
+    local text = note.startup and ("LAST CRASH: the game closed while " .. short_name(note.key) .. " was loading")
+                 or string.sub(note.key, 1, 1) == "(" and "LAST CRASH: a Lua error outside every mod"
                  or ("LAST CRASH: " .. (note.name or short_name(note.key)) .. " raised a Lua error")
     if ui.alert({ text = text, until_at = at + 12, colour = AMBER, keep = true, always = true }) then
       ui.crash_note = nil
@@ -4005,7 +4032,14 @@ local function report(hitch, frame_selfs)
   if hitch.interval * 1000 >= TOAST_MS then
     local first = sorted[1]
     local at = now()
-    if first ~= nil and first.entry.own >= hitch.interval * TOAST_SHARE then
+    if hitch.jit_flush then
+      -- v0.31.0: the loader saw LuaJIT flush its code cache in this frame or
+      -- the second before; every mod runs uncompiled until it is compiled
+      -- again. Not charged to the mod that happened to be running.
+      last_stall = { ms = hitch.interval, cause = "a LuaJIT cache flush", at = at }
+      ui.alert({ text = string.format("LAG %s ms - LuaJIT cache flush", ms(hitch.interval)),
+                 until_at = at + TOAST_S })
+    elseif first ~= nil and first.entry.own >= hitch.interval * TOAST_SHARE then
       local who = short_name(owner(first.entry.link))
       last_stall = { ms = hitch.interval, who = who, at = at }
       local key = owner(first.entry.link)
@@ -4054,6 +4088,9 @@ local function report(hitch, frame_selfs)
   if frame_selfs ~= nil and installed.gcw.note ~= nil
      and installed.gcw.note_frame == installed.frame_id - 1 then
     body = body .. "; " .. installed.gcw.note    -- v0.21.0, the GC probe
+  end
+  if hitch.jit_flush then
+    body = body .. "; LuaJIT code cache flushed in this frame or the second before"
   end
   say(string.format("hitch %s ms (dt %s, next %s ms)%s: %s", ms(hitch.interval),
                     hitch.dt and ms(hitch.dt) or "?", frame_dt and ms(frame_dt) or "?",
@@ -4121,6 +4158,7 @@ local function tick(failed)
   end
 
   local heap = heap_kb()
+  pcall(installed.jit_watch, at)
   local mapped = mapping == nil and #links > 0
   local frame_selfs = nil
   if mapped then
@@ -4161,6 +4199,7 @@ local function tick(failed)
       -- The tick that ended the last frame lies inside this interval: its
       -- cost is this module's own share (unmeasured when it is the top link).
       pending = { interval = interval, dt = frame_dt, heap = heap, heap_drop = drop,
+                  jit_flush = installed.jit_flush_at ~= nil and at - installed.jit_flush_at <= 1.0,
                   mapped = mapped, mine = installed.tick_cost or 0 }
     end
   end
@@ -4604,6 +4643,42 @@ local function main()
       local file = io.open(installed.crash_path, "w")
       if file ~= nil then file:close() end
     end
+  end
+  -- v0.31.0: a launch that closed while the mods were still loading, before
+  -- this module could see anything. Bingus Shared Loader v19 reads its own
+  -- previous log at start ("Previous session: started <t> (...); its log
+  -- ended while loading <module>") and the dump folder ("Newest crash dump:
+  -- <t>, exception ..."). Shown only when a dump was written after that
+  -- launch began: a log that ends while loading may also be a player who
+  -- closed the game. Times are "YYYY-MM-DD HH:MM:SS", local, so they compare
+  -- as text.
+  if ui.crash_note == nil then
+    pcall(function()
+      local loader = rawget(_G, "CowboyBingusModLoader")
+      local health = type(loader) == "table" and rawget(loader, "health") or nil
+      local header = type(health) == "table" and rawget(health, "header") or nil
+      if type(header) ~= "table" then return end
+      local started, loading, dump_at
+      for _, line in ipairs(header) do
+        if type(line) == "string" then
+          local s_at, rest = string.match(line, "^Previous session: started (%d+%-%d+%-%d+ %d+:%d+:%d+)(.*)$")
+          if s_at ~= nil then
+            started = s_at
+            loading = string.match(rest, "its log ended while loading (%S+)$")
+          end
+          dump_at = dump_at or string.match(line, "^Newest crash dump: (%d+%-%d+%-%d+ %d+:%d+:%d+)")
+        end
+      end
+      if loading == nil then return end
+      if dump_at ~= nil and dump_at >= started then
+        say(string.format("last crash: the previous launch (%s) closed while %s was loading; crash dump %s",
+                          started, loading, dump_at))
+        ui.crash_note = { key = loading, startup = true }
+      else
+        say(string.format("last crash: the previous launch (%s) ended while %s was loading, with no crash dump " ..
+                          "after it began: not shown", started, loading))
+      end
+    end)
   end
   local ok_gpu, gpu_told = pcall(gpu.open)
   if not ok_gpu then gpu.read = nil end
