@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.32.0"
+RELEASE = "Mod Lag Watchdog v0.32.1"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4323,6 +4323,45 @@ def hudplus_menu_case():
         clean(s, "hud+ menu")
 
 
+MENU_STALL = r"""
+-- Takes 300 ms in the second frame after the menu opens (and closes): the
+-- frames in which HD2 HUD+ 0.2.2 climbs on and off the top.
+local previous = rawget(_G, "update")
+local seen, was = 0, false
+rawset(_G, "update", function(...)
+  if (MENU_OPEN == true) ~= was then was, seen = MENU_OPEN == true, 0 end
+  seen = seen + 1
+  if seen == 2 then CLOCK = CLOCK + 0.3 end
+  return previous(...)
+end)
+"""
+
+
+def restack_stall_case():
+    """A stall right as a hook comes onto or leaves the top (v0.32.1): it is
+    named, not "chain not mapped yet". v0.29.0-v0.32.0 waited two frames
+    after each restack (in game 2026-10-07: six stalls of 75-138 ms at menu
+    open/close went unnamed). Fails on v0.32.0."""
+    print("stall at a restack")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(menu_stub())
+        check(s.load_mod(source=HUDPLUS_022, name="mods/hd2_hud/hd2_hud_plus"), "hud+ loads")
+        check(s.load_mod(source=MENU_STALL, name="mods/test/menustall"), "menustall loads")
+        load(s, ["std", "finder"])
+        s.frames(600)
+        for _ in range(2):
+            s.lua("MENU_OPEN = true")
+            s.frames(300)
+            s.lua("MENU_OPEN = false")
+            s.frames(300)
+        hitches = log_lines(s, r"hitch 3\d\d ms")
+        named = [l for l in hitches if re.search(r"mods/test/menustall 3\d\d", l)]
+        check(len(hitches) >= 4 and len(named) == len(hitches),
+              "each stall as the menu opens or closes is put on its mod: %r" % hitches)
+        clean(s, "stall at a restack")
+
+
 def churn_case():
     """Two mods that keep themselves on top (v0.32.0; HD2 HUD+ 0.2.2 on the
     menu and a mod that re-hooks whenever it is not on top): the top
@@ -4371,6 +4410,7 @@ def main():
     rehook_case()
     scheduler_case()
     hudplus_menu_case()
+    restack_stall_case()
     churn_case()
     mdl_case()
     mdl_arsenal_case()

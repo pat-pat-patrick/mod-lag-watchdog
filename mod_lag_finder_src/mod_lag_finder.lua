@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.32.0"
+local MARKER = "mod-lag-finder-v0.32.1"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1158,7 +1158,10 @@ installed.restack = function(top)
     end
     links[1].slot, links[1].upname = nil, "_G.update"
     mapped_top = top
-    installed.settling = 2
+    -- No settling (v0.32.1): no shim is new, and the new top is not charged.
+    -- With it, a stall in the two frames after the menu opened or closed
+    -- (HD2 HUD+ 0.2.2 climbs on or off the top then) read "chain not
+    -- mapped yet" in game (2026-10-07, six times in five minutes).
     installed.relinked()
     installed.restacks = installed.restacks + 1
     installed.restack_log("left", first, "a hook left the top, no new walk")
@@ -1193,7 +1196,9 @@ installed.restack = function(top)
     pcall(jit_flush, top)
     pcall(jit_flush, first.fn)
   end
-  installed.settling = 2
+  -- No settling (v0.32.1): the one new shim times the old top, now second;
+  -- until it has run, its frame stamp makes it read 0 (settled_incl), and
+  -- the only link above it is the new top, which is never charged.
   installed.relinked()
   installed.restacks = installed.restacks + 1
   installed.restack_log("came", link, "a hook came on top, no new walk")
