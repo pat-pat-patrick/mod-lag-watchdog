@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.31.1"
+local MARKER = "mod-lag-finder-v0.32.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -2193,6 +2193,7 @@ local function short_name(key)
   return (name or string.match(key, "([^/]+)$") or key) .. plus
 end
 
+
 -- ------------------------------------------------------------ on screen
 
 -- The window lives at one place, kept in 1080p reference pixels (top-left
@@ -2233,6 +2234,7 @@ function ui.alert(new)
   ui.dirty = true
   return true
 end
+
 
 local function tell_once(what, text)
   if ui.told[what] then return end
@@ -2533,6 +2535,92 @@ local AMBER = { 255, 255, 190, 90 }
 local RED = { 255, 255, 120, 100 }
 local BACK = { 200, 8, 10, 14 }
 local BAND = { 235, 28, 32, 42 }
+
+-- A top that keeps changing (v0.32.0). HD2 HUD+ 0.2.2 re-links itself on
+-- top after every frame while the menu is open; with another mod that also
+-- keeps itself on top the two stack a layer each over the other every
+-- frame (in the fake: 3,000 layers and +14 ms a frame after 50 s, and they
+-- stay after the menu closes). A walk never finished then, so v0.31.1 saw
+-- nothing. Here every change of _G.update is counted by the source of the
+-- new top, in 5 s windows: 25 or more (5 a second) is named, in the log and
+-- as a REHOOK alert at most once a minute. While the top changes that
+-- often, a full walk waits for a quiet second instead of starting again
+-- every frame (each start flushes the compiled code of the whole chain).
+-- Opening and closing the menu (HUD+ alone) or HD2Runtime's scheduler
+-- change it every few seconds, far below this.
+installed.churn_s, installed.churn_n = 5, 25    -- on installed: the main chunk's 200-locals limit
+installed.churn_note = function(top, at)
+  local c = installed.churn
+  if c == nil then
+    c = { start = at, n = 0, by = {}, under = {} }
+    installed.churn = c
+  end
+  c.n = c.n + 1
+  local fn = through_ours(top)
+  local source = source_of(fn)
+  c.by[source] = (c.by[source] or 0) + 1
+  -- The layer under it: when two mods leapfrog inside one frame, only the
+  -- last one is on top when this module looks; the other is right below.
+  for index = 1, 32 do
+    local name, value = getupvalue(fn, index)
+    if name == nil then break end
+    value = through_ours(value)
+    if type(value) == "function" then
+      local under = source_of(value)
+      if under ~= source and under ~= "?" and under ~= "=[C]" then
+        c.under[under] = (c.under[under] or 0) + 1
+        break
+      end
+    end
+  end
+end
+
+installed.churn_tick = function(at)
+  local c = installed.churn
+  if c == nil or at - c.start < installed.churn_s then return end
+  installed.churn = nil
+  if c.n < installed.churn_n then return end
+  local order = {}
+  for source, n in pairs(c.by) do order[#order + 1] = { source = source, n = n } end
+  table.sort(order, function(a, b)
+    if a.n ~= b.n then return a.n > b.n end
+    return a.source < b.source
+  end)
+  local rate = c.n / (at - c.start)
+  -- The mod most often right under the top, when it is another one.
+  local partner, most = nil, 0
+  for under, n in pairs(c.under) do
+    if n > most and under ~= order[1].source then partner, most = under, n end
+  end
+  if order[2] == nil and partner ~= nil and most >= c.n / 2 then
+    order[2] = { source = partner, n = most, under = true }
+  end
+  local text
+  if order[2] ~= nil then
+    text = string.format("REHOOK %s and %s keep hooking over each other (%.0f/s)",
+                         short_name(order[1].source), short_name(order[2].source), rate)
+  else
+    text = string.format("REHOOK %s keeps hooking itself on top (%.0f/s)", short_name(order[1].source), rate)
+  end
+  installed.churn_line = { text = text, until_at = at + 15 }
+  installed.churn_logged = (installed.churn_logged or 0) + 1
+  if installed.churn_logged <= 20 then
+    local parts = {}
+    for _, o in ipairs(order) do parts[#parts + 1] = o.source .. (o.under and " (under it) " or " ") .. o.n end
+    say(string.format("rehook: the top of the update changed %d times in %.0f s: %s",
+                      c.n, at - c.start, table.concat(parts, ", ")))
+  end
+  if installed.churn_alerted == nil or at - installed.churn_alerted >= 60 then
+    installed.churn_alerted = at
+    ui.alert({ text = text, until_at = at + 8, colour = AMBER })
+  end
+end
+
+-- Many changes lately and the last one under a second ago: wait to walk.
+installed.churn_busy = function(at)
+  local c = installed.churn
+  return c ~= nil and c.n >= 10 and installed.top_changed_at ~= nil and at - installed.top_changed_at < 1
+end
 
 -- After a chain map: one mod hooked REHOOK_COPIES times or more shows an
 -- amber line for 8 s (at most once a minute) and stays listed in the panel.
@@ -3551,16 +3639,36 @@ local function panel_lines(at)
       if row.worst > m.worst then m.worst = row.worst end
     end
   end
-  for key, row in pairs(merged) do rows[#rows + 1] = { key = key, row = row } end
+  -- v0.32.0: the seconds a mod sat on top of the chain, where it is not
+  -- measured, are left out of its average. HD2 HUD+ 0.2.2 climbs on top
+  -- while the menu is open: its row fell to nothing on the menu and read
+  -- low for 30 s after. Its row is now its average over the measured
+  -- seconds, marked "(in play)" while it is on top.
+  local unmeasured = {}
+  for index, bucket in ipairs(buckets) do
+    if bucket.tops ~= nil then
+      local finish = buckets[index + 1] ~= nil and buckets[index + 1].at or at
+      local span = math.max(0, finish - bucket.at)
+      for key in pairs(bucket.tops) do unmeasured[key] = (unmeasured[key] or 0) + span end
+    end
+  end
+  for key, row in pairs(merged) do
+    local measured = seconds - (unmeasured[key] or 0)
+    if measured >= 1 or unmeasured[key] == nil then
+      rows[#rows + 1] = { key = key, row = row,
+                          mss = row.time * 1000 / math.max(unmeasured[key] and measured or seconds, 0.001),
+                          in_play = unmeasured[key] ~= nil and unmeasured[key] > 0 }
+    end
+  end
   -- v0.30.0 (a Nexus player: which mod had the worst frame in the window
   -- shows what goes with a stutter): click "ms/s" or "worst" to sort by it.
   if ui.sort_worst then
     table.sort(rows, function(a, b)
       if a.row.worst ~= b.row.worst then return a.row.worst > b.row.worst end
-      return a.row.time > b.row.time
+      return a.mss > b.mss
     end)
   else
-    table.sort(rows, function(a, b) return a.row.time > b.row.time end)
+    table.sort(rows, function(a, b) return a.mss > b.mss end)
   end
 
   if frames > 0 then
@@ -3582,7 +3690,7 @@ local function panel_lines(at)
     local all = ui.in_menu
     local shown, quiet, more = 0, 0, 0
     for _, r in ipairs(rows) do
-      local per_second = r.row.time * 1000 / math.max(seconds, 0.001)
+      local per_second = r.mss
       if not all and per_second < QUIET_MSS and r.row.worst * 1000 < QUIET_WORST_MS then
         quiet = quiet + 1
       elseif shown >= PANEL_ROWS then
@@ -3600,8 +3708,9 @@ local function panel_lines(at)
         shown = shown + 1
         local tint = (r.row.worst * 1000 >= TOAST_MS or per_second >= AMBER_MSS) and AMBER or WHITE
         if all and tint == WHITE and per_second < QUIET_MSS then tint = GREY end
-        out[#out + 1] = { string.format("%-28s %8.1f %6s ms", string.sub(short_name(r.key), 1, 28),
-                                        per_second, ms(r.row.worst)), tint, r.key }
+        local label = r.in_play and (string.sub(short_name(r.key), 1, 18) .. " (in play)")
+                      or string.sub(short_name(r.key), 1, 28)
+        out[#out + 1] = { string.format("%-28s %8.1f %6s ms", label, per_second, ms(r.row.worst)), tint, r.key }
       end
     end
     if more > 0 then
@@ -3629,6 +3738,9 @@ local function panel_lines(at)
   end
   if #links > 0 and links[1].fn ~= installed.wrapper then
     out[#out + 1] = { "on top, not measured: " .. short_name(links[1].source), GREY }
+  end
+  if installed.churn_line ~= nil and at < installed.churn_line.until_at then
+    out[#out + 1] = { installed.churn_line.text, AMBER }
   end
   for owner, flag in pairs(mem.flagged) do
     out[#out + 1] = { string.format("MEM %s ~%s, +%s in %d min", short_name(owner), kb_text(flag.kb),
@@ -4128,6 +4240,11 @@ local function tick(failed)
     end
   end
   local top = rawget(_G, "update")
+  if top ~= installed.last_top then
+    installed.last_top, installed.top_changed_at = top, at
+    pcall(installed.churn_note, top, at)
+  end
+  pcall(installed.churn_tick, at)
   if top ~= mapped_top then
     -- A stall seen last tick is reported now, on the chain it happened in:
     -- its links still hold that frame's times (v0.12.7; it used to be
@@ -4148,7 +4265,7 @@ local function tick(failed)
       local ok_r, done = pcall(installed.restack, top)
       restacked = ok_r and done == true
     end
-    if not restacked then
+    if not restacked and not installed.churn_busy(at) then
       if mapped_top ~= nil and (last_change_note == nil or at - last_change_note > 10) then
         last_change_note = at
         say("update chain changed; mapping again")
@@ -4186,6 +4303,15 @@ local function tick(failed)
     pending = nil
   end
   if frame_selfs ~= nil then charge(frame_selfs) end
+  -- v0.32.0: which mod sat on top (not measured) in this second.
+  if mapped and live.bucket ~= nil and links[1] ~= nil and links[1].fn ~= installed.wrapper then
+    local tops = live.bucket.tops
+    if tops == nil then
+      tops = {}
+      live.bucket.tops = tops
+    end
+    tops[owner(links[1])] = true
+  end
 
   if last_tick_time ~= nil then
     local interval = at - last_tick_time

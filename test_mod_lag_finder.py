@@ -102,7 +102,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.31.1"
+RELEASE = "Mod Lag Watchdog v0.32.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4224,6 +4224,137 @@ def bsl_startup_case():
         clean(s, "bsl startup, no dump")
 
 
+HUDPLUS_022 = r"""
+-- HD2 HUD+ 0.2.2's update hook as shipped (00-boot-state BootState.install,
+-- link, finish): a base hook at load; while the menu is open (MENU_OPEN
+-- here) it re-links itself on top after every frame, and only the top layer
+-- works (4 ms a frame here); closed, the extra layer goes if still on top.
+local hook = {}
+local function link(inner)
+  local fn
+  fn = function(...)
+    if fn ~= (hook.outer or hook.base) then return inner(...) end
+    return hook.frame(inner, ...)
+  end
+  rawset(_G, "update", fn)
+  return fn
+end
+local function finish(...)
+  local top = rawget(_G, "update")
+  if MENU_OPEN then
+    if top ~= (hook.outer or hook.base) then hook.outer_inner, hook.outer = top, link(top) end
+  elseif hook.outer ~= nil then
+    if top == hook.outer then rawset(_G, "update", hook.outer_inner) end
+    hook.outer = nil
+  end
+  return ...
+end
+function hook.frame(inner, ...)
+  CLOCK = CLOCK + 0.004
+  return finish(inner(...))
+end
+hook.base = link(rawget(_G, "update"))
+"""
+
+ONTOP = r"""
+-- Another mod that keeps itself on top: whenever _G.update is not its
+-- wrapper after a frame, it wraps again.
+local mine
+local function arm()
+  local below = rawget(_G, "update")
+  local fn
+  local function after(...)
+    if rawget(_G, "update") ~= mine then arm() end
+    return ...
+  end
+  fn = function(...) return after(below(...)) end
+  mine = fn
+  rawset(_G, "update", fn)
+end
+arm()
+"""
+
+
+def hudplus_menu_case():
+    """A mod on top only while the menu is open (v0.32.0; HD2 HUD+ 0.2.2):
+    the seconds it is not measured are left out of its average, so on the
+    menu its row keeps its in-play cost, marked "(in play)", and after the
+    menu closes it is not halved. No REHOOK for opening and closing the menu.
+    Fails on v0.31.1 (no row on the menu; ~half after)."""
+    print("hud+ on top on the menu")
+
+    def hud_row(shown):
+        m = re.search(r"(?:^|\|)(hd2_hud_plus[^|]*?)\s+([\d.]+)\s+\d+ ms", shown)
+        return (m.group(1).strip(), float(m.group(2))) if m else (None, None)
+
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(menu_stub())
+        check(s.load_mod(source=HUDPLUS_022, name="mods/hd2_hud/hd2_hud_plus"), "hud+ loads")
+        load(s, ["std", "finder"])
+        s.frames(2000)                                # ~32 s in play
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        name, play = hud_row(s.eval("SHOWN()"))
+        check(play is not None and play > 100, "in play hud+ is measured: %r" % s.eval("SHOWN()"))
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        s.lua("MENU_OPEN = true; MENU_STATE(1, 0)")
+        s.frames(600)                                 # 10 s on the menu
+        shown = s.eval("SHOWN()")
+        name, menu = hud_row(shown)
+        check(name == "hd2_hud_plus (in play)" and menu is not None and abs(menu - play) < play * 0.15,
+              "on the menu its in-play cost, marked: %r vs %r in play: %r" % (menu, play, shown))
+        check("on top, not measured: hd2_hud_plus" in shown, "and the window says it is on top: %r" % shown)
+        s.lua("MENU_OPEN = false; MENU_STATE(4, 0)")
+        s.frames(120)
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        name, after = hud_row(s.eval("SHOWN()"))
+        check(after is not None and after > play * 0.85,
+              "just after the menu it is not dragged down: %r vs %r" % (after, play))
+        for _ in range(3):
+            s.lua("MENU_OPEN = true")
+            s.frames(300)
+            s.lua("MENU_OPEN = false")
+            s.frames(300)
+        check(not log_lines(s, r"rehook: the top of the update changed"),
+              "opening and closing the menu is no REHOOK: %r" % log_lines(s, "rehook"))
+        clean(s, "hud+ menu")
+
+
+def churn_case():
+    """Two mods that keep themselves on top (v0.32.0; HD2 HUD+ 0.2.2 on the
+    menu and a mod that re-hooks whenever it is not on top): the top
+    changes every frame. Named within ~5 s in the log and as a REHOOK alert;
+    the walk is not restarted every frame; once they stop, the chain is
+    walked again. Fails on v0.31.1 (nothing said)."""
+    print("churn")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(menu_stub())
+        check(s.load_mod(source=HUDPLUS_022, name="mods/hd2_hud/hd2_hud_plus"), "hud+ loads")
+        check(s.load_mod(source=ONTOP, name="mods/test/ontop"), "ontop loads")
+        load(s, ["std", "finder"])
+        s.frames(600)
+        walks_before = len(log_lines(s, r"chain mapped:"))
+        s.lua("MENU_OPEN = true")
+        s.frames(420)                                 # 7 s of leapfrog
+        said = log_lines(s, r"rehook: the top of the update changed \d+ times")
+        check(bool(said) and "mods/hd2_hud/hd2_hud_plus" in said[0] and "mods/test/ontop" in said[0],
+              "both named in the log: %r" % said[:1])
+        check(re.search(r"REHOOK (hd2_hud_plus and ontop|ontop and hd2_hud_plus) keep hooking over each other",
+                        s.eval("SHOWN()")) is not None,
+              "and as an alert: %r" % s.eval("SHOWN()"))
+        walks = len(log_lines(s, r"chain mapped:")) - walks_before
+        check(walks <= 1, "no walk restarted every frame meanwhile: %d" % walks)
+        s.lua("MENU_OPEN = false")
+        s.frames(600)
+        check(len(log_lines(s, r"chain mapped:")) > walks_before,
+              "quiet again: the chain is walked: %r" % log_lines(s, "chain mapped")[-1:])
+        clean(s, "churn")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -4239,6 +4370,8 @@ def main():
     stall_case()
     rehook_case()
     scheduler_case()
+    hudplus_menu_case()
+    churn_case()
     mdl_case()
     mdl_arsenal_case()
     names_case()
