@@ -88,6 +88,7 @@ ways the installed mods do (2026-09-29):
 
 import os
 import re
+import struct
 import time
 import shutil
 import sys
@@ -102,7 +103,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.32.1"
+RELEASE = "Mod Lag Watchdog v0.33.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4394,6 +4395,173 @@ def churn_case():
         clean(s, "churn")
 
 
+CRASHER = r"""
+-- A mod that "crashes the game" inside its own update: the native crash
+-- leaves no Lua running, so the test takes the black box as it is at that
+-- moment (what Windows writes to the file) and ends the session there.
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  if CRASH_NOW then
+    BOX_AT_CRASH = {}
+    for k, v in pairs(__hd2_native_test.box) do BOX_AT_CRASH[k] = v end
+    CRASH_NOW = false
+  end
+  return previous(...)
+end)
+"""
+
+BOX_FILE = "mod_lag_finder_box.bin"
+
+
+def box_bytes(words):
+    """The 8 KB file Windows leaves: the box's words, little-endian."""
+    out = bytearray(8192)
+    for k, v in words.items():
+        struct.pack_into("<I", out, int(k) * 4, int(v) & 0xFFFFFFFF)
+    return bytes(out)
+
+
+def fake_dump(path, written, thread, offset):
+    """A minidump with what the black box reads: the header's time, the
+    exception stream (6) and the module list (4)."""
+    base, name = 0x140000000, "helldivers2.exe".encode("utf-16-le")
+    head_size, directory = 32, 32
+    exception_at = directory + 2 * 12
+    modules_at = exception_at + 168
+    name_at = modules_at + 4 + 108
+    d = bytearray(name_at + 4 + len(name))
+    struct.pack_into("<4sIIIII", d, 0, b"MDMP", 0xA793, 2, directory, 0, written)
+    struct.pack_into("<III", d, directory, 6, 168, exception_at)
+    struct.pack_into("<III", d, directory + 12, 4, 4 + 108, modules_at)
+    struct.pack_into("<IIIIQQ", d, exception_at, thread, 0, 0xC0000005, 0, 0, base + offset)
+    struct.pack_into("<I", d, modules_at, 1)
+    struct.pack_into("<QIIII", d, modules_at + 4, base, 0x4000000, 0, 0, name_at)
+    struct.pack_into("<I", d, name_at, len(name))
+    d[name_at + 4:] = name
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(bytes(d))
+
+
+def box_words(s, expr):
+    """A Lua table of words (keys from 0) as a dict."""
+    text = s.eval("(function(t) local o = {} for k, v in pairs(t) do o[#o + 1] = k .. '=' .. "
+                  "string.format('%d', v) end return table.concat(o, ',') end)(" + expr + ")")
+    return {int(a): int(b) for a, b in (part.split("=") for part in (text or "").split(",") if part)}
+
+
+def box_case():
+    """A crash in play (v0.33.0): the black box holds which mod's update was
+    running, and the next launch names it -- "LAST CRASH: the game crashed
+    while <mod> was running" -- when a crash dump written after that session
+    began has its exception on the thread the mods run on. On another thread
+    (the render crashes), with no newer dump (closed by force) or after a
+    clean shutdown, the log says why and nothing shows. Between frames the
+    box says no mod. Fails on v0.32.1 (no box)."""
+    print("black box")
+    dump_name = "dump-2026-10-09-12.00.00-1a2b3c4d-PC-1.dmp"
+
+    def first_game(scratch, crash=True):
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            s.lua("__hd2_native_test = { box = {}, box_thread = 4242 }")
+            load(s, ["std"])
+            check(s.load_mod(source=CRASHER, name="mods/test/crasher"), "crasher loads")
+            load(s, ["heavy", "finder"])
+            s.frames(400)
+            check(bool(log_lines(s, r"black box: on")), "the box is on: %r" % log_lines(s, "black box"))
+            outside = int(s.eval("__hd2_native_test.box[3]"))
+            check(outside == 0, "between frames the box says no mod: %r" % outside)
+            if not crash:
+                s.lua("FAKE.shutdown()")
+                state = int(s.eval("__hd2_native_test.box[2]"))
+                check(state == 2, "a clean shutdown says closed: %r" % state)
+                words = box_words(s, "__hd2_native_test.box")
+                return words[5], words
+            s.lua("CRASH_NOW = true")
+            s.frames(1)
+            words = box_words(s, "BOX_AT_CRASH")
+            raw = box_bytes(words)
+            n = words[8]
+            names = []
+            for i in range(n):
+                base = (64 + i * 24) * 4
+                length = struct.unpack_from("<I", raw, base)[0]
+                names.append(raw[base + 4:base + 4 + length].decode())
+            who = names[words[3] - 3] if words[3] >= 3 else words[3]
+            check(who == "mods/test/crasher" and words[2] == 1 and words[6] == 4242,
+                  "at the crash the box says crasher, running, thread 4242: %r %r" % (who, names))
+            return words[5], words
+
+    def next_game(scratch, words, dump=None):
+        with open(os.path.join(scratch, "Arrowhead", "Helldivers2", BOX_FILE), "wb") as f:
+            f.write(box_bytes(words))
+        if dump is not None:
+            fake_dump(os.path.join(scratch, "Arrowhead", "Helldivers2", "dumps", dump_name), *dump)
+        s = Session(backend=BACKEND, scratch=scratch, keep_scratch=True)
+        s.__enter__()
+        s.lua(CLOCK)
+        s.lua("FAKE.mission()")
+        s.lua(GUI_STUB)
+        s.lua("__hd2_native_test = { box = {}, box_thread = 5151, dump_names = function() return { %r } end }"
+              % (dump_name if dump is not None else "dump-2000-01-01-00.00.00-x-PC-1.dmp"))
+        load(s, ["finder"])
+        return s
+
+    for label, thread, shown in (("on the mods' thread", 4242, True), ("on another thread", 777, False)):
+        scratch = tempfile.mkdtemp(prefix="mlf_box_")
+        try:
+            started, words = first_game(scratch)
+            s = next_game(scratch, words, (started + 30, thread, 0x438087))
+            try:
+                line = last_session(s, r"last crash: the previous session")
+                if shown:
+                    check(len(line) == 1 and re.search(
+                        r"crashed: dump %s at .*exception 0xC0000005 at helldivers2\.exe\+0x438087, thread 4242, "
+                        r"on the mods' thread, in mods/test/crasher$" % re.escape(dump_name), line[0]) is not None,
+                          "%s: the log names the mod: %r" % (label, line))
+                else:
+                    check(len(line) == 1 and line[0].endswith("the mods run on thread 4242, so no mod's update "
+                                                              "was running in it: not shown"),
+                          "%s: logged, not named: %r" % (label, line))
+                s.frames(1500)
+                text = s.eval("SHOWN()")
+                check(("LAST CRASH: the game crashed while crasher was running" in text) == shown,
+                      "%s: %s on the ship: %r" % (label, "shown" if shown else "nothing", text))
+                check(int(s.eval("__hd2_native_test.box[2]")) == 1 and int(s.eval("__hd2_native_test.box[6]")) == 5151,
+                      "%s: the new session's box starts afresh" % label)
+                clean(s, "black box " + label)
+            finally:
+                s.__exit__(None, None, None)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    scratch = tempfile.mkdtemp(prefix="mlf_box_")
+    try:
+        started, words = first_game(scratch)
+        s = next_game(scratch, words, (started - 600, 4242, 0x438087))      # an older dump only
+        try:
+            line = last_session(s, r"last crash: the previous session")
+            check(len(line) == 1 and line[0].endswith("no crash dump was written after it began "
+                                                      "(closed by force?): not shown"),
+                  "no newer dump: logged, not shown: %r" % line)
+            s.frames(1500)
+            check("LAST CRASH" not in s.eval("SHOWN()"), "and nothing on the ship")
+        finally:
+            s.__exit__(None, None, None)
+        started, words = first_game(scratch, crash=False)
+        s = next_game(scratch, words, (started + 30, 4242, 0x438087))
+        try:
+            check(not last_session(s, r"last crash"), "after a clean shutdown, nothing: %r"
+                  % last_session(s, "last crash"))
+        finally:
+            s.__exit__(None, None, None)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -4405,6 +4573,7 @@ def main():
         globals()[sys.argv[sys.argv.index("--only") + 1] + "_case"]()
         sys.exit(1 if FAILURES else 0)
     map_case()
+    box_case()
     retry_case()
     stall_case()
     rehook_case()

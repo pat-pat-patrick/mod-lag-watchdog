@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.32.1"
+local MARKER = "mod-lag-finder-v0.33.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -544,9 +544,15 @@ end
 -- v0.21.0: with the GC probe on (counter.gcp, see "gc probe") each run also
 -- keeps the collector's heap total and its mark (threshold * 8 + state) at
 -- entry and exit: two uint32 reads and a byte, no allocation. Off, they are 0.
+--
+-- v0.33.0: with the black box on (counter.box, see "black box") each run
+-- stores its mod's number in the box on entry and puts the outer one back
+-- on exit: a read and two stores.
 local function make_shim(link, target, handler, counter)
   local gcp = counter.gcp
   local P, B = gcp ~= nil and gcp.p32 or nil, gcp ~= nil and gcp.p8 or nil
+  local W = counter.box
+  local id = W ~= nil and counter.box_id(link.source) or 0
   local function gh() if P == nil then return 0 end return P[8] end
   local function gm() if P == nil then return 0 end return P[9] * 8 + B[41] end
   local function stamp(t0, h0, m0)
@@ -557,23 +563,29 @@ local function make_shim(link, target, handler, counter)
       link.last_eh, link.last_em, link.last_xh, link.last_xm
     link.last_eh, link.last_em, link.last_xh, link.last_xm = h0, m0, gh(), gm()
   end
-  local function finish(t0, h0, m0, ...)
+  local function finish(outer, t0, h0, m0, ...)
+    if W ~= nil then W[3] = outer end
     stamp(t0, h0, m0)
     return ...
   end
   local shim
   if handler == nil then
     shim = function(...)
-      return finish(timer_now(), gh(), gm(), target(...))
+      local outer = nil
+      if W ~= nil then outer, W[3] = W[3], id end
+      return finish(outer, timer_now(), gh(), gm(), target(...))
     end
   else
-    local function settle_up(t0, h0, m0, ok, ...)
+    local function settle_up(outer, t0, h0, m0, ok, ...)
+      if W ~= nil then W[3] = outer end
       stamp(t0, h0, m0)
       if ok then return ... end
       error((...), 0)
     end
     shim = function(...)
-      return settle_up(timer_now(), gh(), gm(), xpcall(target, handler, ...))
+      local outer = nil
+      if W ~= nil then outer, W[3] = W[3], id end
+      return settle_up(outer, timer_now(), gh(), gm(), xpcall(target, handler, ...))
     end
   end
   ours[shim] = target
@@ -4021,6 +4033,7 @@ local function display(at)
      (not units.installed or (units.world ~= nil and units.candidate == nil and
                               at - (units.world_since or at) >= 10)) then
     local text = note.startup and ("LAST CRASH: the game closed while " .. short_name(note.key) .. " was loading")
+                 or note.native and ("LAST CRASH: the game crashed while " .. short_name(note.key) .. " was running")
                  or string.sub(note.key, 1, 1) == "(" and "LAST CRASH: a Lua error outside every mod"
                  or ("LAST CRASH: " .. (note.name or short_name(note.key)) .. " raised a Lua error")
     if ui.alert({ text = text, until_at = at + 12, colour = AMBER, keep = true, always = true }) then
@@ -4317,6 +4330,11 @@ local function tick(failed)
     end
     tops[owner(links[1])] = true
   end
+  -- v0.33.0: and for the black box, the mod on top that no shim times.
+  if installed.box ~= nil then
+    local top = links[1]
+    installed.box[7] = (mapped and top ~= nil and top.fn ~= installed.wrapper) and installed.box_id(top.source) or 0
+  end
 
   if last_tick_time ~= nil then
     local interval = at - last_tick_time
@@ -4582,6 +4600,12 @@ local function arm()
       end
     end
     local function run_tick(failed)
+      local W = installed.box
+      local outer = nil
+      if W ~= nil then
+        outer, W[3] = W[3], installed.box_self or 2
+        if installed.box_thread ~= nil then W[6] = installed.box_thread() end
+      end
       local started = now()
       local ok_tick, err = pcall(tick, failed)
       installed.tick_cost = now() - started
@@ -4592,9 +4616,11 @@ local function arm()
         installed.told_tick = true
         say("tick error: " .. tostring(err))
       end
+      if W ~= nil then W[3] = outer end
     end
-    local function after(ok, ...)
+    local function after(outer, ok, ...)
       installed.depth = 0
+      if installed.box ~= nil then installed.box[3] = outer end
       if installed.generation == generation then run_tick(not ok or installed.frame_failed) end
       if installed.gcp ~= nil then pcall(installed.gc_frame_out) end
       if ok then return ... end
@@ -4621,12 +4647,18 @@ local function arm()
       installed.last_tick_at = clock()
       installed.tick_calls = installed.mw_calls
       installed.depth = 1
+      -- v0.33.0: in the update, in no timed mod until a shim says which.
+      local W, outer = installed.box, nil
+      if W ~= nil then
+        outer, W[3] = W[3], 2
+        W[4] = installed.frame_id % 4294967296
+      end
       if installed.gcp ~= nil then pcall(installed.gc_frame_in) end
       if installed.xpcall_args then
-        return after(xpcall(previous_update, on_error, ...))
+        return after(outer, xpcall(previous_update, on_error, ...))
       end
       local n, args = select("#", ...), { ... }
-      return after(xpcall(function() return previous_update(unpack_fn(args, 1, n)) end, on_error))
+      return after(outer, xpcall(function() return previous_update(unpack_fn(args, 1, n)) end, on_error))
     end
     -- The slot our own previous lives in, found by name in our own closure.
     installed.previous_slot = nil
@@ -4669,9 +4701,16 @@ local function arm()
   -- times at exit); the flag keeps any copy from doing it twice.
   if type(current_shutdown) == "function" and installed.shutdown_wrapper == nil then
     local previous_shutdown = current_shutdown
+    -- v0.33.0: the black box says closing, then closed once the game's own
+    -- shutdown (and every mod's) has returned.
+    local function closed(...)
+      if installed.box ~= nil then installed.box[2] = 2 end
+      return ...
+    end
     local wrapper = function(...)
       if installed.shutdown_done then return previous_shutdown(...) end
       installed.shutdown_done = true
+      if installed.box ~= nil then installed.box[2] = 3 end
       pcall(function()
         if installed.clear_crash then installed.clear_crash() end
         write_summary(now())
@@ -4679,11 +4718,260 @@ local function arm()
         say("shutdown")
         flush_log()
       end)
-      return previous_shutdown(...)
+      return closed(previous_shutdown(...))
     end
     installed.shutdown_wrapper = wrapper
     rawset(_G, "shutdown", wrapper)
   end
+end
+
+-- ------------------------------------------------------------ black box
+
+-- v0.33.0 (the user, 2026-10-09: name the mod behind a crash in play, not
+-- only behind a Lua error). A native crash -- the engine reading a bad
+-- pointer a mod's call handed it -- ends the process at once: no Lua runs
+-- and nothing is written. So this module keeps, at every moment, which
+-- mod's update runs, in 8 KB of memory mapped from mod_lag_finder_box.bin.
+-- A store there is the file's content, and Windows writes it to disk even
+-- when the process dies, since the pages belong to the file, not the process
+-- (proven offline 2026-10-09, watchdog_box_crash_check.py: a process that
+-- stores and then fails fast, no handler running, leaves the words in the
+-- file). Each timing shim stores its mod's number on entry and puts the
+-- outer one back on exit: no allocation, no file I/O.
+--
+-- Words (uint32): 0 magic, 1 layout, 2 state (1 running, 2 closed, 3
+-- closing), 3 who runs (0 not in the update, 2 in the update but in no timed
+-- mod, 3 and up a mod; this module's own tick is its own number), 4 frame,
+-- 5 start (os.time), 6 the thread the mods run on, 7 the mod on top that no
+-- shim times (0 none), 8 how many names; from word 64, 24 words a name: its
+-- length, then its bytes, 4 a word. A name is written before the count that
+-- makes it readable.
+--
+-- The next launch reads the file before mapping it again. A session that
+-- never closed, with a crash dump written after it started, crashed. The
+-- dump's exception stream says on which thread: only a crash on the thread
+-- the mods run on, inside a timed mod, names that mod. A crash on any other
+-- thread happened while the main thread was wherever it was, and naming the
+-- mod there would be a guess (proven on the 103 dumps of 2026-10-04..09: the
+-- 14 with Lua on the faulting thread were all on the first thread, the 74
+-- render crashes at +0x626296 all on another). In game the thread is
+-- GetCurrentThreadId on every tick: the thread every mod's update runs on.
+-- (Inside a function: the main chunk is at Lua's 200-locals limit.)
+installed.box_setup = function(log_file)
+  local BOX_WORDS, NAMES, SLOT, MAX_NAMES, MAGIC = 2048, 64, 24, 80, 0x584F424D
+  local box_path = string.gsub(log_file, "mod_lag_finder%.log$", "mod_lag_finder_box.bin")
+  local dumps = string.gsub(log_file, "\\mod_lag_finder%.log$", "\\dumps")
+  local function word(bytes, index)
+    if type(bytes) ~= "string" then return nil end
+    local a, b, c, d = string.byte(bytes, index * 4 + 1, index * 4 + 4)
+    if d == nil then return nil end
+    return a + b * 256 + c * 65536 + d * 16777216
+  end
+
+  -- The last session's box, read before this one maps the file again.
+  local before = read_all(box_path)
+  if before ~= nil and #before >= NAMES * 4 and word(before, 0) == MAGIC and word(before, 1) == 1 then
+    local prev = { state = word(before, 2), who = word(before, 3), frame = word(before, 4),
+                   start = word(before, 5), thread = word(before, 6), top = word(before, 7), names = {} }
+    for n = 1, math.min(word(before, 8) or 0, MAX_NAMES) do
+      local base = NAMES + (n - 1) * SLOT
+      local length = word(before, base)
+      if length == nil or length > (SLOT - 1) * 4 then break end
+      prev.names[n + 2] = string.sub(before, (base + 1) * 4 + 1, (base + 1) * 4 + length)
+    end
+    installed.box_prev = prev
+  end
+
+  -- The memory: a test hands a table (the __hd2_native_test seam, as for
+  -- the timer); the game maps the file.
+  local W, thread, ffi, kernel
+  local seam = rawget(_G, "__hd2_native_test")
+  if type(seam) == "table" then
+    if type(seam.box) ~= "table" then return "off (a test without a box)" end
+    W, thread = seam.box, tonumber(seam.box_thread) or 0
+  else
+    local loader = rawget(_G, "require")
+    if type(loader) ~= "function" then return "off (no require)" end
+    local ok, lib = pcall(loader, "ffi")
+    if not ok or type(lib) ~= "table" then return "off (no ffi)" end
+    ffi = lib
+    for _, decl in ipairs({
+        "void *CreateFileA(const char *name, uint32_t access, uint32_t share, void *security," ..
+          " uint32_t disposition, uint32_t flags, void *template);",
+        "void *CreateFileMappingA(void *file, void *security, uint32_t protect, uint32_t high," ..
+          " uint32_t low, const char *name);",
+        "void *MapViewOfFile(void *mapping, uint32_t access, uint32_t high, uint32_t low, size_t size);",
+        "uint32_t GetCurrentThreadId(void);",
+        "void *FindFirstFileA(const char *pattern, void *data);",
+        "int FindNextFileA(void *find, void *data);",
+        "int FindClose(void *find);" }) do
+      pcall(ffi.cdef, decl)
+    end
+    kernel = ffi.load("kernel32")
+    local create = ffi.cast("void *(*)(const char *, uint32_t, uint32_t, void *, uint32_t, uint32_t, void *)",
+                            kernel.CreateFileA)
+    local mapping_of = ffi.cast("void *(*)(void *, void *, uint32_t, uint32_t, uint32_t, const char *)",
+                                kernel.CreateFileMappingA)
+    local view_of = ffi.cast("void *(*)(void *, uint32_t, uint32_t, uint32_t, size_t)", kernel.MapViewOfFile)
+    -- Read and write, shared, opened or created; PAGE_READWRITE; FILE_MAP_WRITE.
+    local file = create(box_path, 0xC0000000, 3, nil, 4, 0x80, nil)
+    if file == nil or tonumber(ffi.cast("intptr_t", file)) == -1 then return "off (the file did not open)" end
+    local mapping = mapping_of(file, nil, 4, 0, BOX_WORDS * 4, nil)
+    if mapping == nil then return "off (no mapping)" end
+    local view = view_of(mapping, 2, 0, 0, BOX_WORDS * 4)
+    if view == nil then return "off (no view)" end
+    -- Kept for the whole session: a collected ffi.load unloads the DLL, and
+    -- the handles stay open until the process ends.
+    installed.box_keep = { ffi = ffi, kernel = kernel, file = file, mapping = mapping, view = view }
+    W = ffi.cast("uint32_t *", view)
+    -- Taken again on every tick (a read of the thread block, no system
+    -- call): the thread the mods' updates run on, not the one that loaded us.
+    local current = ffi.cast("uint32_t (*)(void)", kernel.GetCurrentThreadId)
+    installed.box_keep.thread = current
+    installed.box_thread = function() return current() end
+    thread = tonumber(current())
+  end
+  local ok_now, started = pcall(os.time)
+  W[8], W[7], W[4], W[3], W[2], W[1] = 0, 0, 0, 0, 1, 1
+  W[5], W[6] = ok_now and tonumber(started) or 0, thread
+  W[0] = MAGIC
+
+  local ids, count = {}, 0
+  installed.box_id = function(key)
+    key = tostring(key or "?")
+    local id = ids[key]
+    if id ~= nil then return id end
+    if count >= MAX_NAMES then return 2 end
+    local text = string.sub(key, 1, (SLOT - 1) * 4)
+    local base = NAMES + count * SLOT
+    for index = 0, SLOT - 2 do
+      local a, b, c, d = string.byte(text, index * 4 + 1, index * 4 + 4)
+      W[base + 1 + index] = (a or 0) + (b or 0) * 256 + (c or 0) * 65536 + (d or 0) * 16777216
+    end
+    W[base] = #text
+    count = count + 1
+    W[8] = count
+    id = count + 2
+    ids[key] = id
+    return id
+  end
+  installed.box = W
+
+  -- The newest crash dump (dump-<process start>-....dmp sorts by time).
+  local function newest_dump()
+    local names = {}
+    if type(seam) == "table" then
+      if type(seam.dump_names) == "function" then names = seam.dump_names() or {} end
+    else
+      local first = ffi.cast("void *(*)(const char *, void *)", kernel.FindFirstFileA)
+      local next_file = ffi.cast("int (*)(void *, void *)", kernel.FindNextFileA)
+      local close = ffi.cast("int (*)(void *)", kernel.FindClose)
+      local data = ffi.new("uint8_t[640]")          -- WIN32_FIND_DATAA (320 bytes); the name at +44
+      local find = first(dumps .. "\\dump-*.dmp", data)
+      if find == nil or tonumber(ffi.cast("intptr_t", find)) == -1 then return nil end
+      repeat
+        names[#names + 1] = ffi.string(data + 44)
+      until #names >= 5000 or next_file(find, data) == 0
+      close(find)
+    end
+    local best = nil
+    for _, name in ipairs(names) do
+      if type(name) == "string" and (best == nil or name > best) then best = name end
+    end
+    return best
+  end
+
+  -- From a minidump: when it was written (header), the exception's thread,
+  -- code and address, and the module and offset the address is in.
+  local function read_dump(path)
+    local file = io.open(path, "rb")
+    if file == nil then return nil end
+    local function at(offset, size)
+      file:seek("set", offset)
+      return file:read(size)
+    end
+    local ok, dump = pcall(function()
+      local head = at(0, 32)
+      if type(head) ~= "string" or string.sub(head, 1, 4) ~= "MDMP" then return nil end
+      local streams, directory = word(head, 2), word(head, 3)
+      local found = { written = word(head, 5) }
+      local list = at(directory, streams * 12)
+      local exception, modules
+      for index = 0, streams - 1 do
+        local kind, where = word(list, index * 3), word(list, index * 3 + 2)
+        if kind == 6 then exception = where elseif kind == 4 then modules = where end
+      end
+      if exception == nil then return nil end
+      local record = at(exception, 32)
+      found.thread, found.code = word(record, 0), word(record, 2)
+      found.address = word(record, 6) + word(record, 7) * 4294967296
+      if modules ~= nil then
+        for index = 0, math.min(word(at(modules, 4), 0) or 0, 2000) - 1 do
+          local entry = at(modules + 4 + index * 108, 24)
+          local base = word(entry, 0) + word(entry, 1) * 4294967296
+          if found.address >= base and found.address < base + word(entry, 2) then
+            local name_at = word(entry, 5)
+            local wide = at(name_at + 4, math.min(word(at(name_at, 4), 0) or 0, 520)) or ""
+            local name = string.gsub(wide, "%z", "")
+            found.module = string.match(name, "([^\\/]+)$") or name
+            found.offset = found.address - base
+            break
+          end
+        end
+      end
+      return found
+    end)
+    file:close()
+    if ok then return dump end
+    return nil
+  end
+
+  -- Called once the Lua-error file and the loader's loading crash have had
+  -- their say: either one names the last crash better.
+  installed.box_judge = function()
+    local prev = installed.box_prev
+    installed.box_prev = nil
+    if prev == nil or prev.state == 2 then return end
+    local started = local_time(prev.start)
+    if prev.frame == 0 then
+      say(string.format("last crash: the previous session (%s) ended before its first frame (see the loader's log)",
+                        started))
+      return
+    end
+    local function name(id)
+      return prev.names[id] or (id == 2 and "(the update, in no timed mod)") or (id == 0 and "(no mod)")
+             or ("#" .. tostring(id))
+    end
+    local doing = string.format("%s, frame %d, %s", started, prev.frame,
+                                prev.state == 3 and "while closing" or ("running " .. name(prev.who)))
+    local newest = newest_dump()
+    local dump = newest ~= nil and read_dump(dumps .. "\\" .. newest) or nil
+    if dump == nil or dump.written == nil or dump.written < prev.start then
+      say(string.format("last crash: the previous session (%s) never closed, and no crash dump was written " ..
+                        "after it began (closed by force?): not shown", doing))
+      return
+    end
+    local where = dump.module ~= nil and string.format("%s+0x%X", dump.module, dump.offset)
+                  or string.format("0x%X", dump.address or 0)
+    local text = string.format("the previous session (%s) crashed: dump %s at %s, exception 0x%08X at %s, thread %d",
+                               doing, newest, local_time(dump.written), dump.code or 0, where, dump.thread or 0)
+    if dump.thread ~= prev.thread then
+      say("last crash: " .. text .. "; the mods run on thread " .. tostring(prev.thread) ..
+          ", so no mod's update was running in it: not shown")
+    elseif prev.state ~= 3 and prev.who >= 3 and prev.names[prev.who] ~= nil and
+           not is_mod_source(prev.names[prev.who]) then
+      -- The bottom link: the game's own update script, not a mod.
+      say("last crash: " .. text .. ", on the mods' thread, in the game's own update (" ..
+          prev.names[prev.who] .. "): not shown")
+    elseif prev.state ~= 3 and prev.who >= 3 and prev.names[prev.who] ~= nil then
+      say("last crash: " .. text .. ", on the mods' thread, in " .. prev.names[prev.who])
+      ui.crash_note = { key = prev.names[prev.who], native = true }
+    else
+      say("last crash: " .. text .. ", on the mods' thread but in no timed mod" ..
+          (prev.top >= 3 and ("; on top, not timed: " .. name(prev.top)) or "") .. ": not shown")
+    end
+  end
+  return "on (mod_lag_finder_box.bin)"
 end
 
 local function main()
@@ -4702,6 +4990,12 @@ local function main()
     say(string.format("cannot work here: debug.getupvalue=%s setupvalue=%s getinfo=%s os.clock=%s",
                       type(getupvalue), type(setupvalue), type(getinfo), type(os_clock)))
     return
+  end
+  if log_path ~= nil then
+    local ok_box, told = pcall(installed.box_setup, log_path)
+    if not ok_box then installed.box = nil end
+    if installed.box ~= nil then installed.box_self = installed.box_id(source_of(main)) end
+    say("black box: " .. (ok_box and tostring(told) or ("off (" .. tostring(told) .. ")")))
   end
   -- Not armed here: the first main_world call or the first frame arms it,
   -- above every mod that hooked update while loading. The top link's own
@@ -4812,6 +5106,15 @@ local function main()
                           "after it began: not shown", started, loading))
       end
     end)
+  end
+  -- v0.33.0: a crash in play, from the black box.
+  if installed.box_judge ~= nil then
+    if ui.crash_note == nil then
+      local ok_judge, err = pcall(installed.box_judge)
+      if not ok_judge then say("last crash: the black box could not be read: " .. tostring(err)) end
+    else
+      installed.box_prev = nil
+    end
   end
   local ok_gpu, gpu_told = pcall(gpu.open)
   if not ok_gpu then gpu.read = nil end
