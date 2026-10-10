@@ -103,7 +103,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.34.0"
+RELEASE = "Mod Lag Watchdog v0.35.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4563,13 +4563,49 @@ def box_case():
 
 
 PAINTER = r"""
--- A mod that does its work in _G.render (as HUD Ballistic Trajectory
--- Overlay v9 does): 4 ms a frame, 300 ms once when PAINT_STALL is set.
-local prev = rawget(_G, "render")
+-- A mod that does its work in _G.render, as HUD Ballistic Trajectory
+-- Overlay v9 does: 4 ms a frame, 300 ms once when PAINT_STALL is set. Like
+-- BTO it also holds a helper that render calls with the update's dt.
+local original_render = rawget(_G, "render")
+local state = { dt = 0 }
+local function update_overlay(dt) CLOCK = CLOCK + 0.001 end
+local previous_update = rawget(_G, "update")
+rawset(_G, "update", function(dt, ...)
+  state.dt = dt
+  return previous_update(dt, ...)
+end)
 rawset(_G, "render", function(...)
-  CLOCK = CLOCK + (PAINT_STALL and 0.3 or 0.004)
+  update_overlay(state.dt)
+  CLOCK = CLOCK + (PAINT_STALL and 0.3 or 0.003)
   PAINT_STALL = false
-  return prev(...)
+  return original_render(...)
+end)
+"""
+
+LATECAM = r"""
+-- As ActionCam 2.3.1 does: hooks render from its first update (so above the
+-- Watchdog), and pcalls two helpers with no arguments before passing on.
+local counts = { render = 0 }
+local H = {}
+local function apply() CLOCK = CLOCK + 0.001 end
+function H.flicker_watch() end
+local hooked = false
+local function hook_render()
+  if hooked then return end
+  local previous = rawget(_G, "render")
+  if type(previous) ~= "function" then return end
+  hooked = true
+  render = function(...)
+    counts.render = counts.render + 1
+    pcall(apply)
+    pcall(H.flicker_watch)
+    return previous(...)
+  end
+end
+local previous_update = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  if LATECAM_ON then hook_render() end
+  return previous_update(...)
 end)
 """
 
@@ -4580,60 +4616,90 @@ FAKE.on_frame = function() local r = rawget(_G, "render") if r then r() end end
 """
 
 
+def render_minute(s):
+    line = log_lines(s, r"^t=[\d.]+   render: ")
+    return line[-1] if line else ""
+
+
 def render_case():
-    """Render time (v0.34.0): a mod working in _G.render, where no shim
-    times anything, gets one row "render: <mods>" with its ms/s, and a
-    stall in render is named "LAG ... - render: <mod>". When the Watchdog
-    loads first, the game's own render is timed apart; when the mod hooked
-    render before it, the row says "render+game:". With no render function
-    there is no row. Fails on v0.33.0 (render not timed)."""
+    """Render time (v0.35.0): the render chain is mapped link by link, so a
+    mod working in _G.render (as BTO v9 does) has that time in its own row,
+    the game's own render is timed apart in any load order, and a stall in
+    render is named after its mod. A mod that hooks render later, above the
+    Watchdog (as ActionCam does from its first update), becomes the new top
+    and is timed too; one that pcalls helpers with render's arguments is not
+    taken for the link below. Fails on v0.33.0 (render not timed) and
+    v0.34.0 (one row for all of render)."""
     print("render")
+    for order in ("after", "before"):
+        with session() as s:
+            s.lua(GUI_STUB)
+            s.lua(GAME_RENDER)
+            if order == "before":
+                check(s.load_mod(source=PAINTER, name="mods/test/painter"), "painter loads (before the Watchdog)")
+            load(s, ["std", "finder"])
+            if order == "after":
+                check(s.load_mod(source=PAINTER, name="mods/test/painter"), "painter loads (after the Watchdog)")
+            s.frames(3700)
+            check(bool(log_lines(s, r"render chain: #1 mods/test/painter calls =scenario \(via original_render\)")),
+                  "%s: the walk finds the game's render below it, not the helper: %r"
+                  % (order, log_lines(s, "render chain")))
+            check(bool(log_lines(s, r"render chain: mapped, 2 links, down to the game's own render")),
+                  "%s: the chain is mapped: %r" % (order, log_lines(s, "render chain")))
+            m = re.search(r"render: mods/test/painter ([\d.]+) ms/s \(worst ([\d.]+) ms\), \(the game\) ([\d.]+) ms/s",
+                          render_minute(s))
+            check(m is not None and 150 <= float(m.group(1)) <= 260 and 3.5 <= float(m.group(2)) <= 4.5
+                  and 5 <= float(m.group(3)) <= 15 and "all below" not in render_minute(s),
+                  "%s: the minute line: painter ~200 ms/s, worst 4 ms, the game's own ~10 ms/s: %r"
+                  % (order, render_minute(s)))
+            s.lua("FAKE.press('home')")
+            s.frames(3)
+            shown = s.eval("SHOWN()")
+            row = re.search(r"\npainter\s+([\d.]+)\s+(\d+) ms|^painter\s+([\d.]+)|\|painter\s+([\d.]+)", shown)
+            value = row and float(next(g for g in row.groups() if g)) or 0
+            check(150 <= value <= 260 and "render" not in shown,
+                  "%s: its render time is in its own row, no render row: %r" % (order, shown))
+            if order == "after":
+                s.lua("PAINT_STALL = true")
+                s.frames(4)
+                shown = s.eval("SHOWN()")
+                check(re.search(r"LAG 3\d\d ms - painter", shown) is not None,
+                      "a stall in render is named after its mod: %r" % shown)
+                hitch = log_lines(s, r"hitch 3\d\d ms")
+                check(bool(hitch) and re.search(r"mods/test/painter \(render\) 30\d", hitch[-1]) is not None
+                      and int(re.search(r"not explained (\d+) ms", hitch[-1]).group(1)) < 50,
+                      "the stall line puts it on the mod's render part: %r" % hitch[-1:])
+                small = [l for l in log_lines(s, r"hitch ") if "(render) 0" in l]
+                check(not small, "no render part under 1 ms in a stall line: %r" % small[:2])
+            clean(s, "render " + order)
     with session() as s:
         s.lua(GUI_STUB)
         s.lua(GAME_RENDER)
+        check(s.load_mod(source=LATECAM, name="mods/test/latecam"), "latecam loads")
         load(s, ["std", "finder"])
-        check(s.load_mod(source=PAINTER, name="mods/test/painter"), "painter loads (after the Watchdog)")
-        s.frames(3700)                                         # a minute summary
-        check(bool(log_lines(s, r"render at load: the game's own render \(.*\) timed apart")),
-              "the game's own render is timed apart: %r" % log_lines(s, "render at load"))
-        check(bool(log_lines(s, r"render: on; hooked by mods/test/painter$")),
-              "the render chain is wrapped and its mod found: %r" % log_lines(s, r"render: on"))
-        line = log_lines(s, r"  render: mods [\d.]+ ms/s")
-        m = re.search(r"render: mods ([\d.]+) ms/s, worst frame ([\d.]+) ms \(mods/test/painter\); "
-                      r"the game's own render ([\d.]+) ms/s", line[-1] if line else "")
-        check(m is not None and 150 <= float(m.group(1)) <= 260 and 3.5 <= float(m.group(2)) <= 4.5
-              and 5 <= float(m.group(3)) <= 15,
-              "the minute line: the mod ~200 ms/s, worst 4 ms, the game's own ~10 ms/s: %r" % line[-1:])
-        s.lua("FAKE.press('home')")
-        s.frames(3)
-        shown = s.eval("SHOWN()")
-        row = re.search(r"render: painter\s+([\d.]+)\s+(\d+) ms", shown)
-        check(row is not None and 150 <= float(row.group(1)) <= 260,
-              "one row for it in the table: %r" % shown)
-        s.lua("PAINT_STALL = true")
-        s.frames(4)
-        shown = s.eval("SHOWN()")
-        check(re.search(r"LAG 3\d\d ms - render: painter", shown) is not None,
-              "a stall in render is named: %r" % shown)
-        hitch = log_lines(s, r"hitch 3\d\d ms")
-        check(bool(hitch) and re.search(r"render: painter 3\d\d ms; this module", hitch[-1]) is not None
-              and int(re.search(r"not explained (\d+) ms", hitch[-1]).group(1)) < 50,
-              "the stall line puts it on render, not 'not explained': %r" % hitch[-1:])
-        clean(s, "render")
+        check(s.load_mod(source=PAINTER, name="mods/test/painter"), "painter loads")
+        s.frames(120)
+        s.lua("LATECAM_ON = true")
+        s.frames(3700)
+        check(bool(log_lines(s, r"render chain: mods/test/latecam hooked render above this module; timed as the new top")),
+              "a hook above ours becomes the new top: %r" % log_lines(s, "render chain"))
+        m = re.search(r"mods/test/latecam ([\d.]+) ms/s", render_minute(s))
+        p2 = re.search(r"mods/test/painter ([\d.]+) ms/s", render_minute(s))
+        check(m is not None and 35 <= float(m.group(1)) <= 70 and p2 is not None and 150 <= float(p2.group(1)) <= 260
+              and "mapped, 3 links" in render_minute(s) and "all below" not in render_minute(s),
+              "each mod gets its own render time (latecam ~50, painter ~200): %r" % render_minute(s))
+        clean(s, "render, a hook above")
     with session() as s:
         s.lua(GUI_STUB)
         s.lua(GAME_RENDER)
-        check(s.load_mod(source=PAINTER, name="mods/test/painter"), "painter loads (before the Watchdog)")
+        check(s.load_mod(source=LATECAM, name="mods/test/latecam"), "latecam loads")
+        s.lua("LATECAM_ON = true")
+        s.frames(2)                                            # latecam hooks before the Watchdog arms
         load(s, ["std", "finder"])
-        s.frames(300)
-        check(bool(log_lines(s, r"render at load: render already hooked at load \(mods/test/painter\)")),
-              "hooked before us: not timed apart, and said: %r" % log_lines(s, "render at load"))
-        s.lua("FAKE.press('home')")
-        s.frames(3)
-        shown = s.eval("SHOWN()")
-        check(re.search(r"render\+game: painter\s+[\d.]+", shown) is not None,
-              "the row says the game's own render is in it: %r" % shown)
-        clean(s, "render, hooked first")
+        s.frames(600)
+        check(bool(log_lines(s, r"render chain: #1 mods/test/latecam calls =scenario \(via previous\)")),
+              "pcalled helpers with render's arguments are not the link below: %r" % log_lines(s, "render chain"))
+        clean(s, "render, pcalled helpers")
     with session() as s:
         s.lua(GUI_STUB)
         load(s, ["std", "finder"])
@@ -4641,7 +4707,7 @@ def render_case():
         s.lua("FAKE.press('home')")
         s.frames(3)
         check("render" not in s.eval("SHOWN()") and len(log_lines(s, r"render: off \(no render function\)")) == 1,
-              "no render function: no row, said once: %r" % log_lines(s, "render"))
+              "no render function: nothing shown, said once: %r" % log_lines(s, "render"))
         clean(s, "no render")
 
 

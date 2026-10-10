@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.34.0"
+local MARKER = "mod-lag-finder-v0.35.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3670,19 +3670,6 @@ local function panel_lines(at)
       for key in pairs(bucket.tops) do unmeasured[key] = (unmeasured[key] or 0) + span end
     end
   end
-  -- v0.34.0: the mods' render time, as one row (see "render").
-  local rt = installed.rt
-  if rt ~= nil and rt.wrapper ~= nil and #rt.mods > 0 and seconds > 0 then
-    local r = { time = 0, worst = 0 }
-    for _, bucket in ipairs(buckets) do
-      if bucket.render ~= nil then
-        r.time = r.time + bucket.render.time
-        if bucket.render.worst > r.worst then r.worst = bucket.render.worst end
-      end
-    end
-    rows[#rows + 1] = { key = "\0render", row = r, mss = r.time * 1000 / math.max(seconds, 0.001),
-                        label = installed.render_label(28) }
-  end
   for key, row in pairs(merged) do
     local measured = seconds - (unmeasured[key] or 0)
     if measured >= 1 or unmeasured[key] == nil then
@@ -3739,7 +3726,7 @@ local function panel_lines(at)
         shown = shown + 1
         local tint = (r.row.worst * 1000 >= TOAST_MS or per_second >= AMBER_MSS) and AMBER or WHITE
         if all and tint == WHITE and per_second < QUIET_MSS then tint = GREY end
-        local label = r.label or r.in_play and (string.sub(short_name(r.key), 1, 18) .. " (in play)")
+        local label = r.in_play and (string.sub(short_name(r.key), 1, 18) .. " (in play)")
                       or string.sub(short_name(r.key), 1, 28)
         out[#out + 1] = { string.format("%-28s %8.1f %6s ms", label, per_second, ms(r.row.worst)), tint, r.key }
       end
@@ -4011,8 +3998,6 @@ local function handle_mouse()
             say(ui.alerts_off and "alerts off in missions (menu switch)" or "alerts on in missions (menu switch)")
           elseif row.key == "\0mod list" then
             pcall(installed.export_mod_list, now())
-          elseif row.key == "\0render" then
-            -- v0.34.0: the render row has no report of its own.
           else
             pcall(export_report, row.key, now())
           end
@@ -4176,11 +4161,13 @@ end
 local function report(hitch, frame_selfs)
   local sorted, explained = {}, 0
   if frame_selfs ~= nil then sorted, explained = ranked(frame_selfs) end
-  -- v0.34.0: the mods' render time in this frame (see "render").
-  local render = hitch.render or 0
-  local render_who = nil
-  if render > 0 and installed.rt ~= nil and #installed.rt.mods > 0 then
-    render_who = installed.render_label(60)
+  -- v0.35.0: the render parts of this frame join the ranking (see "render").
+  if hitch.render ~= nil then
+    for k, part in ipairs(hitch.render) do
+      sorted[#sorted + 1] = { index = -300 - k, entry = part }
+      explained = explained + part.own
+    end
+    table.sort(sorted, function(a, b) return a.entry.own > b.entry.own end)
   end
 
   if hitch.interval * 1000 >= TOAST_MS then
@@ -4192,11 +4179,6 @@ local function report(hitch, frame_selfs)
       -- again. Not charged to the mod that happened to be running.
       last_stall = { ms = hitch.interval, cause = "a LuaJIT cache flush", at = at }
       ui.alert({ text = string.format("LAG %s ms - LuaJIT cache flush", ms(hitch.interval)),
-                 until_at = at + TOAST_S })
-    elseif render_who ~= nil and render >= hitch.interval * TOAST_SHARE and
-           (first == nil or render > first.entry.own) then
-      last_stall = { ms = hitch.interval, who = render_who, at = at }
-      ui.alert({ text = string.format("LAG %s ms - %s", ms(hitch.interval), render_who),
                  until_at = at + TOAST_S })
     elseif first ~= nil and first.entry.own >= hitch.interval * TOAST_SHARE then
       local who = short_name(owner(first.entry.link))
@@ -4224,7 +4206,7 @@ local function report(hitch, frame_selfs)
   local parts = {}
   for k = 1, math.min(3, #sorted) do
     local s = sorted[k]
-    parts[#parts + 1] = owner(s.entry.link) .. " " .. ms(s.entry.own)
+    parts[#parts + 1] = owner(s.entry.link) .. (s.entry.link.render and " (render)" or "") .. " " .. ms(s.entry.own)
   end
   local heap = ""
   if hitch.heap ~= nil then
@@ -4239,10 +4221,9 @@ local function report(hitch, frame_selfs)
   else
     local mine = hitch.mine or 0
     local unmeasured_mine = (our_index == 1) and mine or 0
-    local in_render = render_who ~= nil and string.format("; %s %s ms", render_who, ms(render)) or ""
-    body = table.concat(parts, ", ") .. in_render ..
+    body = table.concat(parts, ", ") ..
            string.format("; this module %s ms; not explained %s ms (top %s, outside update)",
-                         ms(mine), ms(math.max(0, hitch.interval - explained - unmeasured_mine - render)),
+                         ms(mine), ms(math.max(0, hitch.interval - explained - unmeasured_mine)),
                          links[1].source)
   end
   if frame_selfs ~= nil and installed.gcw.note ~= nil
@@ -4381,7 +4362,7 @@ local function tick(failed)
       pending = { interval = interval, dt = frame_dt, heap = heap, heap_drop = drop,
                   jit_flush = installed.jit_flush_at ~= nil and at - installed.jit_flush_at <= 1.0,
                   mapped = mapped, mine = installed.tick_cost or 0,
-                  render = installed.rt ~= nil and installed.rt.last or 0 }
+                  render = installed.rt ~= nil and installed.render_parts() or nil }
     end
   end
   last_tick_time = at
@@ -4726,7 +4707,7 @@ local function arm()
     -- v0.34.0: the render chain, once (see "render").
     if not installed.render_tried then
       installed.render_tried = true
-      local ok_render, told = pcall(installed.render_setup, "arm")
+      local ok_render, told = pcall(installed.render_setup)
       if not ok_render or told ~= nil then
         say("render: " .. (ok_render and tostring(told) or ("failed: " .. tostring(told))))
       end
@@ -4766,142 +4747,255 @@ end
 -- ------------------------------------------------------------ render
 
 -- v0.34.0 (the user, 2026-10-10). HUD Ballistic Trajectory Overlay (BTO) v9
--- does its trajectory work in _G.render, where no shim times anything, so
--- its row showed only the 3-5 ms/s of its update part. This is the simple
--- version: one timer around the whole render chain, and one around the
--- game's own render when this module loads before any mod wraps it. The
--- difference is the mods' render time. It shows as one row, "render: <mods>",
--- and in the stall lines.
--- The game's own render Lua should be small: HD2 does not draw its world
--- through Lua (Application.render_world never fired, night vision probe
--- v0.2.0). When it could not be timed apart, the row is "render+game:".
--- Which mods: the mods/ functions reachable from the render top through
--- upvalues (a walk of at most 300 functions, done again once a minute).
--- A hook that comes above ours later is logged, but not timed and not
--- wrapped over: two re-armers escalate.
--- While a render hook runs, the black box holds that mod's number when only
--- one mod hooks render, else 2; inside the game's own render it holds 0.
-installed.render_setup = function(phase)
+-- does its trajectory work in _G.render, where no shim timed anything, so its
+-- row showed only the 3-5 ms/s of its update part. v0.34.0 timed the render
+-- chain as one row. The first game with it showed two mods there, ActionCam
+-- and BTO, cut to "render+game: ActionCam, Over" (28 characters), with the
+-- game's own render mixed in because BTO hooked render before this module
+-- loaded.
+--
+-- v0.35.0 (the user: all three) maps the render chain link by link, the way
+-- the update walk does. Each step:
+--   1. Spy on every function the last link holds (upvalues, and functions
+--      in tables it holds).
+--   2. Let one render call pass.
+--   3. The link below is the spy called with the same arguments as render.
+--      Where several are (ActionCam pcalls two helpers with no arguments,
+--      as render has none), prefer in order: a function that was _G.render
+--      at some time, then a name like "previous" or "original_render", then
+--      the one called last (both mods end with "return previous(...)").
+--   4. The same answer three times gives the link a timing shim, and the
+--      next step starts.
+-- A link that is not a mod's script is the game's own render: the chain
+-- ends there, and it is timed apart in any load order.
+-- A link's own time is its time minus the link below. It goes to the mod's
+-- own row, so a mod's row is its update and render together. The stall lines
+-- show the render part, marked "(render)", when it is 1 ms or more.
+-- A hook that comes above ours (ActionCam hooks render from its first update)
+-- and holds our top shim becomes the new top, up to 3 times a session, so
+-- two hooks that each want the top cannot escalate.
+-- While a render hook runs, the black box holds that mod's number; inside
+-- the game's own render it holds 0.
+installed.render_setup = function()
+  if installed.rt ~= nil then return nil end
+  local first = rawget(_G, "render")
+  if type(first) ~= "function" then return "off (no render function)" end
+  local rt = { links = {}, calls = 0, order = 0, argc = 0, rewraps = 0, minute = {},
+               state = "mapping", seen = installed.render_seen or {} }
+  installed.rt = rt
+  rt.seen[first] = true
+  local link = installed.render_link(first, nil)
+  rt.links[1] = link
+  rawset(_G, "render", link.shim)
+  installed.render_step(link)
+  return "on; mapping the render chain from " .. link.key
+end
+
+-- A link of the render chain and the shim that times it (its time includes
+-- every link below). The outermost one counts the render calls and, after
+-- each, lets the walk take a step.
+installed.render_link = function(fn, slot)
   local rt = installed.rt
-  if rt == nil then
-    rt = { pending = 0, base_pending = 0, last = 0, mods = {}, box_id = 2,
-           minute = { total = 0, base = 0, worst = 0 } }
-    installed.rt = rt
-  end
-  local own = source_of(installed.render_setup)
-  if phase == "load" then
-    local base = rawget(_G, "render")
-    if type(base) ~= "function" then return "no render function at load" end
-    local info = getinfo(base, "S")
-    local key = source_of(base)
-    if type(info) ~= "table" or info.what == "C" or is_mod_source(key) then
-      return "render already hooked at load (" .. tostring(key) .. "): the game's own render is not timed apart"
-    end
-    local function base_done(t0, outer, ...)
-      rt.base_pending = rt.base_pending + (timer_now() - t0)
-      if installed.box ~= nil then installed.box[3] = outer end
-      return ...
-    end
-    rt.base_shim = function(...)
-      local W, outer = installed.box, nil
-      if W ~= nil then outer, W[3] = W[3], 0 end
-      return base_done(timer_now(), outer, base(...))
-    end
-    rawset(_G, "render", rt.base_shim)
-    return "the game's own render (" .. key .. ") timed apart"
-  end
-  if rt.wrapper ~= nil then return nil end
-  local prev = rawget(_G, "render")
-  if type(prev) ~= "function" then return "off (no render function)" end
-  local function done(t0, outer, ...)
-    rt.pending = rt.pending + (timer_now() - t0)
-    if installed.box ~= nil then installed.box[3] = outer end
+  local key = source_of(fn)
+  local link = { fn = fn, key = key, slot = slot, pending = 0, ran = 0, last_own = 0,
+                 game = not is_mod_source(key) }
+  local W = installed.box
+  local id = W ~= nil and (link.game and 0 or installed.box_id(key)) or 0
+  local function done(t0, outer, top, ...)
+    link.pending = link.pending + (timer_now() - t0)
+    if W ~= nil then W[3] = outer end
+    if top and rt.step ~= nil then pcall(installed.render_advance) end
     return ...
   end
-  rt.wrapper = function(...)
-    local W, outer = installed.box, nil
-    if W ~= nil then outer, W[3] = W[3], rt.box_id end
-    return done(timer_now(), outer, prev(...))
+  link.shim = function(...)
+    local top = link == rt.links[1]
+    if top then
+      rt.calls = rt.calls + 1
+      rt.argc, rt.arg1 = select("#", ...), (...)
+    end
+    link.ran = rt.calls
+    local outer = nil
+    if W ~= nil then outer, W[3] = W[3], id end
+    return done(timer_now(), outer, top, fn(...))
   end
-  rt.scan = function()
-    local order, found, seen, queue, head = {}, {}, { [rt.wrapper] = true }, { prev }, 1
-    while head <= #queue and head <= 300 do
-      local fn = queue[head]
-      head = head + 1
-      local key = fn ~= rt.base_shim and source_of(fn) or nil
-      if key ~= nil and key ~= own and is_mod_source(key) then
-        if not found[key] then
-          found[key] = true
-          order[#order + 1] = key
-        end
-        for index = 1, 255 do
-          local name, value = getupvalue(fn, index)
-          if name == nil then break end
-          if type(value) == "function" and not seen[value] then
-            seen[value] = true
-            queue[#queue + 1] = value
-          end
-        end
+  ours[link.shim] = fn
+  return link
+end
+
+-- Spy on everything the link holds, for the next render calls.
+installed.render_step = function(link)
+  local rt = installed.rt
+  rt.step = nil
+  if link.game then
+    rt.state = string.format("mapped, %d links", #rt.links)
+    say("render chain: " .. rt.state .. ", down to the game's own render (" .. link.key .. ")")
+    return
+  end
+  local avoid = {}
+  for _, l in ipairs(rt.links) do avoid[l.fn] = true end
+  local update = rawget(_G, "update")
+  if update ~= nil then avoid[update] = true end
+  local slots = upvalue_slots(link.fn, avoid)
+  for _, slot in ipairs(field_slots(link.fn, avoid)) do slots[#slots + 1] = slot end
+  if #slots == 0 then
+    link.bottom = true
+    rt.state = "stopped at " .. link.key .. " (it holds no function)"
+    say("render chain: " .. rt.state)
+    return
+  end
+  for _, slot in ipairs(slots) do
+    local rec, target = { calls = 0, argc = 0, arg = nil, last = 0 }, slot.original
+    slot.rec = rec
+    slot.spy = function(...)
+      rec.calls = rec.calls + 1
+      rec.argc, rec.arg = select("#", ...), (...)
+      rt.order = rt.order + 1
+      rec.last = rt.order
+      return target(...)
+    end
+    ours[slot.spy] = target
+    slot_set(slot, slot.spy)
+  end
+  rt.step = { link = link, slots = slots, best = nil, streak = 0, misses = 0 }
+end
+
+-- After a render call: which spy is the link below?
+installed.render_advance = function()
+  local rt = installed.rt
+  local st = rt.step
+  local link = st.link
+  local function unspy(keep)
+    for _, slot in ipairs(st.slots) do
+      if slot ~= keep and slot_get(slot) == slot.spy then slot_set(slot, slot.original) end
+    end
+  end
+  if link.ran ~= rt.calls then
+    st.misses = st.misses + 1
+  else
+    local matches, last = {}, nil
+    for _, slot in ipairs(st.slots) do
+      local rec = slot.rec
+      if rec.calls > 0 and rec.argc == rt.argc and (rt.argc == 0 or rawequal(rec.arg, rt.arg1)) then
+        matches[#matches + 1] = slot
+        if last == nil or rec.last > last.rec.last then last = slot end
       end
     end
-    rt.mods = order
-    rt.box_id = (#order == 1 and installed.box ~= nil) and installed.box_id(order[1]) or 2
+    local best, best_score, tied = nil, -1, false
+    for _, slot in ipairs(matches) do
+      local score = (rt.seen[slot.original] and 4 or 0) + name_score(slot.name) * 2 + (slot == last and 1 or 0)
+      if score > best_score then
+        best, best_score, tied = slot, score, false
+      elseif score == best_score then
+        tied = true
+      end
+    end
+    if tied then best = nil end
+    if best ~= nil and best == st.best then
+      st.streak = st.streak + 1
+    elseif best ~= nil then
+      st.best, st.streak = best, 1
+    else
+      st.misses = st.misses + 1
+    end
+    if best ~= nil and st.streak >= 3 then
+      unspy(best)
+      local below = installed.render_link(best.original, best)
+      slot_set(best, below.shim)
+      rt.links[#rt.links + 1] = below
+      say(string.format("render chain: #%d %s calls %s (via %s)", #rt.links - 1, link.key, below.key, best.name))
+      installed.render_step(below)
+      return
+    end
   end
-  rt.scan()
-  rawset(_G, "render", rt.wrapper)
-  return string.format("on; hooked by %s%s", #rt.mods > 0 and table.concat(rt.mods, ", ") or "no mod",
-                       rt.base_shim ~= nil and "" or "; the game's own render is counted in")
+  for _, slot in ipairs(st.slots) do slot.rec.calls = 0 end
+  if st.misses >= 120 then
+    unspy(nil)
+    rt.step = nil
+    link.bottom = true
+    rt.state = "stopped below " .. link.key .. " (the link below it was not found)"
+    say("render chain: " .. rt.state .. "; its time counts everything below it")
+  end
 end
 
--- The row's label: "render: " and the mods' names.
-installed.render_label = function(width)
-  local rt = installed.rt
-  local names = {}
-  for _, key in ipairs(rt.mods) do names[#names + 1] = short_name(key) end
-  return string.sub((rt.base_shim ~= nil and "render: " or "render+game: ") .. table.concat(names, ", "), 1, width)
-end
-
--- Each tick: the render time since the last tick (the render after the last
--- update), into this second's bucket and the minute.
+-- Each tick: each link's own render time since the last tick (the render
+-- after the last update), into its mod's row.
 installed.render_tick = function()
   local rt = installed.rt
-  if rt == nil or rt.wrapper == nil then return end
-  local total, base = rt.pending, rt.base_pending
-  rt.pending, rt.base_pending = 0, 0
-  local net = math.max(0, total - base)
-  rt.last = net
-  local m = rt.minute
-  m.total, m.base = m.total + total, m.base + base
-  if net > m.worst then m.worst = net end
-  local bucket = live.bucket
-  if bucket ~= nil then
-    local r = bucket.render
-    if r == nil then
-      r = { time = 0, worst = 0 }
-      bucket.render = r
+  if rt == nil then return end
+  local links = rt.links
+  for index, link in ipairs(links) do
+    local below = links[index + 1]
+    local own = math.max(0, link.pending - (below ~= nil and below.pending or 0))
+    link.last_own = own
+    if own > 0 then
+      -- While the walk is still under way (a few frames) the last link keeps
+      -- its own name; one the walk gave up below counts everything below it.
+      local key = link.game and "(the game)" or (link.bottom and (link.key .. " (+ all below)") or link.key)
+      link.row_key = key
+      charge_row(window.mods, key, own)
+      if live.bucket ~= nil then charge_row(live.bucket.mods, key, own) end
+      local m = rt.minute[key]
+      if m == nil then
+        m = { time = 0, worst = 0 }
+        rt.minute[key] = m
+      end
+      m.time = m.time + own
+      if own > m.worst then m.worst = own end
     end
-    r.time = r.time + net
-    if net > r.worst then r.worst = net end
   end
-  if not rt.above_told and rawget(_G, "render") ~= rt.wrapper then
-    rt.above_told = true
-    say("render: " .. tostring(source_of(rawget(_G, "render"))) ..
-        " hooked render above this module; its render time is not timed")
+  for _, link in ipairs(links) do link.pending = 0 end
+  -- A hook above ours: when it holds our top shim, it becomes the new top.
+  local top = rawget(_G, "render")
+  if top ~= links[1].shim and not rt.above_told and type(top) == "function" then
+    local holds = false
+    for index = 1, 255 do
+      local name, value = getupvalue(top, index)
+      if name == nil then break end
+      if value == links[1].shim then holds = true break end
+    end
+    if holds and rt.rewraps < 3 then
+      rt.rewraps = rt.rewraps + 1
+      local link = installed.render_link(top, nil)
+      table.insert(links, 1, link)
+      rawset(_G, "render", link.shim)
+      if string.sub(rt.state, 1, 6) == "mapped" then rt.state = string.format("mapped, %d links", #links) end
+      say("render chain: " .. link.key .. " hooked render above this module; timed as the new top")
+    else
+      rt.above_told = true
+      say("render chain: " .. tostring(source_of(top)) .. " hooked render above this module; not timed")
+    end
   end
 end
 
--- The minute's line, and a new walk for the mods.
+-- A stall's render part: the links that took 1 ms or more in it.
+installed.render_parts = function()
+  local rt = installed.rt
+  local parts = nil
+  for _, link in ipairs(rt.links) do
+    if link.last_own >= 0.001 then
+      parts = parts or {}
+      parts[#parts + 1] = { own = link.last_own,
+                            link = { source = link.row_key or link.key, render = true,
+                                     bottom = link.game and "game" or nil } }
+    end
+  end
+  return parts
+end
+
+-- The minute's line.
 installed.render_summary = function(span)
   local rt = installed.rt
-  if rt == nil or rt.wrapper == nil or span <= 0 then return end
-  pcall(rt.scan)
-  local m = rt.minute
-  say(string.format("  render: mods %.2f ms/s, worst frame %.1f ms (%s); the game's own render %s",
-                    math.max(0, m.total - m.base) * 1000 / span, m.worst * 1000,
-                    #rt.mods > 0 and table.concat(rt.mods, ", ") or "no mod hooks it",
-                    rt.base_shim ~= nil and string.format("%.2f ms/s", m.base * 1000 / span)
-                                     or "counted in (not timed apart)"))
-  rt.minute = { total = 0, base = 0, worst = 0 }
+  if rt == nil or span <= 0 then return end
+  local rows = {}
+  for key, m in pairs(rt.minute) do rows[#rows + 1] = { key = key, m = m } end
+  table.sort(rows, function(a, b) return a.m.time > b.m.time end)
+  local parts = {}
+  for _, r in ipairs(rows) do
+    parts[#parts + 1] = string.format("%s %.2f ms/s (worst %.1f ms)", r.key, r.m.time * 1000 / span,
+                                      r.m.worst * 1000)
+  end
+  say("  render: " .. (#parts > 0 and table.concat(parts, ", ") or "nothing") .. "; " .. rt.state)
+  rt.minute = {}
 end
 
 -- ------------------------------------------------------------ black box
@@ -5176,10 +5270,9 @@ local function main()
     if installed.box ~= nil then installed.box_self = installed.box_id(source_of(main)) end
     say("black box: " .. (ok_box and tostring(told) or ("off (" .. tostring(told) .. ")")))
   end
-  do
-    local ok_render, told = pcall(installed.render_setup, "load")
-    say("render at load: " .. (ok_render and tostring(told) or ("failed: " .. tostring(told))))
-  end
+  -- v0.35.0: what render was at load, for the render walk (see "render").
+  installed.render_seen = {}
+  if type(rawget(_G, "render")) == "function" then installed.render_seen[rawget(_G, "render")] = true end
   -- Not armed here: the first main_world call or the first frame arms it,
   -- above every mod that hooked update while loading. The top link's own
   -- time cannot be measured, so the top is best kept for this module.
