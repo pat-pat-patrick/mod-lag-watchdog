@@ -103,7 +103,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.33.0"
+RELEASE = "Mod Lag Watchdog v0.34.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4562,6 +4562,89 @@ def box_case():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+PAINTER = r"""
+-- A mod that does its work in _G.render (as HUD Ballistic Trajectory
+-- Overlay v9 does): 4 ms a frame, 300 ms once when PAINT_STALL is set.
+local prev = rawget(_G, "render")
+rawset(_G, "render", function(...)
+  CLOCK = CLOCK + (PAINT_STALL and 0.3 or 0.004)
+  PAINT_STALL = false
+  return prev(...)
+end)
+"""
+
+GAME_RENDER = """
+-- The game's own render (0.2 ms), called after every update.
+render = function() CLOCK = CLOCK + 0.0002 end
+FAKE.on_frame = function() local r = rawget(_G, "render") if r then r() end end
+"""
+
+
+def render_case():
+    """Render time (v0.34.0): a mod working in _G.render, where no shim
+    times anything, gets one row "render: <mods>" with its ms/s, and a
+    stall in render is named "LAG ... - render: <mod>". When the Watchdog
+    loads first, the game's own render is timed apart; when the mod hooked
+    render before it, the row says "render+game:". With no render function
+    there is no row. Fails on v0.33.0 (render not timed)."""
+    print("render")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(GAME_RENDER)
+        load(s, ["std", "finder"])
+        check(s.load_mod(source=PAINTER, name="mods/test/painter"), "painter loads (after the Watchdog)")
+        s.frames(3700)                                         # a minute summary
+        check(bool(log_lines(s, r"render at load: the game's own render \(.*\) timed apart")),
+              "the game's own render is timed apart: %r" % log_lines(s, "render at load"))
+        check(bool(log_lines(s, r"render: on; hooked by mods/test/painter$")),
+              "the render chain is wrapped and its mod found: %r" % log_lines(s, r"render: on"))
+        line = log_lines(s, r"  render: mods [\d.]+ ms/s")
+        m = re.search(r"render: mods ([\d.]+) ms/s, worst frame ([\d.]+) ms \(mods/test/painter\); "
+                      r"the game's own render ([\d.]+) ms/s", line[-1] if line else "")
+        check(m is not None and 150 <= float(m.group(1)) <= 260 and 3.5 <= float(m.group(2)) <= 4.5
+              and 5 <= float(m.group(3)) <= 15,
+              "the minute line: the mod ~200 ms/s, worst 4 ms, the game's own ~10 ms/s: %r" % line[-1:])
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        row = re.search(r"render: painter\s+([\d.]+)\s+(\d+) ms", shown)
+        check(row is not None and 150 <= float(row.group(1)) <= 260,
+              "one row for it in the table: %r" % shown)
+        s.lua("PAINT_STALL = true")
+        s.frames(4)
+        shown = s.eval("SHOWN()")
+        check(re.search(r"LAG 3\d\d ms - render: painter", shown) is not None,
+              "a stall in render is named: %r" % shown)
+        hitch = log_lines(s, r"hitch 3\d\d ms")
+        check(bool(hitch) and re.search(r"render: painter 3\d\d ms; this module", hitch[-1]) is not None
+              and int(re.search(r"not explained (\d+) ms", hitch[-1]).group(1)) < 50,
+              "the stall line puts it on render, not 'not explained': %r" % hitch[-1:])
+        clean(s, "render")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(GAME_RENDER)
+        check(s.load_mod(source=PAINTER, name="mods/test/painter"), "painter loads (before the Watchdog)")
+        load(s, ["std", "finder"])
+        s.frames(300)
+        check(bool(log_lines(s, r"render at load: render already hooked at load \(mods/test/painter\)")),
+              "hooked before us: not timed apart, and said: %r" % log_lines(s, "render at load"))
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        check(re.search(r"render\+game: painter\s+[\d.]+", shown) is not None,
+              "the row says the game's own render is in it: %r" % shown)
+        clean(s, "render, hooked first")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["std", "finder"])
+        s.frames(300)
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        check("render" not in s.eval("SHOWN()") and len(log_lines(s, r"render: off \(no render function\)")) == 1,
+              "no render function: no row, said once: %r" % log_lines(s, "render"))
+        clean(s, "no render")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -4574,6 +4657,7 @@ def main():
         sys.exit(1 if FAILURES else 0)
     map_case()
     box_case()
+    render_case()
     retry_case()
     stall_case()
     rehook_case()
