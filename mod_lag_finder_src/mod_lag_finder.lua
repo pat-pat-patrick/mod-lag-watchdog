@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.35.0"
+local MARKER = "mod-lag-finder-v0.36.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1038,13 +1038,26 @@ installed.relinked = function()
     if link.fn == installed.wrapper then our_index = index end
     if link.source == MDL_SOURCE and runtime_index == nil then runtime_index = index end
   end
+  -- v0.36.0: copies of the same function (source and line), not of the same
+  -- file: Super Holo Kit hooks the update twice by design (its tick at load,
+  -- and its own escape-menu tab, wrapped once on top when the menu first
+  -- opens), and showed "hooked more than once" every game. A mod loaded
+  -- twice, or one that wraps again and again, repeats the same function.
   local copies = {}
   for _, link in ipairs(links) do
-    if link.bottom ~= "game" then copies[link.source] = (copies[link.source] or 0) + 1 end
+    if link.bottom ~= "game" then
+      local key = link.source .. ":" .. tostring(link.line or 0)
+      local c = copies[key]
+      if c == nil then
+        c = { source = link.source, n = 0 }
+        copies[key] = c
+      end
+      c.n = c.n + 1
+    end
   end
   local repeated = {}
-  for source, n in pairs(copies) do
-    if n >= 2 then repeated[#repeated + 1] = { source = source, n = n } end
+  for _, c in pairs(copies) do
+    if c.n >= 2 then repeated[#repeated + 1] = { source = c.source, n = c.n } end
   end
   table.sort(repeated, function(a, b)
     if a.n ~= b.n then return a.n > b.n end
@@ -4331,14 +4344,28 @@ local function tick(failed)
     pending = nil
   end
   if frame_selfs ~= nil then charge(frame_selfs) end
-  -- v0.32.0: which mod sat on top (not measured) in this second.
+  -- v0.32.0: which mod sat on top (not measured) in this second. v0.36.0:
+  -- not when a different hook of the same mod is timed further down. Super
+  -- Holo Kit's escape-menu tab sits on top for the rest of the game while its
+  -- tick is timed as usual; its row went missing from the table (every second
+  -- left out, none left). HD2 HUD+ 0.2.2 puts a copy of the same hook on top
+  -- (same line) and the one below passes through idle: still left out.
   if mapped and live.bucket ~= nil and links[1] ~= nil and links[1].fn ~= installed.wrapper then
-    local tops = live.bucket.tops
-    if tops == nil then
-      tops = {}
-      live.bucket.tops = tops
+    local timed_below = false
+    for k = 2, #links do
+      if links[k].source == links[1].source and links[k].line ~= links[1].line then
+        timed_below = true
+        break
+      end
     end
-    tops[owner(links[1])] = true
+    if not timed_below then
+      local tops = live.bucket.tops
+      if tops == nil then
+        tops = {}
+        live.bucket.tops = tops
+      end
+      tops[owner(links[1])] = true
+    end
   end
   -- v0.33.0: and for the black box, the mod on top that no shim times.
   if installed.box ~= nil then
@@ -4804,6 +4831,7 @@ installed.render_link = function(fn, slot)
   local function done(t0, outer, top, ...)
     link.pending = link.pending + (timer_now() - t0)
     if W ~= nil then W[3] = outer end
+    if top then rt.in_render = false end
     if top and rt.step ~= nil then pcall(installed.render_advance) end
     return ...
   end
@@ -4812,6 +4840,7 @@ installed.render_link = function(fn, slot)
     if top then
       rt.calls = rt.calls + 1
       rt.argc, rt.arg1 = select("#", ...), (...)
+      rt.in_render = true
     end
     link.ran = rt.calls
     local outer = nil
@@ -4836,7 +4865,30 @@ installed.render_step = function(link)
   local update = rawget(_G, "update")
   if update ~= nil then avoid[update] = true end
   local slots = upvalue_slots(link.fn, avoid)
-  for _, slot in ipairs(field_slots(link.fn, avoid)) do slots[#slots + 1] = slot end
+  -- v0.36.0: the functions in tables it holds. In a big one only the first
+  -- TABLE_FIELDS_MAX were looked at, and Super Holo Kit keeps the render
+  -- below in MZ.prev_render among some thousands of fields: there, a former
+  -- _G.render and names like prev/orig/render are always taken.
+  for index = 1, 255 do
+    local name, value = getupvalue(link.fn, index)
+    if name == nil then break end
+    if type(value) == "table" and not skip_table[value] and getmetatable(value) == nil then
+      local plain, count = 0, 0
+      for key, field in next, value do
+        count = count + 1
+        if count > 20000 then break end
+        field = through_ours(field)
+        if type(key) == "string" and not avoid[field] and is_lua_function(field) then
+          local hinted = rt.seen[field] or name_score(key) > 0 or string.find(string.lower(key), "render", 1, true)
+          if hinted or plain < TABLE_FIELDS_MAX then
+            if not hinted then plain = plain + 1 end
+            slots[#slots + 1] = { kind = "field", holder = value, key = key,
+                                  name = name .. "." .. key, original = field }
+          end
+        end
+      end
+    end
+  end
   if #slots == 0 then
     link.bottom = true
     rt.state = "stopped at " .. link.key .. " (it holds no function)"
@@ -4847,10 +4899,12 @@ installed.render_step = function(link)
     local rec, target = { calls = 0, argc = 0, arg = nil, last = 0 }, slot.original
     slot.rec = rec
     slot.spy = function(...)
-      rec.calls = rec.calls + 1
-      rec.argc, rec.arg = select("#", ...), (...)
-      rt.order = rt.order + 1
-      rec.last = rt.order
+      if rt.in_render then
+        rec.calls = rec.calls + 1
+        rec.argc, rec.arg = select("#", ...), (...)
+        rt.order = rt.order + 1
+        rec.last = rt.order
+      end
       return target(...)
     end
     ours[slot.spy] = target
@@ -4923,6 +4977,7 @@ installed.render_tick = function()
   local rt = installed.rt
   if rt == nil then return end
   local links = rt.links
+  rt.in_render = false                 -- a render call an error cut short
   for index, link in ipairs(links) do
     local below = links[index + 1]
     local own = math.max(0, link.pending - (below ~= nil and below.pending or 0))

@@ -103,7 +103,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.35.0"
+RELEASE = "Mod Lag Watchdog v0.36.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1271,9 +1271,7 @@ assert(STAND_IN ~= nil, "the stand-in game.dll did not load")
 """
 
 
-SPIN = r"""
--- Real work: each frame spins for 0.3 ms of real time (read with its own
--- QueryPerformanceCounter), so the finder's timer has something true to find.
+QPC_SECONDS = r"""
 local ffi = require("ffi")
 pcall(ffi.cdef, "int QueryPerformanceCounter(int64_t *count);")
 pcall(ffi.cdef, "int QueryPerformanceFrequency(int64_t *frequency);")
@@ -1284,11 +1282,51 @@ local w = ffi.new("uint32_t[2]")
 qpf(w)
 local frequency = w[1] * 4294967296 + w[0]
 local function seconds() qpc(w) return (w[1] * 4294967296 + w[0]) / frequency end
+"""
+
+# Real work: while SPIN_ON is set, each frame spins for 0.3 ms of real time
+# (read with its own QueryPerformanceCounter), so the finder's timer has
+# something true to find. SPIN_OWN keeps when each call started, how long it
+# really took and how long the links under it took, on that same clock. On a
+# loaded machine Windows can switch the thread out in the middle of the spin,
+# and that call then really lasts longer: 76-136 ms under 24 busy processes
+# (2026-10-12). The finder must charge that too, so the test compares the
+# finder with these times, not with 0.3 ms.
+SPIN = QPC_SECONDS + r"""
+local own = { n = 0, start = {}, took = {}, below = {} }
+rawset(_G, "SPIN_OWN", own)
 local previous = rawget(_G, "update")
+local function after(n, called, ...)
+  own.below[n] = seconds() - called
+  return ...
+end
 rawset(_G, "update", function(...)
-  local stop = seconds() + 0.0003
-  while seconds() < stop do end
-  return previous(...)
+  local start = seconds()
+  local t = start
+  if rawget(_G, "SPIN_ON") then
+    local stop = start + 0.0003
+    while t < stop do t = seconds() end
+  end
+  local n = own.n + 1
+  own.n, own.start[n], own.took[n] = n, start, t - start
+  local called = seconds()
+  return after(n, called, previous(...))
+end)
+"""
+
+# Under std, above the game: how long each call (the game and this) took,
+# so the test knows std's own time each frame: the spin's below minus this.
+FLOOR = QPC_SECONDS + r"""
+local own = { n = 0, took = {} }
+rawset(_G, "FLOOR_OWN", own)
+local previous = rawget(_G, "update")
+local function after(called, ...)
+  local n = own.n + 1
+  own.n, own.took[n] = n, seconds() - called
+  return ...
+end
+rawset(_G, "update", function(...)
+  return after(seconds(), previous(...))
 end)
 """
 
@@ -3632,37 +3670,81 @@ def soak_case(seed=20260930, chunks=200):
 def timer_case():
     """In game the timer is QueryPerformanceCounter, not os.clock's whole
     milliseconds (v0.8.0): with ffi allowed and no test seam, a mod that
-    really spends 0.3 ms a frame is shown at 0.3 ms over the frame time, and
-    a mod that spends nothing is not listed but counted. Without ffi the
-    finder says it is on os.clock."""
+    really spends 0.3 ms a frame is shown at the share of real time it
+    measured itself spending (0.3 ms over the frame time on an idle
+    machine), and a mod that spends nothing is not listed but counted.
+    Without ffi the finder says it is on os.clock."""
     print("timer")
     with Session(backend=BACKEND, ffi="allow") as s:
         s.lua(CLOCK)
         s.lua("FAKE.mission()")
         s.lua(GUI_STUB)
+        check(s.load_mod(source=FLOOR, name="mods/test/floor"), "floor loads")
         load(s, ["std"])
         check(s.load_mod(source=SPIN, name="mods/test/spin"), "spin loads")
         load(s, ["finder"])
+        # The spin starts once the finder has armed and mapped the chain, and
+        # stops before the panel is drawn, so every 0.3 ms it spends is timed
+        # by the finder and inside the window, whichever frame the key is
+        # seen on.
+        s.frames(300)
+        s.lua("SPIN_ON = true; SPIN_FIRST = SPIN_OWN.n + 1")
         s.frames(3000)
+        s.lua("SPIN_ON = false; SPIN_MARK = SPIN_OWN.n")
         s.lua("FAKE.press('home')")
         s.frames(3)
         shown = s.eval("SHOWN()")
         timer = log_lines(s, r"timer: ")
         check(bool(timer) and "QueryPerformanceCounter" in timer[0],
               "the timer is QueryPerformanceCounter: %r" % timer)
-        # The fake runs frames back to back, so the frame is the spin plus
-        # a little: the share must be 0.3 ms over the average frame.
+        # What really happened, by the mods' own clock. The median spin call
+        # (a switched-out call is rare, so the median is the spin itself);
+        # the spin's share of the real time from the finder's first tick
+        # (frame 2: on frame 1 the bootstrap arms it) to the draw; and the
+        # time std took beyond its usual frame (the thread switched out
+        # inside it, a GC step): what a do-nothing mod is really charged.
+        values = s.eval("""(function()
+          local o, f = SPIN_OWN, FLOOR_OWN
+          local function median(list, first, last)
+            local copy = {}
+            for i = first, last do copy[#copy + 1] = list[i] end
+            table.sort(copy)
+            return copy[math.ceil(#copy / 2)]
+          end
+          local std = {}
+          for i = 1, SPIN_MARK do std[i] = o.below[i] - f.took[i] end
+          local total, usual, excess = 0, median(std, 2, SPIN_MARK), 0
+          for i = 2, SPIN_MARK do
+            total = total + o.took[i]
+            excess = excess + math.max(0, std[i] - usual)
+          end
+          return string.format("%.7f %.6f %.6f %.6f %d %d", median(o.took, SPIN_FIRST, SPIN_MARK),
+                               total, o.start[SPIN_MARK + 1] - o.start[2], excess, o.n, f.n)
+        end)()""").split()
+        median, total, span, excess = map(float, values[:4])
+        check(values[4] == values[5], "spin and floor ran once a frame each: %s, %s" % tuple(values[4:]))
+        check(0.0003 <= median <= 0.00033,
+              "the spin is a 0.3 ms mod: its median call took %.4f ms" % (median * 1000))
+        # The fake runs frames back to back, so the frame is the spin plus a
+        # little. The finder must charge the spin what it really took over
+        # those frames: 0.3 ms a frame on an idle machine, more on a loaded
+        # one, where the spin itself is slowed (the frame time grows with it).
         m = re.search(r"\|spin +(\d+\.\d) +(\d+) ms", shown)
         got = float(m.group(1)) if m else -1
-        f = re.search(r"frame (\d+\.\d) ms avg", shown)
-        want = 0.3 / float(f.group(1)) * 1000 if f and float(f.group(1)) > 0 else -1
-        check(want > 0 and abs(got - want) <= 0.35 * want,
-              "a real 0.3 ms mod reads 0.3 ms over the frame (%.0f ms/s expected): %r" % (want, shown))
+        want = total * 1000 / span if span > 0 else -1
+        check(span < 25, "the run fits the panel's 30 s window: %.1f s" % span)
+        check(want > 0 and abs(got - want) <= 0.03 * want,
+              "a real 0.3 ms mod reads what it really spent (%.1f ms/s by its own clock): %r"
+              % (want, shown))
         # Frames here are ~0.4 ms of real time, so even an empty mod's few
-        # microseconds can reach 10 ms/s: compare with the spinning mod.
+        # microseconds can reach 10 ms/s: compare with the spinning mod. On a
+        # loaded machine a switch-out can land in std too, and then it really
+        # took that long: what std took beyond its usual frame is allowed on
+        # top.
         e = re.search(r"\|std +(\d+\.\d)", shown)
-        check(e is None or (got > 0 and float(e.group(1)) < got / 20),
-              "a mod that does nothing reads next to nothing: %r" % shown)
+        allowed = got / 20 + excess * 1000 / span if span > 0 else -1
+        check(e is None or (got > 0 and float(e.group(1)) < allowed),
+              "a mod that does nothing reads next to nothing (under %.1f ms/s): %r" % (allowed, shown))
     with session() as s:
         load(s, ["finder"])
         s.frames(5)
@@ -4711,6 +4793,74 @@ def render_case():
         clean(s, "no render")
 
 
+HOLO = r"""
+-- As Super Holo Kit v1.7 hooks the game: its tick after the update (2 ms),
+-- a render hook that passes on through MZ.prev_render (MZ holds hundreds of
+-- functions), MZ.sm_drop called from the tick with no arguments, and its
+-- own escape-menu tab: the update wrapped once more, on top, when HOLO_TAB
+-- is set (the menu first opened).
+local MZ = {}
+for i = 1, 300 do MZ["helper" .. i] = function() end end
+function MZ.sm_drop() end
+local function tick()
+  MZ.sm_drop()
+  CLOCK = CLOCK + 0.002
+  if HOLO_TAB and not MZ.tab_hooked then
+    MZ.tab_hooked = true
+    local prev = rawget(_G, "update")
+    rawset(_G, "update", function(...)
+      CLOCK = CLOCK + 0.0001
+      return prev(...)
+    end)
+  end
+end
+local function after(...)
+  pcall(tick)
+  return ...
+end
+local previous_update = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  return after(previous_update(...))
+end)
+MZ.prev_render = rawget(_G, "render")
+rawset(_G, "render", function(...)
+  return MZ.prev_render(...)
+end)
+"""
+
+
+def holo_case():
+    """Super Holo Kit's hooks (v0.36.0). Its own escape-menu tab wraps the
+    update once more, on top, while its tick stays timed below: no "hooked
+    more than once" (two different functions), and its row stays in the
+    table with its tick's time, not "(in play)" and not dropped. Its render
+    hook passes on through MZ.prev_render in a table of hundreds of
+    functions, and calls MZ.sm_drop from the update with no arguments: the
+    render walk takes MZ.prev_render and reaches the game. Fails on v0.35.0
+    (render chain mapped to MZ.sm_drop; the row gone after the tab)."""
+    print("holo kit")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(GAME_RENDER)
+        load(s, ["std"])
+        check(s.load_mod(source=HOLO, name="mods/test/holo"), "holo loads")
+        load(s, ["finder"])
+        s.frames(600)
+        check(bool(log_lines(s, r"render chain: #1 mods/test/holo calls =scenario \(via MZ\.prev_render\)")),
+              "the render walk takes MZ.prev_render: %r" % log_lines(s, "render chain"))
+        s.lua("HOLO_TAB = true")
+        s.frames(2400)
+        check(bool(log_lines(s, r"a hook came on top")), "the tab's hook came on top: %r" % log_lines(s, "on top"))
+        s.lua("FAKE.press('home')")
+        s.frames(3)
+        shown = s.eval("SHOWN()")
+        row = re.search(r"holo(?: \(in play\))?\s+([\d.]+)\s+\d+ ms", shown)
+        check(row is not None and "(in play)" not in shown and 80 <= float(row.group(1)) <= 130,
+              "its row stays, with its tick's ~100 ms/s, not '(in play)': %r" % shown)
+        check("hooked more than once" not in shown, "two different hooks are not 'hooked more than once': %r" % shown)
+        clean(s, "holo kit")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -4724,6 +4874,7 @@ def main():
     map_case()
     box_case()
     render_case()
+    holo_case()
     retry_case()
     stall_case()
     rehook_case()
