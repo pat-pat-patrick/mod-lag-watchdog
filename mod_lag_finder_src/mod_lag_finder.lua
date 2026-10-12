@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.37.0"
+local MARKER = "mod-lag-finder-v0.38.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1998,18 +1998,116 @@ local function line_marks(path, offset)
   return funcs, ends
 end
 
+-- v0.38.0 (Echelon's author, 2026-10-13): Echelon, another HD2 mod manager,
+-- keeps an open, read-only list at %APPDATA%\Echelon\library.json
+-- (format "echelon-library", version 1, from Echelon 0.36.2). Each mod has
+-- its name, whether it is on, its folder, and its patch sets: the files
+-- relative to the folder, the main .patch_N first, and "deployed_as", the
+-- name in the game's data folder, or null when not deployed. Options and
+-- choices point at sets by index from 0. Read when there is no Arsenal list
+-- (as its author suggested), into the shape the Arsenal reading builds:
+-- each enabled mod with its Lua archives (the 9ba626afa44a3aa3 sets that are
+-- deployed) and the option each came from.
+-- A mod: { label, uuid, folder = relative folder, parts = { { file, option,
+-- names } } }. names: the archive is a patch_0, which names go by.
+installed.manager_mods = function()
+  local LUA_HASH = "9ba626afa44a3aa3"
+  local ok_local, localappdata = pcall(os.getenv, "LOCALAPPDATA")
+  local text = type(localappdata) == "string" and read_all(localappdata .. "\\hd2arsenal\\hd2a_data.json") or nil
+  if text ~= nil then
+    local data, why = json_decode(text)
+    if type(data) ~= "table" then return nil, "Arsenal mod list unreadable: " .. tostring(why or "not an object") end
+    local profile = type(data.modsList) == "table" and data.modsList[data.selectedProfile or "default"]
+    if type(profile) ~= "table" or type(profile.mods) ~= "table" then return nil, "no active Arsenal profile" end
+    local mods = {}
+    for _, mod in ipairs(profile.mods) do
+      if type(mod) == "table" and mod.enabled == true and type(mod.path) == "string" then
+        local folders = {}
+        local function add(option)
+          for _, include in ipairs(type(option.include) == "table" and option.include or {}) do
+            if type(include) == "string" then
+              folders[#folders + 1] = { dir = string.gsub(include, "/", "\\"), option = option.name }
+            end
+          end
+        end
+        local options = type(mod.options) == "table" and mod.options or {}
+        if #options == 0 then folders[1] = { dir = "", option = nil } end
+        for _, option in ipairs(options) do
+          if type(option) == "table" and option.enabled == true then
+            add(option)
+            for _, sub in ipairs(type(option.suboptions) == "table" and option.suboptions or {}) do
+              if type(sub) == "table" and sub.enabled == true then add(sub) end
+            end
+          end
+        end
+        local parts = {}
+        for _, folder in ipairs(folders) do
+          local base = mod.path .. (folder.dir ~= "" and ("\\" .. folder.dir) or "") .. "\\" .. LUA_HASH .. ".patch_"
+          -- An option may ship its Lua under a later patch index (HD2 HUD+
+          -- 0.1.13: its squad fragment in patch_5): those count for the mod
+          -- list, not for names.
+          for patch = 0, 15 do
+            parts[#parts + 1] = { file = base .. patch, option = folder.option, names = patch == 0 }
+          end
+        end
+        mods[#mods + 1] = { label = mod.label, uuid = mod.uuid, path = mod.path, parts = parts }
+      end
+    end
+    return mods, nil, "Arsenal", data
+  end
+  local ok_roaming, appdata = pcall(os.getenv, "APPDATA")
+  text = type(appdata) == "string" and read_all(appdata .. "\\Echelon\\library.json") or nil
+  if text == nil then return nil, "no Arsenal or Echelon mod list" end
+  local data, why = json_decode(text)
+  if type(data) ~= "table" or data.format ~= "echelon-library" then
+    return nil, "Echelon mod list unreadable: " .. tostring(why or "not an echelon-library")
+  end
+  if data.version ~= 1 then return nil, "Echelon mod list version " .. tostring(data.version) .. ", not 1" end
+  local mods = {}
+  for _, mod in ipairs(type(data.mods) == "table" and data.mods or {}) do
+    if type(mod) == "table" and mod.enabled == true and type(mod.folder) == "string" and type(mod.sets) == "table" then
+      -- The option (or choice) each set comes from, by index from 0.
+      local from = {}
+      for _, option in ipairs(type(mod.options) == "table" and mod.options or {}) do
+        if type(option) == "table" and option.enabled == true then
+          for _, index in ipairs(type(option.sets) == "table" and option.sets or {}) do
+            if type(index) == "number" then from[index] = from[index] or option.name end
+          end
+          local choices = type(option.choices) == "table" and option.choices or {}
+          local chosen = type(option.selected) == "number" and choices[option.selected + 1] or nil
+          if type(chosen) == "table" then
+            for _, index in ipairs(type(chosen.sets) == "table" and chosen.sets or {}) do
+              if type(index) == "number" then from[index] = from[index] or chosen.name end
+            end
+          end
+        end
+      end
+      local parts = {}
+      for index, set in ipairs(mod.sets) do
+        local first = type(set) == "table" and type(set.files) == "table" and set.files[1] or nil
+        if type(first) == "string" and set.hash == LUA_HASH and type(set.deployed_as) == "string" then
+          parts[#parts + 1] = { file = mod.folder .. "\\" .. string.gsub(first, "/", "\\"),
+                                option = from[index - 1], names = string.match(first, "%.patch_0$") ~= nil }
+        end
+      end
+      mods[#mods + 1] = { label = mod.name, uuid = nil, path = mod.folder, parts = parts }
+    end
+  end
+  return mods, nil, "Echelon", nil
+end
+
 read_names = function()
   -- The enabled mods and how each runs, for "copy mod list" (v0.17.1).
-  installed.mod_list, installed.mod_list_why = nil, "no Arsenal mod list was read"
+  installed.mod_list, installed.mod_list_why = nil, "no mod manager list was read"
   local listed_mods = {}
-  local ok_env, localappdata = pcall(os.getenv, "LOCALAPPDATA")
-  if not ok_env or type(localappdata) ~= "string" then return "no LOCALAPPDATA" end
-  local text = read_all(localappdata .. "\\hd2arsenal\\hd2a_data.json")
-  if text == nil then return "no Arsenal mod list" end
-  local data, why = json_decode(text)
-  if type(data) ~= "table" then return "Arsenal mod list unreadable: " .. tostring(why or "not an object") end
-  local profile = type(data.modsList) == "table" and data.modsList[data.selectedProfile or "default"]
-  if type(profile) ~= "table" or type(profile.mods) ~= "table" then return "no active Arsenal profile" end
+  local mods_in, why, manager, data = installed.manager_mods()
+  if mods_in == nil then
+    installed.mod_list_why = why
+    return why
+  end
+  installed.manager = manager
+  data = data or {}
+  local profile = type(data.modsList) == "table" and data.modsList[data.selectedProfile or "default"] or { mods = {} }
   -- Every mod's name by its Arsenal uuid, enabled or not: MDL starts mods
   -- from the library live and calls a legacy script "arsenal:<uuid>"
   -- (v0.19.1: the user saw "mdl: arsenal:c9bea282-ab42-" in the table).
@@ -2040,47 +2138,22 @@ read_names = function()
   local claims, claim_order = {}, {}     -- row hash -> { [mod index] = claim }, rows in order
   local shared, shared_rows = {}, {}
   installed.shared, installed.shared_rows, installed.shared_seen = shared, shared_rows, {}
-  for mod_index, mod in ipairs(profile.mods) do
-    if type(mod) == "table" and mod.enabled == true and type(mod.path) == "string" then
+  for mod_index, mod in ipairs(mods_in) do
+    do
       local listed = { label = plain_label(mod.label), keys = {}, lua = 0, scripts = 0,
                        folder = relative_folder(mod.path) }
       listed_mods[#listed_mods + 1] = listed
-      local folders = {}
-      local function add(option)
-        for _, include in ipairs(type(option.include) == "table" and option.include or {}) do
-          if type(include) == "string" then
-            folders[#folders + 1] = { dir = string.gsub(include, "/", "\\"), option = option.name }
-          end
-        end
-      end
-      local options = type(mod.options) == "table" and mod.options or {}
-      if #options == 0 then folders[1] = { dir = "", option = nil } end
-      for _, option in ipairs(options) do
-        if type(option) == "table" and option.enabled == true then
-          add(option)
-          for _, sub in ipairs(type(option.suboptions) == "table" and option.suboptions or {}) do
-            if type(sub) == "table" and sub.enabled == true then add(sub) end
-          end
-        end
-      end
       -- Which options each resource of this mod comes from.
       local by_addon, order, lua_folders = {}, {}, 0
-      for _, folder in ipairs(folders) do
-        local path = mod.path .. (folder.dir ~= "" and ("\\" .. folder.dir) or "") .. "\\" .. LUA_ARCHIVE
-        local addons = archive_addons(path)
-        if addons ~= nil then archives = archives + 1 end
+      for _, folder in ipairs(mod.parts) do
+        local path = folder.file
+        local all = archive_addons(path)
+        local addons = folder.names and all or nil
+        if folder.names and all ~= nil then archives = archives + 1 end
         if addons ~= nil and #addons > 0 then lua_folders = lua_folders + 1 end
-        -- The mod list sees every patch index of the folder.
-        local every = {}
-        for _, entry in ipairs(addons or {}) do every[#every + 1] = entry end
-        for patch = 1, 15 do
-          local more = archive_addons((string.gsub(path, "patch_0$", "patch_" .. patch)))
-          for _, entry in ipairs(more or {}) do
-            every[#every + 1] = entry
-            hashes[entry.key], hashes[entry.row] = true, true
-          end
-        end
-        for _, entry in ipairs(every) do
+        -- The mod list sees every Lua archive of the mod.
+        for _, entry in ipairs(all or {}) do
+          hashes[entry.key], hashes[entry.row] = true, true
           listed.keys[entry.key], listed.keys[entry.row] = true, true
           listed.lua = listed.lua + 1
           if entry.readable == nil then listed.scripts = listed.scripts + 1 end
@@ -2182,7 +2255,7 @@ read_names = function()
   for _, key in ipairs(keys) do
     say(string.format("name: %s = %s", readable[key] or ("#" .. key), shown[key] or "(short name)"))
   end
-  return string.format("%d addons named from Arsenal (%d Lua archives read)", count, archives)
+  return string.format("%d addons named from %s (%d Lua archives read)", count, manager, archives)
 end
 
 end   -- names
@@ -3466,9 +3539,9 @@ local function mod_list_text(at)
                   seconds / 60, seconds > 0 and frames / seconds or 0, game),
   }
   if installed.mod_list == nil then
-    lines[#lines + 1] = "No Arsenal mod list: " .. tostring(installed.mod_list_why)
+    lines[#lines + 1] = "No mod manager list: " .. tostring(installed.mod_list_why)
   else
-    lines[#lines + 1] = string.format("Enabled in Arsenal: %d mods", #installed.mod_list)
+    lines[#lines + 1] = string.format("Enabled in %s: %d mods", installed.manager or "Arsenal", #installed.mod_list)
   end
   local groups = by_how_it_runs()
   for _, group in ipairs({
@@ -3476,7 +3549,7 @@ local function mod_list_text(at)
       { groups.scripts, "Replace the game's own scripts (their cost shows as \"(the game)\")" },
       { groups.other, "Lua that is not in the update" },
       { groups.none, "No Lua (models, textures, sounds)" },
-      { groups.loose, "In the update but not in Arsenal" },
+      { groups.loose, "In the update but not in " .. (installed.manager or "Arsenal") },
       { groups.shared, "Ship the same Lua resource as another mod (only one runs)" } }) do
     if #group[1] > 0 or (group[1] ~= groups.loose and group[1] ~= groups.shared) then
       lines[#lines + 1] = string.format("%s: %d", group[2], #group[1])
@@ -3539,9 +3612,9 @@ local function report_text(key, at)
   if key == "(the game)" then
     local scripts = by_how_it_runs().scripts
     if installed.mod_list == nil then
-      last = "Mods that replace game scripts: unknown (no Arsenal mod list)"
+      last = "Mods that replace game scripts: unknown (no mod manager list)"
     elseif #scripts == 0 then
-      last = "Mods that replace game scripts (counted here): none in Arsenal"
+      last = "Mods that replace game scripts (counted here): none in " .. (installed.manager or "Arsenal")
     else
       last = "Mods that replace game scripts (counted here): " .. table.concat(scripts, ", ")
     end
@@ -3559,7 +3632,7 @@ local function report_text(key, at)
     local bare = string.gsub(key, " %(%+ all below it%)$", "")
     local hash = installed.hash_of(bare)
     if installed.mod_list == nil then
-      manager = "Mod manager: unknown (no Arsenal mod list)"
+      manager = "Mod manager: unknown (no mod manager list)"
     else
       local found = {}
       for _, listed in ipairs(installed.mod_list) do
@@ -3569,7 +3642,7 @@ local function report_text(key, at)
         return string.format("%s [folder: %s]", listed.label, listed.folder or "?")
       end
       if #found == 0 then
-        manager = "Mod manager: not among the mods enabled in Arsenal (installed another way?)"
+        manager = "Mod manager: not among the mods enabled in " .. (installed.manager or "Arsenal") .. " (installed another way?)"
       elseif #found == 1 then
         manager = "Mod manager: " .. folder(found[1])
       else

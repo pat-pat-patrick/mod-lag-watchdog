@@ -103,7 +103,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.37.0"
+RELEASE = "Mod Lag Watchdog v0.38.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -594,7 +594,123 @@ def names_case():
         check(re.search(r"LAG 4\d\d ms - slow", shown) is not None, "and short names are used: %r" % shown)
         os.remove(os.path.join(arsenal, "hd2a_data.json"))
         text, _ = game()
-        check("names: no Arsenal mod list" in text, "no list: said, nothing else changes")
+        check("names: no Arsenal or Echelon mod list" in text, "no list: said, nothing else changes")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def echelon_names_case():
+    """Names from Echelon (v0.38.0; its author asked): with no Arsenal list,
+    %APPDATA%\Echelon\library.json (format "echelon-library", version 1)
+    names the mods the same way. Only enabled mods' sets of the Lua archive
+    that are deployed count, options and pick-one choices name their sets,
+    a set not deployed or of another archive is skipped, a list of another
+    format or version is refused. Fails on v0.37.0 (no names)."""
+    import json
+    print("echelon names")
+    scratch = tempfile.mkdtemp(prefix="mlf_echelon_")
+    root = os.path.join(scratch, "Echelon Mods")
+    echelon = os.path.join(scratch, "Echelon")
+    os.makedirs(echelon)
+    LUA = "9ba626afa44a3aa3"
+
+    def archive(rel, *addons):
+        path = os.path.join(root, *rel.split("/"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(lua_archive(["-- HD2-Addon: %s\nreturn {}\n" % a for a in addons]))
+
+    def lua_set(folder, rel, deployed):
+        archive(folder + "/" + rel, *ADDONS[(folder, rel)])
+        return {"hash": LUA, "files": [rel], "deployed_as": ("%s.patch_%d" % (LUA, deployed)) if deployed is not None else None}
+
+    ADDONS = {
+        ("WMS", "Beacon/%s.patch_0" % LUA): ["mods/test/slow"],
+        ("Whip", "Whip/%s.patch_0" % LUA): ["mods/test/heavy"],
+        ("Off", "Main/%s.patch_0" % LUA): ["mods/test/std"],
+        ("Pack", "options/RowA/%s.patch_0" % LUA): ["mods/test/pack", "mods/test/row_a"],
+        ("Pack", "options/RowB/%s.patch_0" % LUA): ["mods/test/pack", "mods/test/row_b"],
+        ("Pack", "options/RowC/%s.patch_0" % LUA): ["mods/test/pack", "mods/test/row_c"],
+        ("Styled", "Native/%s.patch_0" % LUA): ["mods/test/native_style"],
+        ("Styled", "Pixel/%s.patch_0" % LUA): ["mods/test/pixel_style"],
+        ("Twin1", "A/%s.patch_0" % LUA): ["mods/test/twin_a"],
+        ("Twin2", "A/%s.patch_0" % LUA): ["mods/test/twin_b"],
+    }
+
+    def mod(name, folder, sets, options=(), enabled=True):
+        return {"id": folder.lower(), "name": name, "folder": os.path.join(root, folder), "enabled": enabled,
+                "deployed": enabled, "sets": sets, "options": list(options)}
+
+    def option(name, sets, enabled=True, choices=(), selected=None):
+        return {"name": name, "enabled": enabled, "sets": list(sets),
+                "choices": [{"name": n, "sets": list(x)} for n, x in choices], "selected": selected}
+
+    texture = {"hash": "2e24ba9dd702da5c", "files": ["Beacon/2e24ba9dd702da5c.patch_0"],
+               "deployed_as": "2e24ba9dd702da5c.patch_1"}
+    library = {"format": "echelon-library", "version": 1, "mods": [
+        mod("Where's My Shit?  v0.11.6", "WMS", [lua_set("WMS", "Beacon/%s.patch_0" % LUA, 2), texture]),
+        mod("\u771f\u7406\u90e8\u4e4b\u97ad v0.3.0", "Whip", [lua_set("Whip", "Whip/%s.patch_0" % LUA, 3)]),
+        mod("Off Mod", "Off", [lua_set("Off", "Main/%s.patch_0" % LUA, None)], enabled=False),
+        mod("Vanilla Plus Megapack Rows - v34", "Pack",
+            [lua_set("Pack", "options/RowA/%s.patch_0" % LUA, 4),
+             lua_set("Pack", "options/RowB/%s.patch_0" % LUA, 5),
+             lua_set("Pack", "options/RowC/%s.patch_0" % LUA, None)],
+            [option("Enemy Collision Synchronized", [0]), option("Know Your Constellation Rows", [1]),
+             option("Row C", [2], enabled=False)]),
+        mod("Styled HUD", "Styled",
+            [lua_set("Styled", "Native/%s.patch_0" % LUA, None), lua_set("Styled", "Pixel/%s.patch_0" % LUA, 6)],
+            [option("Style", [], choices=[("Native", [0]), ("Pixel", [1])], selected=1)]),
+        mod("Twin 1.0", "Twin1", [lua_set("Twin1", "A/%s.patch_0" % LUA, 7)]),
+        mod("Twin 2.0", "Twin2", [lua_set("Twin2", "A/%s.patch_0" % LUA, 8)]),
+    ]}
+
+    def write(data):
+        with open(os.path.join(echelon, "library.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def game(frames=320, home=True):
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            load(s, ["slow", "heavy", "std", "finder"])
+            s.frames(frames)
+            shown = ""
+            if home:
+                s.lua("FAKE.press('home')")
+                s.frames(3)
+                shown = s.eval("SHOWN()")
+            text = (s.file(LOG, "") or "").split("== mod-lag-finder")[-1]
+            clean(s, "echelon names")
+        return text, shown
+
+    try:
+        write(library)
+        text, shown = game()
+        said = dict(re.findall(r"name: (\S+) = (.+)", text))
+        want = {"mods/test/slow": "Where's My Shit?",
+                "mods/test/heavy": "(short name)",
+                "mods/test/pack": "Vanilla Plus Megapack Rows",
+                "mods/test/row_a": "Enemy Collision Synchronized",
+                "mods/test/row_b": "Know Your Constellation Rows",
+                "mods/test/pixel_style": "Styled HUD",
+                "mods/test/twin_a": "(short name)",
+                "mods/test/twin_b": "(short name)"}
+        for addon, label in want.items():
+            check(said.get(addon) == label, "echelon: %s is named %r: %r" % (addon, label, said.get(addon)))
+        check(not any(k in said for k in ("mods/test/std", "mods/test/row_c", "mods/test/native_style")),
+              "echelon: a disabled mod, a disabled option and a choice not taken name nothing: %r" % sorted(said))
+        check(re.search(r"names: 5 addons named from Echelon \(7 Lua archives read\)", text) is not None,
+              "echelon: the count is logged with the manager: %r" % [l for l in text.splitlines() if "names:" in l])
+        check(re.search(r"LAG 4\d\d ms - Where's My Shit\?", shown) is not None,
+              "echelon: the stall line names the mod: %r" % shown)
+        library["version"] = 2
+        write(library)
+        text, _ = game(frames=40, home=False)
+        check("names: Echelon mod list version 2, not 1" in text, "echelon: another version is refused, and said")
+        write({"format": "something-else", "version": 1, "mods": []})
+        text, _ = game(frames=40, home=False)
+        check("names: Echelon mod list unreadable" in text, "echelon: another format is refused, and said")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -3357,7 +3473,7 @@ def report_case():
             lines = clip.split("\r\n")
             check(len(lines) == 9, "9 lines: %r" % clip)
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
-            check(lines[1:2] == ["Mod manager: unknown (no Arsenal mod list)"], "no Arsenal list: %r" % lines[1:2])
+            check(lines[1:2] == ["Mod manager: unknown (no mod manager list)"], "no Arsenal list: %r" % lines[1:2])
             del lines[1:2]
             check(re.match(r"Game build 6AB3B43F, Watchdog " + re.escape(RELEASE.split()[-1]) + r", 4 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
@@ -4926,6 +5042,7 @@ def main():
     mdl_case()
     mdl_arsenal_case()
     names_case()
+    echelon_names_case()
     deploy_case()
     writes_case()
     top_case()
