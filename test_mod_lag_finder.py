@@ -103,7 +103,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.36.0"
+RELEASE = "Mod Lag Watchdog v0.37.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4471,7 +4471,9 @@ def churn_case():
         walks = len(log_lines(s, r"chain mapped:")) - walks_before
         check(walks <= 1, "no walk restarted every frame meanwhile: %d" % walks)
         s.lua("MENU_OPEN = false")
-        s.frames(600)
+        # v0.37.0: the walk goes on past 64 links (up to 256), and the ~800
+        # layers left behind take it there: about 30 s of frames, not 10.
+        s.frames(2400)
         check(len(log_lines(s, r"chain mapped:")) > walks_before,
               "quiet again: the chain is walked: %r" % log_lines(s, "chain mapped")[-1:])
         clean(s, "churn")
@@ -4861,6 +4863,44 @@ def holo_case():
         clean(s, "holo kit")
 
 
+LIGHT = r"""
+-- One of many small mods: 0.1 ms a frame.
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  CLOCK = CLOCK + 0.0001
+  return previous(...)
+end)
+"""
+
+
+def many_case():
+    """More than 64 Lua mods (v0.37.0, a Nexus player: past 64 the 64th mod
+    got the cost of every mod after it). With 80 small mods above a heavy
+    one, the walk maps all 82 links down to the game, the heavy mod keeps its
+    own row, and no row counts "all below". Fails on v0.36.0 (stopped at 64)."""
+    print("many mods")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["heavy"])                                     # at the bottom of the chain
+        for i in range(1, 81):
+            s.load_mod(source=LIGHT, name="mods/test/m%02d" % i)
+        load(s, ["finder"])
+        s.frames(7400)
+        mapped = log_lines(s, r"chain mapped: \d+ links")
+        check(bool(mapped) and re.search(r"chain mapped: 83 links \(reached the game\)", mapped[-1]) is not None,
+              "all 83 links are mapped, down to the game: %r" % mapped[-1:])
+        rows = log_lines(s, r"^t=[\d.]+   \S+ +[\d.]+ ms/s")
+        last = rows[-10:]
+        heavy = [l for l in last if "mods/test/heavy " in l]
+        value = float(re.search(r"([\d.]+) ms/s", heavy[0]).group(1)) if heavy else 0
+        check(140 <= value <= 210 and not any("all below" in l for l in last),
+              "the heavy mod keeps its own ~170 ms/s, no row counts all below: %r" % last[:3])
+        light = [float(re.search(r"([\d.]+) ms/s", l).group(1)) for l in last if "mods/test/m" in l]
+        check(bool(light) and max(light) < 10, "no small mod is blamed for the heavy one: %r" % light[:5])
+        check(not log_lines(s, r"more than \d+ hooks"), "no link-limit note under 256")
+        clean(s, "many mods")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -4875,6 +4915,7 @@ def main():
     box_case()
     render_case()
     holo_case()
+    many_case()
     retry_case()
     stall_case()
     rehook_case()

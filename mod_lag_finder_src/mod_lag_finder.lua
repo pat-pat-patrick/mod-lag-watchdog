@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.36.0"
+local MARKER = "mod-lag-finder-v0.37.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -179,7 +179,11 @@ local SUMMARY_ROWS = 10
 local SPY_FRAMES = 8          -- frames a link's upvalues are watched
 local SPY_NEED = 6            -- of those, frames the previous must match
 local TIE_FRAMES = 16         -- frames timing the candidates when several match
-local MAX_LINKS = 64
+-- v0.37.0 (a Nexus player, 2026-10-13: past 64 Lua mods the 64th was blamed
+-- for every mod after it): the walk stopped at 64 links and the last one
+-- counted everything below. 256 now; a chain that still reaches it says so
+-- in the log and the window.
+local MAX_LINKS = 256
 local TABLE_FIELDS_MAX = 64
 local MAP_LOGS = 40           -- chain maps written per session
 local LOG_LIMIT = 4 * 1024 * 1024
@@ -854,7 +858,13 @@ end
 -- 200-locals limit.)
 local function begin_step()
   local link = mapping.links[#mapping.links]
-  if #mapping.links >= MAX_LINKS then return finish_mapping("link limit") end
+  if #mapping.links >= MAX_LINKS then
+    if not installed.link_limit then
+      installed.link_limit = true
+      say(string.format("chain: more than %d hooks; the last one mapped counts every mod below it", MAX_LINKS))
+    end
+    return finish_mapping("link limit")
+  end
   local known = installed.archive_hashes
   -- A patch link being retried stays a patch (v0.13.3, review [1]: the retry
   -- found its name already taken and called it the game). A name in no
@@ -3770,6 +3780,9 @@ local function panel_lines(at)
   if #links > 0 and links[1].fn ~= installed.wrapper then
     out[#out + 1] = { "on top, not measured: " .. short_name(links[1].source), GREY }
   end
+  if installed.link_limit then
+    out[#out + 1] = { string.format("more than %d hooks: the last row counts all below it", MAX_LINKS), AMBER }
+  end
   if installed.churn_line ~= nil and at < installed.churn_line.until_at then
     out[#out + 1] = { installed.churn_line.text, AMBER }
   end
@@ -5067,7 +5080,7 @@ end
 -- file). Each timing shim stores its mod's number on entry and puts the
 -- outer one back on exit: no allocation, no file I/O.
 --
--- Words (uint32): 0 magic, 1 layout, 2 state (1 running, 2 closed, 3
+-- Words (uint32; 8 KB until v0.36.0, 32 KB since v0.37.0): 0 magic, 1 layout, 2 state (1 running, 2 closed, 3
 -- closing), 3 who runs (0 not in the update, 2 in the update but in no timed
 -- mod, 3 and up a mod; this module's own tick is its own number), 4 frame,
 -- 5 start (os.time), 6 the thread the mods run on, 7 the mod on top that no
@@ -5086,7 +5099,8 @@ end
 -- GetCurrentThreadId on every tick: the thread every mod's update runs on.
 -- (Inside a function: the main chunk is at Lua's 200-locals limit.)
 installed.box_setup = function(log_file)
-  local BOX_WORDS, NAMES, SLOT, MAX_NAMES, MAGIC = 2048, 64, 24, 80, 0x584F424D
+  -- v0.37.0: room for 300 names (32 KB), as the walk now goes past 64 mods.
+  local BOX_WORDS, NAMES, SLOT, MAX_NAMES, MAGIC = 8192, 64, 24, 300, 0x584F424D
   local box_path = string.gsub(log_file, "mod_lag_finder%.log$", "mod_lag_finder_box.bin")
   local dumps = string.gsub(log_file, "\\mod_lag_finder%.log$", "\\dumps")
   local function word(bytes, index)
