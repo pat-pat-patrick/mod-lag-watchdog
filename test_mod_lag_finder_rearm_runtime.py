@@ -1,3 +1,7 @@
+# Mod Lag Watchdog. Copyright (c) 2026 patpatpatrick.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Mod Lag Watchdog comes back after losing its update link, even when
 Application.main_world is called rarely.
 
@@ -35,7 +39,7 @@ from hd2fake import Session                      # noqa: E402
 from hd2fake.sources import lua_from_release     # noqa: E402
 import modpaths                                  # noqa: E402
 
-CURRENT = "Mod Lag Watchdog v0.40.0"
+CURRENT = "Mod Lag Watchdog v0.40.1"
 CONTROL = "Mod Lag Watchdog v0.16.1"
 FOLDER = "Mod Lag Watchdog"
 NAME = "mods/patpatpatrick/mod_lag_finder"

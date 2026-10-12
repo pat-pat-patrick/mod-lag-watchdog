@@ -1,3 +1,7 @@
+# Mod Lag Watchdog. Copyright (c) 2026 patpatpatrick.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Mod Lag Finder through the strict fake engine, from the shipped bytes.
 
 The clock is the scenario's: os.clock is replaced before any mod loads, the
@@ -103,7 +107,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.40.0"
+RELEASE = "Mod Lag Watchdog v0.40.1"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1843,7 +1847,8 @@ end""")
         clean(s, "small")
 
 
-# HD2 HUD+ as shipped: 0.1.12 replaces the game's boot script and hooks
+# Modelled on how HD2 HUD+ hooks the game (written for this test, not its
+# code): 0.1.12 replaces the game's boot script and hooks
 # update from there (chunk "boot", previous in an upvalue named "original");
 # 0.1.13's boot patch only requires its module, "mods/hd2_hud/product",
 # which hooks update like any mod but has no HD2-Addon line.
@@ -4184,30 +4189,36 @@ def gc_case():
 
 
 SCHEDULER = r"""
--- HD2Runtime 0.20.1's runtime/scheduler as shipped: attach puts a callback
--- on top of _G.update; once the last watch is done it puts update back.
-local watches = {}
-local callback, original
-local function pack(...) return { n = select('#', ...), ... } end
-local function tick(dt)
-  for i = #watches, 1, -1 do
-    watches[i].left = watches[i].left - 1
-    if watches[i].left <= 0 then table.remove(watches, i) end
+-- Written for this test to behave like HD2Runtime 0.20.1's scheduler (not
+-- its code): while it has jobs it keeps one callback on top of _G.update,
+-- runs the jobs after the update below it, and when the last job is done
+-- puts back the update it found.
+local jobs = {}
+local mine, beneath
+local function run_jobs()
+  for i = #jobs, 1, -1 do
+    local job = jobs[i]
+    job.left = job.left - 1
+    if job.left <= 0 then table.remove(jobs, i) end
   end
-  if #watches == 0 and update == callback then update = original; callback = nil end
+  if #jobs == 0 and update == mine then
+    update, mine = beneath, nil
+  end
 end
-SCHED_ATTACH = function(watch)
-  watches[#watches + 1] = watch
-  if not callback then
-    original = update
-    callback = function(dt, ...)
-      local result = original and pack(original(dt, ...)) or { n = 0 }
-      tick(type(dt) == 'number' and dt >= 0 and dt < 10 and dt or 0)
-      return unpack(result, 1, result.n)
+local function then_jobs(...)
+  run_jobs()
+  return ...
+end
+SCHED_ATTACH = function(job)
+  jobs[#jobs + 1] = job
+  if mine == nil then
+    beneath = update
+    mine = function(...)
+      return then_jobs(beneath(...))
     end
-    update = callback
+    update = mine
   end
-  return watch
+  return job
 end
 """
 
@@ -4424,35 +4435,36 @@ def bsl_startup_case():
 
 
 HUDPLUS_022 = r"""
--- HD2 HUD+ 0.2.2's update hook as shipped (00-boot-state BootState.install,
--- link, finish): a base hook at load; while the menu is open (MENU_OPEN
--- here) it re-links itself on top after every frame, and only the top layer
--- works (4 ms a frame here); closed, the extra layer goes if still on top.
-local hook = {}
-local function link(inner)
-  local fn
-  fn = function(...)
-    if fn ~= (hook.outer or hook.base) then return inner(...) end
-    return hook.frame(inner, ...)
+-- Written for this test to behave like HD2 HUD+ 0.2.2's update hook (not
+-- its code): one hook at load; while the menu is open (MENU_OPEN here) it
+-- puts another copy of the same hook on top after every frame, and only the
+-- copy on top does the work (4 ms a frame here); once the menu is closed the
+-- extra copy is taken off again if it is still on top.
+local state = {}
+local function add_layer(below)
+  local layer
+  layer = function(...)
+    if layer ~= (state.extra or state.first) then return below(...) end
+    return state.work(below, ...)
   end
-  rawset(_G, "update", fn)
-  return fn
+  rawset(_G, "update", layer)
+  return layer
 end
-local function finish(...)
+local function after_frame(...)
   local top = rawget(_G, "update")
   if MENU_OPEN then
-    if top ~= (hook.outer or hook.base) then hook.outer_inner, hook.outer = top, link(top) end
-  elseif hook.outer ~= nil then
-    if top == hook.outer then rawset(_G, "update", hook.outer_inner) end
-    hook.outer = nil
+    if top ~= (state.extra or state.first) then state.extra_below, state.extra = top, add_layer(top) end
+  elseif state.extra ~= nil then
+    if top == state.extra then rawset(_G, "update", state.extra_below) end
+    state.extra = nil
   end
   return ...
 end
-function hook.frame(inner, ...)
+function state.work(below, ...)
   CLOCK = CLOCK + 0.004
-  return finish(inner(...))
+  return after_frame(below(...))
 end
-hook.base = link(rawget(_G, "update"))
+state.first = add_layer(rawget(_G, "update"))
 """
 
 ONTOP = r"""

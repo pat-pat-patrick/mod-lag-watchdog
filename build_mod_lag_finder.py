@@ -1,3 +1,7 @@
+# Mod Lag Watchdog. Copyright (c) 2026 patpatpatrick.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
 """Package Mod Lag Watchdog (was Mod Lag Finder) as a loader-v15 addon.
 
 Times each mod's share of every frame by walking the _G.update chain (see
@@ -24,7 +28,7 @@ TEMPLATE = os.path.join(HERE, "lua_archive_template.bin")
 ADDON = "mods/patpatpatrick/mod_lag_finder"
 LUA_T = 0xA14E8DFA2CD117E2
 PAYLOAD_FLAG = 2
-VERSION = "v0.40.0"
+VERSION = "v0.40.1"
 MOD = "Mod Lag Watchdog"
 # A build is a local test build unless the user says it goes to Nexus (the
 # user, 2026-09-30): then the release name has no "Nexus" and the manifest
@@ -73,6 +77,12 @@ The pause-menu window needs the game version this release was made for.
 After a game update, Home still works.
 
 Requires Bingus Shared Loader v15 or later.
+
+Licence: Mozilla Public License 2.0 (https://mozilla.org/MPL/2.0/).
+Source: https://github.com/pat-pat-patrick/mod-lag-watchdog
+Unchanged official builds may be passed on under this name, also inside a
+mod manager. A changed copy must use another name and say it is based on
+Mod Lag Watchdog. The log's "build:" line tells an official build by its id.
 """
 
 def write_module(out_dir, resource_name, source):

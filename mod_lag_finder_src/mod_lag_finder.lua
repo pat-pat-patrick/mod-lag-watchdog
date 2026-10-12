@@ -1,4 +1,8 @@
 -- HD2-Addon: mods/patpatpatrick/mod_lag_finder
+-- Mod Lag Watchdog. Copyright (c) 2026 patpatpatrick.
+-- This Source Code Form is subject to the terms of the Mozilla Public
+-- License, v. 2.0. If a copy of the MPL was not distributed with this
+-- file, You can obtain one at https://mozilla.org/MPL/2.0/.
 -- Mod Lag Watchdog v0.20.0 (was Mod Lag Finder; the addon, log and window
 -- file keep that name so an update finds them)
 --
@@ -120,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.40.0"
+local MARKER = "mod-lag-finder-v0.40.1"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
