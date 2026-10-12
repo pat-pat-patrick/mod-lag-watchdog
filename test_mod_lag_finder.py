@@ -103,7 +103,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.39.0"
+RELEASE = "Mod Lag Watchdog v0.40.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -4615,7 +4615,7 @@ BOX_FILE = "mod_lag_finder_box.bin"
 
 def box_bytes(words):
     """The 8 KB file Windows leaves: the box's words, little-endian."""
-    out = bytearray(8192)
+    out = bytearray(32768)                    # 32 KB since v0.37.0
     for k, v in words.items():
         struct.pack_into("<I", out, int(k) * 4, int(v) & 0xFFFFFFFF)
     return bytes(out)
@@ -5044,6 +5044,110 @@ def build_id_case():
     check(build_of(commented) == first, "a comment alone does not (only the code counts)")
 
 
+DATA_FILE = "mod_lag_watchdog.json"
+
+
+def data_file_case():
+    """The data file (v0.40.0): mod_lag_watchdog.json, for mod managers.
+    Written when the game closes: format and version, the Watchdog's version
+    and build, the session, every mod with its numbers (costliest first),
+    warnings, no crash, and no paths. After a crash, written at the next
+    launch from the black box: the crash verdict and the numbers of the last
+    minute summary. With no crash dump the session ended "unknown". Fails on
+    v0.39.0 (no file)."""
+    import json
+    print("data file")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["std", "heavy", "slow", "finder"])
+        s.frames(3700)                                   # a minute summary, a stall from slow
+        s.lua("FAKE.shutdown()")
+        text = s.file(DATA_FILE, "") or ""
+        check(bool(log_lines(s, r"data file: written \(mod_lag_watchdog\.json, \d+ mods\)")),
+              "written when the game closes: %r" % log_lines(s, "data file"))
+        clean(s, "data file")
+    try:
+        data = json.loads(text)
+    except ValueError as e:
+        data = {}
+        check(False, "it is JSON: %s: %r" % (e, text[:200]))
+    check(data.get("format") == "mod-lag-watchdog" and data.get("version") == 1,
+          "format and version: %r" % {k: data.get(k) for k in ("format", "version")})
+    w = data.get("watchdog") or {}
+    check(w.get("version") == RELEASE.split()[-1].lstrip("v") and re.match(r"^[0-9a-f]{12}$", w.get("build") or ""),
+          "the Watchdog's version and build: %r" % w)
+    sess = data.get("session") or {}
+    check(sess.get("ended_how") == "closed" and 0.9 <= (sess.get("minutes_played") or 0) <= 1.8
+          and (sess.get("fps_average") or 0) > 10 and (sess.get("stalls_200ms") or 0) >= 1
+          and re.match(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d", sess.get("started") or ""),
+          "the session: %r" % sess)
+    mods = data.get("mods") or []
+    keys = [m.get("key") for m in mods]
+    heavy = next((m for m in mods if m.get("key") == "mods/test/heavy"), {})
+    slow = next((m for m in mods if m.get("key") == "mods/test/slow"), {})
+    check(bool(mods) and keys == sorted(keys, key=lambda k: -next(m["ms_per_s"] for m in mods if m["key"] == k)),
+          "every mod, costliest first: %r" % keys)
+    check(150 <= (heavy.get("ms_per_s") or 0) <= 300 and heavy.get("name") == "heavy"
+          and 4.5 <= (heavy.get("worst_frame_ms") or 0) <= 5.5,
+          "a mod's numbers: %r" % heavy)
+    check((slow.get("stalls_caused") or 0) >= 1 and (slow.get("worst_stall_ms") or 0) >= 300,
+          "the stalls it caused: %r" % slow)
+    check(data.get("crash") is None and isinstance(data.get("warnings"), list), "no crash; warnings a list")
+    check(":\\" not in text and ":/" not in text, "no paths in it")
+
+    # After a crash: written at the next launch, from the black box.
+    scratch = tempfile.mkdtemp(prefix="mlf_data_")
+    dump_name = "dump-2026-10-13-12.00.00-1a2b3c4d-PC-1.dmp"
+    try:
+        with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+            s.lua(CLOCK)
+            s.lua("FAKE.mission()")
+            s.lua(GUI_STUB)
+            s.lua("__hd2_native_test = { box = {}, box_thread = 4242 }")
+            load(s, ["std"])
+            check(s.load_mod(source=CRASHER, name="mods/test/crasher"), "crasher loads")
+            load(s, ["heavy", "finder"])
+            s.frames(3700)
+            s.lua("CRASH_NOW = true")
+            s.frames(1)
+            words = box_words(s, "BOX_AT_CRASH")
+        started = words[5]
+
+        def next_launch(dump):
+            with open(os.path.join(scratch, "Arrowhead", "Helldivers2", BOX_FILE), "wb") as f:
+                f.write(box_bytes(words))
+            names = []
+            if dump is not None:
+                fake_dump(os.path.join(scratch, "Arrowhead", "Helldivers2", "dumps", dump_name), *dump)
+                names = [dump_name]
+            with Session(backend=BACKEND, scratch=scratch, keep_scratch=True) as s:
+                s.lua(CLOCK)
+                s.lua("FAKE.mission()")
+                s.lua(GUI_STUB)
+                s.lua("__hd2_native_test = { box = {}, box_thread = 5151, dump_names = function() return %s end }"
+                      % ("{ %r }" % names[0] if names else "{}"))
+                load(s, ["finder"])
+                s.frames(5)
+                return json.loads(s.file(DATA_FILE, "") or "{}")
+
+        data = next_launch((started + 30, 4242, 0x438087))
+        crash = data.get("crash") or {}
+        check((data.get("session") or {}).get("ended_how") == "crashed" and crash.get("key") == "mods/test/crasher"
+              and crash.get("shown") is True and crash.get("on_mods_thread") is True
+              and crash.get("where") == "helldivers2.exe+0x438087" and crash.get("dump") == dump_name,
+              "a crash: the verdict, as on the ship: %r" % data.get("crash"))
+        mods = data.get("mods") or []
+        heavy = next((m for m in mods if m.get("key") == "mods/test/heavy"), {})
+        check(150 <= (heavy.get("ms_per_s") or 0) <= 300 and "until_the_last_minute" in (heavy.get("flags") or []),
+              "and the numbers of the last minute summary: %r" % heavy)
+        os.remove(os.path.join(scratch, "Arrowhead", "Helldivers2", "dumps", dump_name))
+        data = next_launch(None)
+        check((data.get("session") or {}).get("ended_how") == "unknown" and data.get("crash") is None,
+              "no crash dump: ended 'unknown', no verdict: %r" % data.get("session"))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -5057,6 +5161,7 @@ def main():
     map_case()
     build_id_case()
     box_case()
+    data_file_case()
     render_case()
     holo_case()
     many_case()

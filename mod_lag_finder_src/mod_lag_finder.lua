@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.39.0"
+local MARKER = "mod-lag-finder-v0.40.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1639,6 +1639,7 @@ local function write_summary(at)
     if row.worst > total.worst then total.worst = row.worst end
     total.peak = math.max(total.peak, row.time * 1000 / span)
   end
+  if installed.data_snapshot ~= nil then pcall(installed.data_snapshot) end   -- v0.40.0
   window = { mods = {}, started = at, frames = 0, hitches = 0 }
 end
 
@@ -2858,6 +2859,7 @@ function gpu.tick(at)
     if not quiet and (toast == nil or at >= toast.until_at) then
       gpu.alerted = at
       local text = string.format("VRAM %.1f / %.1f GB - over budget", usage / 1073741824, budget / 1073741824)
+      gpu.over_text = text
       ui.alert({ text = text, until_at = at + 8, colour = AMBER })
       say("vram: " .. text)
     end
@@ -4847,6 +4849,10 @@ local function arm()
       pcall(function()
         if installed.clear_crash then installed.clear_crash() end
         write_summary(now())
+        if installed.data_write_live ~= nil then
+          local ok_data, err = pcall(installed.data_write_live, now())
+          if not ok_data then say("data file: failed: " .. tostring(err)) end
+        end
         say(session_line("game over"))
         say("shutdown")
         flush_log()
@@ -5076,6 +5082,8 @@ installed.render_tick = function()
       link.row_key = key
       charge_row(window.mods, key, own)
       if live.bucket ~= nil then charge_row(live.bucket.mods, key, own) end
+      rt.session = rt.session or {}                  -- v0.40.0, for the data file
+      rt.session[key] = (rt.session[key] or 0) + own
       local m = rt.minute[key]
       if m == nil then
         m = { time = 0, worst = 0 }
@@ -5170,6 +5178,246 @@ installed.build_id = function()
   return installed.build
 end
 
+-- ------------------------------------------------------------ data file
+
+-- v0.40.0 (the user, 2026-10-13: mod managers that want the Watchdog's
+-- numbers in their own window should not have to change its code). One
+-- documented, read-only JSON file next to the log, mod_lag_watchdog.json
+-- (format "mod-lag-watchdog", version 1; DATA_JSON.md has every field).
+-- Written whole at two moments only, never in play:
+--   * when the game closes: the whole session;
+--   * at the next launch, while it loads, when the last session never
+--     closed: what the black box kept -- the crash verdict and the numbers
+--     of the last minute summary (see "black box": once a minute the 20
+--     costliest mods go into the mapped memory, a few stores, no disk).
+-- No paths, user names or player names: a mod's folder is its own name only.
+installed.data_file = function()
+  local DATA_SNAP, SNAP_ROWS, SNAP_WORDS = 7300, 20, 8
+  installed.DATA_SNAP = DATA_SNAP
+  local function jstr(v)
+    v = string.gsub(tostring(v), '[%c"\\]', function(c)
+      if c == '"' then return '\\"' elseif c == "\\" then return "\\\\"
+      elseif c == "\n" then return "\\n" elseif c == "\r" then return "\\r" elseif c == "\t" then return "\\t" end
+      return string.format("\\u%04x", string.byte(c))
+    end)
+    return '"' .. v .. '"'
+  end
+  local function jnum(v)
+    if type(v) ~= "number" or v ~= v then return "null" end
+    if v == math.floor(v) and math.abs(v) < 9007199254740992 then return string.format("%d", v) end
+    return (string.gsub(string.format("%.2f", v), "%.?0+$", ""))
+  end
+  local function jval(v)
+    if v == nil then return "null" end
+    if type(v) == "boolean" then return v and "true" or "false" end
+    if type(v) == "number" then return jnum(v) end
+    if type(v) == "table" then return v.json end
+    return jstr(v)
+  end
+  -- An object from ordered pairs, an array from a list; both carry .json.
+  -- (Values may be nil: counted with select, not #, which stops at a hole.)
+  local function obj(...)
+    local n, list, parts = select("#", ...), { ... }, {}
+    for k = 1, n, 2 do parts[#parts + 1] = jstr(list[k]) .. ": " .. jval(list[k + 1]) end
+    return { json = "{" .. table.concat(parts, ", ") .. "}" }
+  end
+  -- A record built field by field: push(r, key, value), then done(r).
+  local function push(r, key, value)
+    r.n = (r.n or 0) + 2
+    r[r.n - 1], r[r.n] = key, value
+  end
+  local function done(r)
+    local parts = {}
+    for k = 1, r.n or 0, 2 do parts[#parts + 1] = jstr(r[k]) .. ": " .. jval(r[k + 1]) end
+    return { json = "{" .. table.concat(parts, ", ") .. "}" }
+  end
+  local function arr(items)
+    local parts = {}
+    for _, item in ipairs(items) do parts[#parts + 1] = jval(item) end
+    return { json = "[" .. table.concat(parts, ", ") .. "]" }
+  end
+  local function path()
+    if log_path == nil then return nil end
+    return (string.gsub(log_path, "mod_lag_finder%.log$", "mod_lag_watchdog.json"))
+  end
+  local function write(record)
+    local file_path = path()
+    if file_path == nil then return false end
+    local temp = file_path .. ".tmp"
+    local file = io.open(temp, "wb")
+    if file == nil then return false end
+    file:write(record.json, "\n")
+    file:close()
+    pcall(os.remove, file_path)
+    local ok = pcall(os.rename, temp, file_path)
+    return ok
+  end
+  -- The mod manager's entry for a key: its name there and its folder.
+  local function manager_of(key)
+    if installed.mod_list == nil or type(installed.hash_of) ~= "function" then return nil, false end
+    local bare = string.gsub(key, " %(%+ all below it%)$", "")
+    local ok, hash = pcall(installed.hash_of, bare)
+    if not ok or hash == nil then return nil, false end
+    local found = nil
+    for _, listed in ipairs(installed.mod_list) do
+      if listed.keys[hash] then
+        if found ~= nil then return nil, true end      -- two mods ship it
+        found = listed
+      end
+    end
+    return found, false
+  end
+  local function version()
+    return (string.match(MARKER, "v([%d%.]+)$") or MARKER)
+  end
+  local function head(how, started, ended, minutes, fps, stalls50, stalls200)
+    local r = {}
+    push(r, "format", "mod-lag-watchdog")
+    push(r, "version", 1)
+    push(r, "watchdog", obj("version", version(), "build", installed.build or "unknown"))
+    push(r, "manager", installed.manager)
+    push(r, "session", obj("started", started, "ended", ended, "ended_how", how,
+                           "minutes_played", minutes, "fps_average", fps,
+                           "game_build", native.stamp and string.format("%08X", native.stamp) or nil,
+                           "stalls_50ms", stalls50, "stalls_200ms", stalls200))
+    return r
+  end
+  local function mod_obj(row)
+    local listed, shared = manager_of(row.key)
+    return obj("key", row.key, "name", short_name(row.key),
+               "manager_name", listed and listed.label or nil, "folder", listed and listed.folder or nil,
+               "ms_per_s", row.mss, "worst_minute_ms_per_s", row.peak, "worst_frame_ms", row.worst,
+               "render_ms_per_s", row.render, "stalls_caused", row.stalls, "worst_stall_ms", row.worst_stall,
+               "lua_errors", row.errors, "lua_memory_kb", row.memory,
+               "helper_units", row.units, "flags", arr(row.flags or {}),
+               "shared_script", shared)
+  end
+
+  -- The whole session, when the game closes.
+  installed.data_write_live = function(at)
+    local partial = window.started and math.max(0, at - window.started) or 0
+    local seconds = (session.time or 0) + partial
+    local frames = (session.frames or 0) + window.frames
+    local keys = {}
+    for key in pairs(session.mods or {}) do keys[key] = true end
+    for key in pairs(window.mods) do keys[key] = true end
+    local render = installed.rt ~= nil and installed.rt.session or {}
+    local rows = {}
+    for key in pairs(keys) do
+      local total, now_row = session.mods and session.mods[key] or nil, window.mods[key]
+      local time = (total and total.time or 0) + (now_row and now_row.time or 0)
+      local peak = total and total.peak or 0
+      if now_row ~= nil and partial >= 10 then peak = math.max(peak, now_row.time * 1000 / partial) end
+      local stalls = session.stalls and session.stalls[key] or nil
+      local history = mem.history[key]
+      local flags = {}
+      if #links > 0 and links[1].source == key and links[1].fn ~= installed.wrapper then
+        flags[#flags + 1] = "on_top_not_timed"
+      end
+      for _, r in ipairs(rehook.repeated) do
+        if r.source == key then flags[#flags + 1] = "hooked_" .. r.n .. "_times" end
+      end
+      if seconds > 0 then
+        rows[#rows + 1] = {
+          key = key, mss = time * 1000 / seconds, peak = peak,
+          worst = math.max(total and total.worst or 0, now_row and now_row.worst or 0) * 1000,
+          render = (render[key] or 0) * 1000 / seconds,
+          stalls = stalls and stalls.count or 0, worst_stall = stalls and stalls.top[1] and stalls.top[1] * 1000 or 0,
+          errors = installed.errors_session[key] or 0,
+          memory = history and #history > 0 and history[#history].kb or nil,
+          units = (units.max[key] or 0) > 0 and obj("alive", units.alive[key] or 0, "most", units.max[key],
+                                                    "older_than_10_min", units.old[key] or 0) or nil,
+          flags = flags }
+      end
+    end
+    table.sort(rows, function(a, b) return a.mss > b.mss end)
+    local mods = {}
+    for _, row in ipairs(rows) do mods[#mods + 1] = mod_obj(row) end
+    local warnings = {}
+    local function warn(kind, key, text)
+      warnings[#warnings + 1] = obj("type", kind, "key", key, "text", text)
+    end
+    for owner, flag in pairs(mem.flagged) do
+      warn("MEM", owner, string.format("MEM %s ~%s, +%s in %d min", short_name(owner), kb_text(flag.kb),
+                                       kb_text(flag.growth), flag.minutes))
+    end
+    for mod, flag in pairs(units.flagged) do
+      warn("UNITS", mod, string.format("UNITS %s %d old units, still rising", short_name(mod), flag.old))
+    end
+    if rehook.repeated[1] ~= nil and rehook.repeated[1].n >= REHOOK_COPIES then
+      warn("REHOOK", rehook.repeated[1].source,
+           string.format("REHOOK %s x%d", short_name(rehook.repeated[1].source), rehook.repeated[1].n))
+    end
+    if (installed.churn_logged or 0) > 0 and installed.churn_line ~= nil then
+      warn("REHOOK", nil, installed.churn_line.text)
+    end
+    for key in pairs(installed.error_told or {}) do
+      warn("LUA_ERRORS", key, short_name(key) .. " keeps raising Lua errors")
+    end
+    if gpu.over_text ~= nil then warn("VRAM", nil, gpu.over_text) end
+    local ok_date, ended = pcall(os.date, "%Y-%m-%d %H:%M:%S")
+    local r = head("closed", installed.session_date, ok_date and ended or nil,
+                   seconds / 60, seconds > 0 and frames / seconds or nil,
+                   session.stalls50, session.stalls200)
+    push(r, "mods", arr(mods))
+    push(r, "warnings", arr(warnings))
+    push(r, "crash", nil)
+    local ok = write(done(r))
+    say("data file: " .. (ok and "written" or "not written") .. " (mod_lag_watchdog.json, " .. #mods .. " mods)")
+  end
+
+  -- Once a minute, the 20 costliest mods into the black box (no disk).
+  installed.data_snapshot = function()
+    local W = installed.box
+    if W == nil or (session.time or 0) <= 0 then return end
+    local render = installed.rt ~= nil and installed.rt.session or {}
+    local rows = {}
+    for key, total in pairs(session.mods or {}) do rows[#rows + 1] = { key = key, total = total } end
+    table.sort(rows, function(a, b) return a.total.time > b.total.time end)
+    local n = math.min(SNAP_ROWS, #rows)
+    W[DATA_SNAP] = 0                                        -- not readable while it changes
+    W[DATA_SNAP + 1] = math.floor(session.time)
+    W[DATA_SNAP + 2] = (session.frames or 0) % 4294967296
+    W[DATA_SNAP + 3] = session.stalls50 or 0
+    W[DATA_SNAP + 4] = session.stalls200 or 0
+    for i = 1, n do
+      local r, o = rows[i], DATA_SNAP + 6 + (i - 1) * SNAP_WORDS
+      local stalls = session.stalls and session.stalls[r.key] or nil
+      W[o] = installed.box_id(r.key)
+      W[o + 1] = math.floor(r.total.time * 1000 / session.time * 100)
+      W[o + 2] = math.floor(r.total.peak * 100)
+      W[o + 3] = math.floor(r.total.worst * 100000)
+      W[o + 4] = math.floor((render[r.key] or 0) * 1000 / session.time * 100)
+      W[o + 5] = stalls and stalls.count or 0
+      W[o + 6] = stalls and stalls.top[1] and math.floor(stalls.top[1] * 1000) or 0
+      W[o + 7] = installed.errors_session[r.key] or 0
+    end
+    W[DATA_SNAP + 5] = n
+    W[DATA_SNAP] = 1
+  end
+
+  -- At the next launch: the session that never closed, from its box.
+  installed.data_write_crash = function(prev, how, crash, ended)
+    local snap = prev.snap
+    local mods = {}
+    for _, row in ipairs(snap and snap.rows or {}) do
+      mods[#mods + 1] = mod_obj({ key = row.key, mss = row.mss, peak = row.peak, worst = row.worst,
+                                  render = row.render, stalls = row.stalls, worst_stall = row.worst_stall,
+                                  errors = row.errors, flags = { "until_the_last_minute" } })
+    end
+    local r = head(how, local_time(prev.start), ended,
+                   snap and snap.seconds / 60 or nil,
+                   snap and snap.seconds > 0 and snap.frames / snap.seconds or nil,
+                   snap and snap.stalls50 or nil, snap and snap.stalls200 or nil)
+    push(r, "mods", arr(mods))
+    push(r, "warnings", arr({}))
+    push(r, "crash", crash)
+    local ok = write(done(r))
+    say("data file: " .. (ok and "written" or "not written") .. " for the last session (" .. how .. ")")
+  end
+  installed.data_obj = obj
+end
+
 -- ------------------------------------------------------------ black box
 
 -- v0.33.0 (the user, 2026-10-09: name the mod behind a crash in play, not
@@ -5225,6 +5473,24 @@ installed.box_setup = function(log_file)
       if length == nil or length > (SLOT - 1) * 4 then break end
       prev.names[n + 2] = string.sub(before, (base + 1) * 4 + 1, (base + 1) * 4 + length)
     end
+    -- v0.40.0: the last minute summary the session put in its box (see
+    -- "data file"): word 7300 is 1 when it is whole.
+    local SNAP = 7300
+    if word(before, SNAP) == 1 then
+      local snap = { seconds = word(before, SNAP + 1), frames = word(before, SNAP + 2),
+                     stalls50 = word(before, SNAP + 3), stalls200 = word(before, SNAP + 4), rows = {} }
+      for i = 1, math.min(word(before, SNAP + 5) or 0, 20) do
+        local o = SNAP + 6 + (i - 1) * 8
+        local key = prev.names[word(before, o) or 0]
+        if key ~= nil then
+          snap.rows[#snap.rows + 1] = { key = key, mss = word(before, o + 1) / 100, peak = word(before, o + 2) / 100,
+                                        worst = word(before, o + 3) / 100, render = word(before, o + 4) / 100,
+                                        stalls = word(before, o + 5), worst_stall = word(before, o + 6),
+                                        errors = word(before, o + 7) }
+        end
+      end
+      prev.snap = snap
+    end
     installed.box_prev = prev
   end
 
@@ -5279,6 +5545,7 @@ installed.box_setup = function(log_file)
   end
   local ok_now, started = pcall(os.time)
   W[8], W[7], W[4], W[3], W[2], W[1] = 0, 0, 0, 0, 1, 1
+  W[7300] = 0                -- v0.40.0: no snapshot yet (installed.DATA_SNAP, see "data file")
   W[5], W[6] = ok_now and tonumber(started) or 0, thread
   W[0] = MAGIC
 
@@ -5392,15 +5659,22 @@ installed.box_setup = function(log_file)
                                 prev.state == 3 and "while closing" or ("running " .. name(prev.who)))
     local newest = newest_dump()
     local dump = newest ~= nil and read_dump(dumps .. "\\" .. newest) or nil
+    local function record(how, crash, ended)
+      if prev.state ~= 3 and installed.data_write_crash ~= nil then
+        pcall(installed.data_write_crash, prev, how, crash, ended)
+      end
+    end
     if dump == nil or dump.written == nil or dump.written < prev.start then
       say(string.format("last crash: the previous session (%s) never closed, and no crash dump was written " ..
                         "after it began (closed by force?): not shown", doing))
+      record("unknown", nil, nil)
       return
     end
     local where = dump.module ~= nil and string.format("%s+0x%X", dump.module, dump.offset)
                   or string.format("0x%X", dump.address or 0)
     local text = string.format("the previous session (%s) crashed: dump %s at %s, exception 0x%08X at %s, thread %d",
                                doing, newest, local_time(dump.written), dump.code or 0, where, dump.thread or 0)
+    local named = nil
     if dump.thread ~= prev.thread then
       say("last crash: " .. text .. "; the mods run on thread " .. tostring(prev.thread) ..
           ", so no mod's update was running in it: not shown")
@@ -5412,9 +5686,17 @@ installed.box_setup = function(log_file)
     elseif prev.state ~= 3 and prev.who >= 3 and prev.names[prev.who] ~= nil then
       say("last crash: " .. text .. ", on the mods' thread, in " .. prev.names[prev.who])
       ui.crash_note = { key = prev.names[prev.who], native = true }
+      named = prev.names[prev.who]
     else
       say("last crash: " .. text .. ", on the mods' thread but in no timed mod" ..
           (prev.top >= 3 and ("; on top, not timed: " .. name(prev.top)) or "") .. ": not shown")
+    end
+    local obj = installed.data_obj
+    if obj ~= nil then
+      record("crashed", obj("key", named, "name", named and short_name(named) or nil, "dump", newest,
+                            "exception", string.format("0x%08X", dump.code or 0), "where", where,
+                            "on_mods_thread", dump.thread == prev.thread, "shown", named ~= nil),
+             local_time(dump.written))
     end
   end
   return "on (mod_lag_finder_box.bin)"
@@ -5429,6 +5711,7 @@ local function main()
     end
   end
   local ok, date = pcall(os.date, "%Y-%m-%d %H:%M:%S")
+  installed.session_date = ok and date or nil
   write_raw(NL .. "== " .. MARKER .. " session " ..
             (ok and tostring(date) or "?") .. " ==" .. NL, "a")
   do
@@ -5448,6 +5731,7 @@ local function main()
     if installed.box ~= nil then installed.box_self = installed.box_id(source_of(main)) end
     say("black box: " .. (ok_box and tostring(told) or ("off (" .. tostring(told) .. ")")))
   end
+  pcall(installed.data_file)
   -- v0.35.0: what render was at load, for the render walk (see "render").
   installed.render_seen = {}
   if type(rawget(_G, "render")) == "function" then installed.render_seen[rawget(_G, "render")] = true end
