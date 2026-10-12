@@ -24,7 +24,7 @@ TEMPLATE = os.path.join(HERE, "lua_archive_template.bin")
 ADDON = "mods/patpatpatrick/mod_lag_finder"
 LUA_T = 0xA14E8DFA2CD117E2
 PAYLOAD_FLAG = 2
-VERSION = "v0.38.0"
+VERSION = "v0.39.0"
 MOD = "Mod Lag Watchdog"
 # A build is a local test build unless the user says it goes to Nexus (the
 # user, 2026-09-30): then the release name has no "Nexus" and the manifest
@@ -104,6 +104,21 @@ def run_check(script, why):
         raise SystemExit(why)
 
 
+def build_id(source):
+    """The build id the Watchdog logs at load (v0.39.0): run the released Lua
+    once in hd2fake, on the game's own lua51.dll, and read its "build:" line.
+    The same bytecode the game makes, so the id matches the one in game."""
+    import re
+    from hd2fake import Session
+    with Session() as s:
+        s.lua("FAKE.mission()")
+        s.load_mod(source=source, name=ADDON)
+        s.frames(2)
+        log = s.file("mod_lag_finder.log", "") or ""
+    m = re.search(r"build: ([0-9a-f]{12}) ", log)
+    return m.group(1) if m else None
+
+
 def build():
     source = open(SOURCE, encoding="utf-8").read()
     run_check("check_lua51_syntax.py", "probe Lua does not parse -- refusing to package")
@@ -151,6 +166,16 @@ def build():
                 bundle.write(full, os.path.relpath(full, OUT))
                 count += 1
     print("lua bytes %d -> %s" % (len(source.encode("utf-8")), ADDON))
+    # The official build ids, one line a release (v0.39.0): a changed copy
+    # someone passes on shows another id in its log and reports.
+    from hd2fake.sources import lua_from_release
+    ident = build_id(lua_from_release(OUT, FOLDER))      # the bytes that ship
+    if ident is None:
+        raise SystemExit("the released Lua logs no build id")
+    builds = os.path.join(os.path.dirname(os.path.dirname(OUT)), "builds.txt")
+    with open(builds, "a", encoding="utf-8") as out:
+        out.write("%s\t%s\n" % (RELEASE, ident))
+    print("build id %s (listed in %s)" % (ident, builds))
     print("wrote %s (%d files, %d bytes)"
           % (zip_path, count, os.path.getsize(zip_path)))
 

@@ -103,7 +103,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.38.0"
+RELEASE = "Mod Lag Watchdog v0.39.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -5017,6 +5017,33 @@ def many_case():
         clean(s, "many mods")
 
 
+def build_id_case():
+    """The build id (v0.39.0): a fingerprint of the running code, in the log
+    at load. The same code gives the same id, under any chunk name; a change
+    to the code (not a comment) gives another. Fails on v0.38.0 (no id)."""
+    print("build id")
+
+    def build_of(source, name="mods/patpatpatrick/mod_lag_finder"):
+        with session() as s:
+            s.lua(GUI_STUB)
+            check(s.load_mod(source=source, name=name), "finder loads as %s" % name)
+            s.frames(5)
+            said = log_lines(s, r"build: ")
+            clean(s, "build id")
+        m = re.search(r"build: ([0-9a-f]{12}) \(this copy's code", said[-1] if said else "")
+        return m.group(1) if m else None
+
+    source = finder_source()
+    first = build_of(source)
+    check(first is not None, "the log names the build: %r" % first)
+    check(build_of(source) == first, "the same code, the same id")
+    check(build_of(source, "mods/someone/watchdog_copy") == first, "under another chunk name too")
+    changed = source.replace('"LAG %s ms - %s"', '"LAG %s ms -- %s"', 1)
+    check(changed != source and build_of(changed) not in (None, first), "a change to the code changes it")
+    commented = source.replace("\nlocal MARKER", "\n-- a comment\nlocal MARKER", 1)
+    check(build_of(commented) == first, "a comment alone does not (only the code counts)")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -5028,6 +5055,7 @@ def main():
         globals()[sys.argv[sys.argv.index("--only") + 1] + "_case"]()
         sys.exit(1 if FAILURES else 0)
     map_case()
+    build_id_case()
     box_case()
     render_case()
     holo_case()

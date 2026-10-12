@@ -120,7 +120,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.38.0"
+local MARKER = "mod-lag-finder-v0.39.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3533,8 +3533,8 @@ local function mod_list_text(at)
   local version = string.match(MARKER, "(v[%d%.]+)$") or MARKER
   local game, seconds, frames = session_cost("(the game)", at)
   local lines = {
-    string.format("Mod Lag Watchdog mod list (%s, game build %s)", version,
-                  native.stamp and string.format("%08X", native.stamp) or "unknown"),
+    string.format("Mod Lag Watchdog mod list (%s, game build %s), Watchdog build %s", version,
+                  native.stamp and string.format("%08X", native.stamp) or "unknown", installed.build or "unknown"),
     string.format("Session: %.0f min, %.0f FPS average; \"(the game)\" %.1f ms/s average",
                   seconds / 60, seconds > 0 and frames / seconds or 0, game),
   }
@@ -3667,8 +3667,9 @@ local function report_text(key, at)
   end
   local lines = {
     string.format("Mod Lag Watchdog report: %s (%s)", name, key),
-    string.format("Game build %s, Watchdog %s, %d mods hook the update",
-                  native.stamp and string.format("%08X", native.stamp) or "unknown", version, chain),
+    string.format("Game build %s, Watchdog %s, %d mods hook the update; Watchdog build %s",
+                  native.stamp and string.format("%08X", native.stamp) or "unknown", version, chain,
+                  installed.build or "unknown"),
     string.format("Session: %.0f min, %.0f FPS average, %d world changes", seconds / 60,
                   seconds > 0 and frames / seconds or 0, units.world_changes or 0),
     string.format("Cost: %.1f ms/s average, %.1f ms/s in the worst minute, worst frame %s ms",
@@ -5139,6 +5140,36 @@ installed.render_summary = function(span)
   rt.minute = {}
 end
 
+-- ------------------------------------------------------------ build id
+
+-- v0.39.0 (the user, 2026-10-13, before opening the source: a copy someone
+-- changed and passed on must not be taken for this one). A fingerprint of
+-- the code that is actually running: the game's own LuaJIT dumps this
+-- chunk's bytecode without debug information (so the chunk name and the
+-- loader do not matter), and two 32-bit running sums over its bytes make
+-- 12 hex digits. Any change to the code changes it; the official builds'
+-- ids are listed with each release. It is in the log, the copied report and
+-- the mod list. It proves nothing against someone who fakes the line on
+-- purpose, only against an honest changed copy. One pass at load, a few ms.
+installed.build_id = function()
+  if installed.build ~= nil then return installed.build end
+  installed.build = "unknown"
+  local dump, fn = rawget(string, "dump"), installed.self_fn
+  if type(dump) ~= "function" or type(fn) ~= "function" then return installed.build end
+  local ok, code = pcall(dump, fn, true)
+  if not ok or type(code) ~= "string" or #code == 0 then return installed.build end
+  local a, b, byte, n = 5381, 0, string.byte, #code
+  for i = 1, n, 64 do
+    local chunk = { byte(code, i, math.min(i + 63, n)) }
+    for k = 1, #chunk do
+      a = (a * 33 + chunk[k]) % 4294967296
+      b = (b * 65599 + chunk[k]) % 4294967296
+    end
+  end
+  installed.build = string.sub(string.format("%08x%08x", a, b), 1, 12)
+  return installed.build
+end
+
 -- ------------------------------------------------------------ black box
 
 -- v0.33.0 (the user, 2026-10-09: name the mod behind a crash in play, not
@@ -5400,6 +5431,11 @@ local function main()
   local ok, date = pcall(os.date, "%Y-%m-%d %H:%M:%S")
   write_raw(NL .. "== " .. MARKER .. " session " ..
             (ok and tostring(date) or "?") .. " ==" .. NL, "a")
+  do
+    local ok_id, id = pcall(installed.build_id)
+    say("build: " .. (ok_id and tostring(id) or "unknown") ..
+        " (this copy's code; the official builds are listed with each release)")
+  end
   if type(getupvalue) ~= "function" or type(setupvalue) ~= "function" or
      type(getinfo) ~= "function" or type(os_clock) ~= "function" then
     say(string.format("cannot work here: debug.getupvalue=%s setupvalue=%s getinfo=%s os.clock=%s",
@@ -5543,6 +5579,7 @@ local function main()
   say("installed; frames of " .. HITCH_MS .. " ms or more are broken down by mod")
 end
 
+installed.self_fn = type(getinfo) == "function" and getinfo(1, "f").func or nil
 local main_ok, main_err = pcall(main)
 pcall(flush_log)
 if not main_ok then
