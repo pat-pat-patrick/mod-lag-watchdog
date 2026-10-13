@@ -47,19 +47,6 @@ It does not:
 - change any mod's behaviour (errors from other mods reach the game unchanged);
 - use the network.
 
-## Official builds
-
-Every copy shows a **build id**, a fingerprint of the code that is actually running. It appears in the log's `build:` line, in every copied report and in the mod list. A copy that was changed shows a different id.
-
-| Version | Build id |
-|---|---|
-| 0.41.0 | `51f7bbb1c3e0` |
-| 0.40.1 | `e833638944fd` |
-| 0.40.0 | `82d49ba8403f` |
-| 0.39.0 | `ea0297414737` |
-
-If your id is not in this table, your copy is not an official build. Please report problems with such a copy to whoever made it.
-
 ## For mod managers and tools
 
 Mod managers are welcome to integrate the Watchdog. The intended way needs no change to its code:
@@ -68,7 +55,7 @@ Mod managers are welcome to integrate the Watchdog. The intended way needs no ch
 2. **Read its results** from `%APPDATA%\Arrowhead\Helldivers2\mod_lag_watchdog.json`. This file is written when the game closes, and at the next launch after a crash. It holds every mod's cost, its stalls, the warnings and the crash verdict. The format is documented in [DATA_JSON.md](DATA_JSON.md).
 3. **Give it names:** if your manager keeps a public list of the user's mods, the Watchdog can show your names in game. Echelon's `library.json` is read today. Open an issue to add another format.
 
-If you need something the file does not give you, please open an issue rather than changing the Watchdog. That way every copy stays the same and keeps a matching build id.
+If you need something the file does not give you, please open an issue rather than changing the Watchdog. That way every copy stays the same.
 
 ## Licence and name
 
