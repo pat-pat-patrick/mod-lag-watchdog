@@ -107,7 +107,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.40.1"
+RELEASE = "Mod Lag Watchdog v0.41.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -5160,6 +5160,40 @@ def data_file_case():
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+BIG_TABLE = r"""
+-- A mod that keeps one table of 300,000 numbers (as Super Holo Kit v1.10.4
+-- kept ~123 MB of Lua, 2026-10-13).
+local big = {}
+for i = 1, 300000 do big[i] = i * 0.5 end
+local previous = rawget(_G, "update")
+rawset(_G, "update", function(...)
+  big[1] = big[1] + 1
+  return previous(...)
+end)
+"""
+
+
+def big_table_case():
+    """One huge table (v0.41.0): the memory walk takes it a slice at a time,
+    so no frame walks more than ~8,700 entries (8,192 plus one slice of
+    512); the table is still counted to its mod. Fails on v0.40.1 (the whole
+    table in one step: 300,000 entries in one frame)."""
+    print("big table")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["std"])
+        check(s.load_mod(source=BIG_TABLE, name="mods/test/big"), "big loads")
+        load(s, ["finder"])
+        s.frames(3900)
+        line = log_lines(s, r"memory: \d+ objects in \d+ frames")
+        m = re.search(r"at most [\d.]+ ms and (\d+) entries a frame", line[-1] if line else "")
+        check(m is not None and int(m.group(1)) <= 8192 + 512,
+              "no frame walks more than one slice past the cap: %r" % line[-1:])
+        mb = re.search(r"big ~([\d.]+) MB", line[-1] if line else "")
+        check(mb is not None and float(mb.group(1)) >= 10, "the table still counts to its mod: %r" % line[-1:])
+        clean(s, "big table")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -5177,6 +5211,7 @@ def main():
     render_case()
     holo_case()
     many_case()
+    big_table_case()
     retry_case()
     stall_case()
     rehook_case()

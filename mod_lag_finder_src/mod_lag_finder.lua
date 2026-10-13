@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.40.1"
+local MARKER = "mod-lag-finder-v0.41.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -2907,6 +2907,13 @@ do
 local MEM_EVERY_S = 60
 local MEM_BUDGET_S = 0.0003
 local MEM_STEPS = 2000
+-- v0.41.0 (the user's game, 2026-10-13: Super Holo Kit v1.10.4 held ~123 MB
+-- of Lua; this module's own worst frame rose to 25-35 ms once a minute): one
+-- table was walked whole in one step, however big. A table is now walked
+-- MEM_SLICE entries at a time, the rest in the next steps and frames, and a
+-- frame stops after MEM_ENTRIES entries whatever the clock says.
+local MEM_SLICE = 512
+local MEM_ENTRIES = 8192
 local MEM_KEEP = 16
 local FLAG_SPAN = 10
 local FLAG_MIN_KB = 256
@@ -2990,17 +2997,35 @@ local function mem_visit(job, obj, owner)
   job.qo[job.tail] = owner
 end
 
+-- One step: a function, or up to MEM_SLICE entries of a table. Returns
+-- whether the object is done, and how many entries this step took. A table
+-- left half-walked goes on from its last key next step; a mod may change it
+-- in between, and if next() refuses the old key, what was counted stands.
 local function mem_process(job, obj, owner)
   local bytes
   if type(obj) == "table" then
-    local entries, strings = 0, 0
-    for key, value in next, obj do
+    local key, entries, strings = nil, 0, 0
+    if job.cont == obj then key, entries, strings = job.cont_key, job.cont_entries, job.cont_strings end
+    local taken = 0
+    while true do
+      local ok, k, value = pcall(next, obj, key)
+      if not ok or k == nil then break end
+      key = k
       entries = entries + 1
       if type(key) == "string" then strings = strings + #key else mem_visit(job, key, owner) end
       if type(value) == "string" then strings = strings + #value else mem_visit(job, value, owner) end
+      taken = taken + 1
+      if taken >= MEM_SLICE then
+        job.cont, job.cont_key, job.cont_entries, job.cont_strings = obj, key, entries, strings
+        return false, taken
+      end
     end
+    job.cont, job.cont_key = nil, nil
     if getmeta ~= nil then mem_visit(job, getmeta(obj), owner) end
     bytes = 64 + 40 * entries + strings
+    job.size[owner] = (job.size[owner] or 0) + bytes
+    job.objects = job.objects + 1
+    return true, taken
   else
     bytes = 40
     for index = 1, 255 do
@@ -3011,6 +3036,7 @@ local function mem_process(job, obj, owner)
   end
   job.size[owner] = (job.size[owner] or 0) + bytes
   job.objects = job.objects + 1
+  return true, 1
 end
 
 kb_text = function(kb)
@@ -3048,8 +3074,10 @@ local function mem_finish(job, at)
   end
   local ok, heap = false, nil
   if type(collect) == "function" then ok, heap = pcall(collect, "count") end
-  say(string.format("memory: %d objects in %d frames (%.1f ms); world #%d; Lua heap %s; shared ~%s; %s",
-                    job.objects, job.frames, job.spent * 1000, job.world,
+  say(string.format("memory: %d objects in %d frames (%.1f ms, at most %.1f ms and %d entries a frame); " ..
+                    "world #%d; Lua heap %s; shared ~%s; %s",
+                    job.objects, job.frames, job.spent * 1000, (job.worst_frame or 0) * 1000,
+                    job.most_entries or 0, job.world,
                     (ok and type(heap) == "number") and kb_text(heap) or "?",
                     kb_text((job.size[SHARED] or 0) / 1024), table.concat(parts, ", ")))
   -- A leak only grows: no drop over the last FLAG_SPAN walks, grown by
@@ -3146,8 +3174,8 @@ mem_step = function(at)
     mem.job = job
   end
   local started = timer_now()
-  local steps = 0
-  while steps < MEM_STEPS do
+  local steps, entries = 0, 0
+  while steps < MEM_STEPS and entries < MEM_ENTRIES do
     if job.head > job.tail then
       -- Everything shared is marked before any mod is walked.
       job.phase = 2
@@ -3169,15 +3197,25 @@ mem_step = function(at)
     else
       local head = job.head
       local obj, owner = job.q[head], job.qo[head]
-      job.q[head], job.qo[head] = nil, nil
-      job.head = head + 1
-      mem_process(job, obj, owner)
+      local done, taken = mem_process(job, obj, owner)
+      if done then
+        job.q[head], job.qo[head] = nil, nil
+        job.head = head + 1
+      end
+      entries = entries + taken
+      if taken >= 64 and timer_now() - started >= MEM_BUDGET_S then
+        steps = steps + 1
+        break
+      end
     end
     steps = steps + 1
     if steps % 32 == 0 and timer_now() - started >= MEM_BUDGET_S then break end
   end
   job.frames = job.frames + 1
-  job.spent = job.spent + (timer_now() - started)
+  local took = timer_now() - started
+  job.spent = job.spent + took
+  if took > (job.worst_frame or 0) then job.worst_frame = took end
+  if entries > (job.most_entries or 0) then job.most_entries = entries end
 end
 end   -- memory
 

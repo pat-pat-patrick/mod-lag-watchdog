@@ -53,6 +53,7 @@ Every copy shows a **build id**, a fingerprint of the code that is actually runn
 
 | Version | Build id |
 |---|---|
+| 0.41.0 | `51f7bbb1c3e0` |
 | 0.40.1 | `e833638944fd` |
 | 0.40.0 | `82d49ba8403f` |
 | 0.39.0 | `ea0297414737` |
