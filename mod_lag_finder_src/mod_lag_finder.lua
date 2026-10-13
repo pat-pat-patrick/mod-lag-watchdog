@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.47.0"
+local MARKER = "mod-lag-finder-v0.48.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3261,7 +3261,21 @@ local function mem_finish(job, at)
       if minutes < FLAG_SPAN then minutes = FLAG_SPAN end
       local found = { kb = history[count].kb, growth = growth, minutes = minutes }
       if grows and crossed and growth >= FLAG_MIN_KB then leak = found end
-      if grows and growth >= SCREEN_MIN_KB * minutes / FLAG_SPAN then fast = found end
+      -- v0.48.0: on screen, steady growth only: the largest single step is
+      -- left out, with its time. A mod that loads its data once (Super Holo
+      -- Kit at landing: 1 MB -> 437 MB in one count) then grows a little
+      -- read "+500 MB in 12 min" in v0.47.0; the growth after the step is
+      -- what a leak looks like. A steady leak loses one step of ten.
+      local step, step_s = -1, 0
+      for index = start + 1, count do
+        local rise = history[index].kb - history[index - 1].kb
+        if rise > step then step, step_s = rise, history[index].at - history[index - 1].at end
+      end
+      local steady = growth - math.max(step, 0)
+      local steady_min = math.max(history[count].at - first.at - step_s, 1) / 60
+      if grows and steady >= SCREEN_MIN_KB * steady_min / FLAG_SPAN then
+        fast = { kb = history[count].kb, growth = steady, minutes = math.max(1, math.floor(steady_min + 0.5)) }
+      end
     end
     -- The log: every leak, however small.
     if leak ~= nil and mem.logged[owner] == nil then

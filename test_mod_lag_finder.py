@@ -1589,8 +1589,9 @@ def memory_case():
         s.lua("FAKE.press('home')")
         s.frames(3)
         shown = s.eval("SHOWN()")
-        # v0.42.0: the minutes the 10 counts really spanned (10-11 here).
-        check(re.search(r"MEM runaway ~[\d.]+ MB, \+[\d.]+ MB in 1[01] min", shown) is not None,
+        # v0.42.0: the minutes the 10 counts really spanned (10-11 here);
+        # v0.48.0: less the largest single step, so 9-11.
+        check(re.search(r"MEM runaway ~[\d.]+ MB, \+[\d.]+ MB in (9|10|11) min", shown) is not None,
               "the window names the runaway: %r" % shown)
         check(re.search(r"MEM (leaky|steady|wave|mission|global|hooker|mod_lag_finder)", shown) is None,
               "and nothing else: a 700 KB leak stays in the log: %r" % shown)
@@ -5316,6 +5317,48 @@ def sparse_leak_case():
         clean(s, "sparse leak")
 
 
+LOAD_THEN = r"""
+local previous = rawget(_G, "update")
+local held, n = {}, 0
+rawset(_G, "update", function(...)
+  n = n + 1
+  if n == 1200 then                                    -- 5 min in: one big load, ~60 MB
+    for i = 1, 7500 do held[#held + 1] = string.rep("y", 8000) .. i end
+  elseif n > 1200 and GROW_AFTER then
+    held[#held + 1] = string.rep("x", 8000) .. n       -- then ~1.9 MB a minute
+  end
+  return previous(...)
+end)
+"""
+
+
+def load_step_case():
+    """A one-time load is not a leak (v0.48.0). Counts 12 minutes apart
+    (__mlf_mem_every). A mod that loads ~60 MB once and then stays flat is
+    not flagged; the same load followed by steady growth is, and the screen
+    figure is the growth after the load, not the load. In game, v0.47.0
+    showed Super Holo Kit "+500 MB in 12 min" for a 436 MB landing load plus
+    64 MB of growth. Fails on v0.47.0."""
+    print("load step")
+    for grow in (False, True):
+        with session() as s:
+            s.lua(GUI_STUB)
+            s.lua("FAKE.before_frame = function() CLOCK = CLOCK + 0.25 end")   # 4 frames a second
+            s.lua("__mlf_mem_every = 720")
+            s.lua("GROW_AFTER = %s" % ("true" if grow else "false"))
+            load(s, ["std", "finder"])
+            check(s.load_mod(source=LOAD_THEN, name="mods/test/loader"), "loader loads")
+            s.frames(int(40 * 60 / 0.25))
+            fast = log_lines(s, r"memory: mods/test/loader grows fast")
+            if not grow:
+                check(not fast, "a load then flat is not flagged: %r" % fast)
+            else:
+                m = re.search(r"\+([\d.]+) MB in (\d+) min", fast[0] if fast else "")
+                check(m is not None and float(m.group(1)) < 50,
+                      "load then growth is flagged, with the growth after the load (~1.9 MB/min): %r" % fast[:1])
+            clean(s, "load step")
+
+
 def main():
     global BACKEND, SOURCE, RELEASE_V
     if "--backend" in sys.argv:
@@ -5339,6 +5382,7 @@ def main():
     own_cost_case()
     own_last_case()
     sparse_leak_case()
+    load_step_case()
     retry_case()
     stall_case()
     rehook_case()
