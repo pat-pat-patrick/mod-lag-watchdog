@@ -107,7 +107,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.43.0"
+RELEASE = "Mod Lag Watchdog v0.44.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -5213,8 +5213,9 @@ end)
 def own_cost_case():
     """This module's own cost (v0.42.0, the user: ~11 ms/s in a mission is a
     bit much for a basic tool). With real time on the clock and a mod holding
-    4 M numbers: the next memory count waits 1000 times what the last one
-    took, at least the usual minute ("next in N s" = max(60, ms taken)), and
+    4 M numbers: the next memory count waits 2000 times what the last one
+    took (1000 in v0.42.0), at least the usual minute ("next in N s" =
+    max(60, 2 x ms taken)), and
     does not start sooner; the minute line splits this module's time by
     part. Fails on v0.41.0 (a count every minute, no parts)."""
     print("own cost")
@@ -5234,7 +5235,7 @@ def own_cost_case():
             return
         at, took, wait = float(m.group(1)), float(m.group(2)), int(m.group(3))
         print("    first count: %.0f ms, next in %d s" % (took, wait))
-        check(abs(wait - max(60, took)) <= 2, "it waits max(60 s, 1000 x its own time): %.0f ms -> %d s" % (took, wait))
+        check(abs(wait - max(60, 2 * took)) <= 2, "it waits max(60 s, 2000 x its own time): %.0f ms -> %d s" % (took, wait))
         s.frames(int((wait + 40) / 0.016))
         counts = log_lines(s, r"memory: \d+ objects in \d+ frames")
         times = [float(re.match(r"t=([\d.]+)", l).group(1)) for l in counts]

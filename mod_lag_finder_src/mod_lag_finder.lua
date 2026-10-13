@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.43.0"
+local MARKER = "mod-lag-finder-v0.44.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1644,10 +1644,13 @@ local function write_summary(at)
   pcall(installed.render_summary, span)
   do
     local parts, shown = installed.own_parts or {}, {}
-    for _, part in ipairs({ "screen", "times", "gc", "chain", "memory", "units", "vram", "render", "log" }) do
+    for _, part in ipairs({ "screen", "key", "menu", "draw", "times", "gc", "chain", "memory", "units", "vram",
+                            "render", "log", "before", "call", "after" }) do
       local value = (parts[part] or 0) * 1000 / span
       if value >= 0.05 then shown[#shown + 1] = string.format("%s %.2f", part, value) end
     end
+    -- v0.44.0: before, call and after are outside the tick: not in the
+    -- first figure, which is the tick's own time.
     say(string.format("  this module: %.2f ms/s, worst frame %.1f ms%s",
                       (installed.own_time or 0) * 1000 / span, (installed.own_worst or 0) * 1000,
                       #shown > 0 and ("; parts (ms/s): " .. table.concat(shown, ", ")) or ""))
@@ -2970,7 +2973,9 @@ local MEM_ENTRIES = 8192
 -- what the last one took, so on average it costs at most 1 ms/s: a 340 ms
 -- count waits ~6 minutes, a 20 ms one the usual minute. A leak is still
 -- judged over FLAG_SPAN counts; its minutes are read from their times.
-local MEM_COST_K = 1000
+-- v0.44.0: 2000 (at most ~0.5 ms/s; in game 2026-10-13 a 170 ms count every
+-- ~3 minutes was still ~1 ms/s, the minute it ran +3 ms/s).
+local MEM_COST_K = 2000
 local MEM_KEEP = 16
 local FLAG_SPAN = 10
 local FLAG_MIN_KB = 256
@@ -4245,6 +4250,10 @@ local function handle_mouse()
 end
 
 local function display(at)
+  -- v0.44.0: the screen part split ("key", "menu", "draw"; the rest stays
+  -- "screen"): in game it stayed at ~0.8 ms/s with the menu read every
+  -- third frame (v0.43.0), so the reads were not what cost.
+  local lap, mark = installed.lap, timer_now()
   rehook_alert(at)
   -- The last session's crash, once, on the ship (v0.15.0; the user chose the
   -- log and one line on the next launch). On the ship = 20 s after the first
@@ -4264,12 +4273,14 @@ local function display(at)
       say("last crash shown: " .. text)
     end
   end
+  mark = lap("screen", mark)
   if key_pressed() then
     ui.panel = not ui.panel
     ui.dirty = true
     save_place()
     say(ui.panel and "panel opened" or "panel closed")
   end
+  mark = lap("key", mark)
   if toast ~= nil and at >= toast.until_at then
     toast = nil
     ui.dirty = true
@@ -4284,9 +4295,11 @@ local function display(at)
     end
   end
   if in_menu then handle_mouse() end
+  mark = lap("menu", mark)
   if not (in_menu or ui.panel or (toast ~= nil and (not ui.alerts_off or toast.always))) then
     if ui.gui ~= nil then drop_gui() end
     ui.dirty = false
+    lap("screen", mark)
     return
   end
   if ui.dirty or at >= ui.next_refresh then
@@ -4294,6 +4307,7 @@ local function display(at)
     ui.next_refresh = at + REFRESH_S
     draw(items(at))
   end
+  lap("draw", mark)
 end
 
 -- ------------------------------------------------------------------ tick
@@ -4663,9 +4677,8 @@ local function tick(failed)
   end
   mark = lap("vram", mark)
   if at - window.started >= SUMMARY_S then write_summary(at) end
-  mark = lap("log", mark)
+  lap("log", mark)
   display(at)
-  lap("screen", mark)
 end
 
 -- ------------------------------------------------------------ update hook
@@ -4904,10 +4917,24 @@ local function arm()
       if W ~= nil then W[3] = outer end
     end
     local function after(outer, ok, ...)
+      local back = timer_now()
       installed.depth = 0
+      do
+        local called, below = installed.called_at, our_index and links[our_index + 1] or nil
+        if called ~= nil then
+          local inside = back - called
+          if below ~= nil and below.last_frame == installed.frame_id then inside = inside - below.last_incl end
+          if inside > 0 then
+            local parts = installed.own_parts
+            parts.call = (parts.call or 0) + inside
+          end
+        end
+      end
       if installed.box ~= nil then installed.box[3] = outer end
-      if installed.generation == generation then run_tick(not ok or installed.frame_failed) end
+      local ticked = installed.generation == generation
+      if ticked then run_tick(not ok or installed.frame_failed) end
       if installed.gcp ~= nil then pcall(installed.gc_frame_out) end
+      installed.lap("after", back + (ticked and installed.tick_cost or 0))
       if ok then return ... end
       error((...), 0)
     end
@@ -4924,6 +4951,7 @@ local function arm()
       if installed.depth > 0 or installed.generation ~= generation then
         return previous_update(...)
       end
+      local entered = timer_now()
       frame_dt = (...)
       frame_argc = select("#", ...)
       if installed.crash_pending ~= nil then pcall(survived) end
@@ -4939,6 +4967,11 @@ local function arm()
         W[4] = installed.frame_id % 4294967296
       end
       if installed.gcp ~= nil then pcall(installed.gc_frame_in) end
+      -- v0.44.0: this module's time outside its tick (log only), in three
+      -- parts: "before" the chain, the "call" into it (the frame's time in
+      -- the chain less what the link below us measured: the xpcall and the
+      -- shim's own work), and "after" it, less the tick (own_time).
+      installed.called_at = installed.lap("before", entered)
       if installed.xpcall_args then
         return after(outer, xpcall(previous_update, on_error, ...))
       end
