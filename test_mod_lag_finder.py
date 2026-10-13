@@ -4141,7 +4141,10 @@ def gc_case():
                   "a step between frames costs the 5 ms the engine took: %r" % line[-1:])
             check(m is not None and 0.07 <= (int(m.group(4)) + int(m.group(5))) / max(1, int(m.group(2)) + int(m.group(4)) + int(m.group(5))) <= 0.13,
                   "about one frame in ten had a step: %r" % line[-1:])
-            check(m is not None and 25.0 <= float(m.group(6)) <= 35.0,
+            # v0.46.0: the time between frames is read after one frame in
+            # four, at random: ~900 readings a minute, of which ~90 with a
+            # step, so the count is good to ~10% (1 sigma); 2 sigma allowed.
+            check(m is not None and 22.0 <= float(m.group(6)) <= 38.0,
                   "5 ms x 6 steps a second (60 frames a second, virtual) = ~30 ms/s: %r" % line[-1:])
             clean(s, "gc between frames")
         # v0.27.0: as in game (2026-10-03), the engine steps the collector

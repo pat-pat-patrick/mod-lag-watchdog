@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.45.0"
+local MARKER = "mod-lag-finder-v0.46.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1341,7 +1341,7 @@ local function gc_window(a, b)
   return true, wrap or sa >= 3 or sb >= 3, sa <= 2 and (sb >= 3 or wrap)
 end
 
--- v0.43.0: the split runs in one frame of GC_EVERY and counts that frame
+-- v0.43.0: the split runs in one frame of GC_EVERY (v0.46.0: at random) and counts that frame
 -- GC_EVERY times (it is statistical anyway: good over a minute, not for one
 -- frame); a frame long enough to be a stall is always looked at, for its
 -- line, and counted 0 times when it is not a sampled one. In game it was
@@ -1522,8 +1522,8 @@ installed.gc_frame_in = function()
   local o = installed.gcw.outside
   local hist = atomic and o.atomic or (stepped and o.step or o.plain)
   local bucket = math.floor(outside * 10000)
-  hist[bucket] = (hist[bucket] or 0) + 1
-  hist.n = hist.n + 1
+  hist[bucket] = (hist[bucket] or 0) + 4          -- one frame in four (v0.46.0)
+  hist.n = hist.n + 4
 end
 
 local function gc_median(hist)
@@ -1584,21 +1584,57 @@ local function charge_row(rows, key, own)
 end
 
 local function charge(frame_selfs)
-  -- v0.43.0: a counted loop over the links, then MDL's scripts at -1, -2, ...
-  -- (add_mdl), where pairs() went over the table every frame.
-  local rows, bucket = window.mods, live.bucket ~= nil and live.bucket.mods or nil
-  local index = #links
-  while true do
+  -- v0.46.0 (in game: this part of the tick ~1.5 ms/s with 30 links): a
+  -- link's time is added up on the link itself, a number and a max, and put
+  -- into the rows by name once a second (installed.fold) and before anything
+  -- reads them. A link that leaves the chain is still folded: the links
+  -- with time not yet folded are listed apart.
+  local waiting = installed.acc_waiting
+  for index = #links, 2, -1 do
     local entry = frame_selfs[index]
     if entry ~= nil then
-      local key = owner(entry.link)
-      charge_row(rows, key, entry.own)
-      if bucket ~= nil then charge_row(bucket, key, entry.own) end
-    elseif index < 0 then
-      break
+      local link, own = entry.link, entry.own
+      local t = link.acc_t
+      if t == nil then
+        t = 0
+        link.acc_w = 0
+        waiting[#waiting + 1] = link
+      end
+      link.acc_t = t + own
+      if own > link.acc_w then link.acc_w = own end
     end
-    index = index - 1
-    if index == 1 then index = -1 end
+  end
+  -- MDL's scripts (add_mdl puts them at -1, -2, ...): straight into the rows.
+  local k = -1
+  while frame_selfs[k] ~= nil do
+    local entry = frame_selfs[k]
+    local key = owner(entry.link)
+    charge_row(window.mods, key, entry.own)
+    if live.bucket ~= nil then charge_row(live.bucket.mods, key, entry.own) end
+    k = k - 1
+  end
+end
+
+installed.acc_waiting = {}
+installed.fold = function()
+  local waiting = installed.acc_waiting
+  local n = #waiting
+  if n == 0 then return end
+  local rows, bucket = window.mods, live.bucket ~= nil and live.bucket.mods or nil
+  for i = 1, n do
+    local link = waiting[i]
+    waiting[i] = nil
+    local key, t, w = owner(link), link.acc_t or 0, link.acc_w or 0
+    link.acc_t, link.acc_w = nil, 0
+    for _, into in ipairs({ rows, bucket }) do
+      local row = into[key]
+      if row == nil then
+        row = { time = 0, worst = 0 }
+        into[key] = row
+      end
+      row.time = row.time + t
+      if w > row.worst then row.worst = w end
+    end
   end
 end
 
@@ -1608,12 +1644,14 @@ local function roll(at)
     return
   end
   if at - live.bucket.at < 1 then return end
+  installed.fold()
   live.ring[#live.ring + 1] = live.bucket
   while #live.ring > WINDOW_S do table.remove(live.ring, 1) end
   live.bucket = new_bucket(at)
 end
 
 local function write_summary(at)
+  installed.fold()
   local span = at - (window.started or at)
   if span <= 0 then return end
   local rows = {}
@@ -3638,6 +3676,7 @@ end
 
 -- A key's cost so far: ms/s over the session, and the session's length.
 local function session_cost(key, at)
+  installed.fold()
   local partial = window.started and math.max(0, at - window.started) or 0
   local seconds = (session.time or 0) + partial
   local total = session.mods and session.mods[key] or nil
@@ -3703,6 +3742,7 @@ local function report_text(key, at)
     end
   end
   -- The session so far: the summaries written plus the minute under way.
+  installed.fold()
   local partial = window.started and math.max(0, at - window.started) or 0
   local seconds = (session.time or 0) + partial
   local frames = (session.frames or 0) + window.frames
@@ -3864,6 +3904,7 @@ end
 end   -- report
 
 local function panel_lines(at)
+  installed.fold()
   local out = {}
   local rows, frames, time, stalls, seconds = {}, 0, 0, 0, 0
   local merged = {}
@@ -4260,7 +4301,7 @@ local function display(at)
   -- v0.44.0: the screen part split ("key", "menu", "draw"; the rest stays
   -- "screen"): in game it stayed at ~0.8 ms/s with the menu read every
   -- third frame (v0.43.0), so the reads were not what cost.
-  local lap, mark = installed.lap, timer_now()
+  local lap, mark = installed.lap, installed.lap_now and timer_now() or 0
   rehook_alert(at)
   -- The last session's crash, once, on the ship (v0.15.0; the user chose the
   -- log and one line on the next launch). On the ship = 20 s after the first
@@ -4493,17 +4534,33 @@ end
 -- ("this module: ... ms/s; parts: ..."): the user found ~5 ms/s on the ship
 -- and ~11 in a mission a bit much for a basic tool, and offline (no game GUI,
 -- units or video memory) it is ~0.5. One timer reading a part.
+-- v0.46.0: on one frame in lap_every, counted that many times: the ~15
+-- timer readings a frame cost something themselves (a part's share over a
+-- minute is what is wanted, not one frame's).
 installed.own_parts = {}
+-- Which frames: at random (Park-Miller), not every n-th frame -- a mod (or
+-- the engine) that works every n frames would line up with a fixed step and
+-- be seen always or never (the test's collector, stepped every 10th frame,
+-- was seen 4 times in a minute with frames 3 and 4 of every 4).
+installed.rng = 12345
+installed.chance = function(n)
+  local r = (installed.rng * 16807) % 2147483647
+  installed.rng = r
+  return r % n == 0
+end
+installed.lap_every = 8
+installed.lap_now = false
 installed.lap = function(part, mark)
+  if not installed.lap_now then return mark end
   local t = timer_now()
   local parts = installed.own_parts
-  parts[part] = (parts[part] or 0) + (t - mark)
+  parts[part] = (parts[part] or 0) + (t - mark) * installed.lap_every
   return t
 end
 
 local function tick(failed)
   local at = now()
-  local lap, mark = installed.lap, timer_now()
+  local lap, mark = installed.lap, installed.lap_now and timer_now() or 0
   if installed.rt ~= nil then pcall(installed.render_tick) end
   mark = lap("render", mark)
   if window.started == nil then
@@ -4576,7 +4633,7 @@ local function tick(failed)
   mark = lap("times", mark)
   do
     local every = installed.gc_every
-    local sampled = installed.frame_id % every == 0
+    local sampled = installed.chance(every)
     local long = last_tick_time ~= nil and (at - last_tick_time) * 1000 >= HITCH_MS
     local ok, err = true, nil
     if sampled or long then ok, err = pcall(installed.gc_frame, frame_selfs, sampled and every or 0) end
@@ -4924,7 +4981,7 @@ local function arm()
       if W ~= nil then W[3] = outer end
     end
     local function after(outer, ok, ...)
-      local back = timer_now()
+      local back = installed.lap_now and timer_now() or 0
       installed.depth = 0
       do
         local called, below = installed.called_at, our_index and links[our_index + 1] or nil
@@ -4935,15 +4992,17 @@ local function arm()
           if below ~= nil and below.last_frame == installed.frame_id then inside = back - called - below.last_incl end
           if inside > 0 then
             local parts = installed.own_parts
-            parts.call = (parts.call or 0) + inside
+            parts.call = (parts.call or 0) + inside * installed.lap_every
           end
         end
       end
       if installed.box ~= nil then installed.box[3] = outer end
       local ticked = installed.generation == generation
       if ticked then run_tick(not ok or installed.frame_failed) end
-      if installed.gcp ~= nil then pcall(installed.gc_frame_out) end
-      installed.lap("after", back + (ticked and installed.tick_cost or 0))
+      -- v0.46.0: the time between frames is read after one frame in four,
+      -- at random, up to the next frame; each reading counts four times.
+      if installed.gcp ~= nil and installed.chance(4) then pcall(installed.gc_frame_out) end
+      if installed.lap_now then installed.lap("after", back + (ticked and installed.tick_cost or 0)) end
       if ok then return ... end
       error((...), 0)
     end
@@ -4961,12 +5020,19 @@ local function arm()
         return previous_update(...)
       end
       local entered = timer_now()
+      installed.lap_now = installed.chance(installed.lap_every)
       frame_dt = (...)
       frame_argc = select("#", ...)
       if installed.crash_pending ~= nil then pcall(survived) end
       installed.last_err, installed.frame_failed = nil, false
       installed.frame_id = installed.frame_id + 1
-      installed.last_tick_at = clock()
+      -- v0.46.0: the engine's clock at most every 0.1 s, not every frame
+      -- (an engine call; "before" was ~1 ms/s in game). Staleness is judged
+      -- at 0.5 s and more (update_is_live), so 0.1 s late changes nothing.
+      if entered - (installed.clock_read_t or -1) >= 0.1 or entered < (installed.clock_read_t or 0) then
+        installed.last_tick_at = clock()
+        installed.clock_read_t = entered
+      end
       installed.tick_calls = installed.mw_calls
       installed.depth = 1
       -- v0.33.0: in the update, in no timed mod until a shim says which.
@@ -4975,12 +5041,12 @@ local function arm()
         outer, W[3] = W[3], 2
         W[4] = installed.frame_id % 4294967296
       end
-      if installed.gcp ~= nil then pcall(installed.gc_frame_in) end
+      if installed.gcp ~= nil and installed.gc_out_t ~= nil then pcall(installed.gc_frame_in) end
       -- v0.44.0: this module's time outside its tick (log only), in three
       -- parts: "before" the chain, the "call" into it (the frame's time in
       -- the chain less what the link below us measured: the xpcall and the
       -- shim's own work), and "after" it, less the tick (own_time).
-      installed.called_at = installed.lap("before", entered)
+      installed.called_at = installed.lap_now and installed.lap("before", entered) or nil
       if installed.xpcall_args then
         return after(outer, xpcall(previous_update, on_error, ...))
       end
@@ -5495,6 +5561,7 @@ installed.data_file = function()
 
   -- The whole session, when the game closes.
   installed.data_write_live = function(at)
+    installed.fold()
     local partial = window.started and math.max(0, at - window.started) or 0
     local seconds = (session.time or 0) + partial
     local frames = (session.frames or 0) + window.frames
