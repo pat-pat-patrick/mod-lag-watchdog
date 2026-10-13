@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.44.0"
+local MARKER = "mod-lag-finder-v0.45.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3250,10 +3250,17 @@ mem_step = function(at)
       local ok, registry = pcall(getregistry)
       if ok then mem_visit(job, registry, SHARED) end
     end
+    -- v0.45.0: this module is walked last. An object goes to the first mod
+    -- that reaches it, and this module holds other mods' tables: the slot a
+    -- mod keeps its previous update or render in (a field of its own table).
+    -- Walked first -- on top of the chain, as it usually is -- it took them:
+    -- in game 2026-10-13 "Mod Lag Watchdog ~194 MB", Super Holo Kit's.
+    local own = type(installed.wrapper) == "function" and mod_of(installed.wrapper) or nil
     for _, link in ipairs(links) do
       local mod = type(link.fn) == "function" and mod_of(link.fn) or nil
-      if mod ~= nil then mem_add_root(job, link.fn, mod) end
+      if mod ~= nil and mod ~= own then mem_add_root(job, link.fn, mod) end
     end
+    if own ~= nil then mem_add_root(job, installed.wrapper, own) end
     mem.job = job
   end
   local started = timer_now()
@@ -4922,8 +4929,10 @@ local function arm()
       do
         local called, below = installed.called_at, our_index and links[our_index + 1] or nil
         if called ~= nil then
-          local inside = back - called
-          if below ~= nil and below.last_frame == installed.frame_id then inside = inside - below.last_incl end
+          -- Only when the link below timed this frame (v0.45.0: while the
+          -- chain was still being mapped, the whole chain counted as "call").
+          local inside = -1
+          if below ~= nil and below.last_frame == installed.frame_id then inside = back - called - below.last_incl end
           if inside > 0 then
             local parts = installed.own_parts
             parts.call = (parts.call or 0) + inside

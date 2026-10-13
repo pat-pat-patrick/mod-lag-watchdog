@@ -5248,12 +5248,46 @@ def own_cost_case():
         clean(s, "own cost")
 
 
+FIELD_BIG = r"""
+local M = { prev = rawget(_G, "update"), data = {} }
+for i = 1, 200000 do M.data[i] = i * 0.5 end
+rawset(_G, "update", function(...)
+  return M.prev(...)
+end)
+"""
+
+
+def own_last_case():
+    """This module is walked last in the memory count (v0.45.0). A mod that
+    keeps its previous update in a field of its own table, with its data in
+    that table: the Watchdog holds the table (the slot) and sits on top, so
+    it was walked first and the data was counted as the Watchdog's (in game:
+    "Mod Lag Watchdog ~194 MB", Super Holo Kit's). Fails on v0.44.0."""
+    print("own last")
+    with session() as s:
+        s.lua(GUI_STUB)
+        load(s, ["std"])
+        check(s.load_mod(source=FIELD_BIG, name="mods/test/fieldbig"), "fieldbig loads")
+        load(s, ["finder"])
+        s.frames(3900)
+        line = log_lines(s, r"memory: \d+ objects in \d+ frames")
+        text = line[-1] if line else ""
+        big = re.search(r"fieldbig ~([\d.]+) (MB|KB)", text)
+        mine = re.search(r"mod_lag_finder ~([\d.]+) (MB|KB)", text)
+        size = lambda m: float(m.group(1)) * (1024 if m.group(2) == "MB" else 1) if m else 0
+        check(size(big) >= 5 * 1024 and size(mine) < 2 * 1024,
+              "the mod's data counts to the mod, not to this module: %r" % text[:300])
+        clean(s, "own last")
+
+
 def main():
-    global BACKEND, SOURCE
+    global BACKEND, SOURCE, RELEASE_V
     if "--backend" in sys.argv:
         BACKEND = sys.argv[sys.argv.index("--backend") + 1]
     if "--source" in sys.argv:
         SOURCE = os.path.join(HERE, "mod_lag_finder_src", "mod_lag_finder.lua")
+        # The version the working source says it is, not the last build's.
+        RELEASE_V = re.search(r'local MARKER = "mod-lag-finder-(v[\d.]+)"', finder_source()).group(1)
     static()
     if "--only" in sys.argv:
         globals()[sys.argv[sys.argv.index("--only") + 1] + "_case"]()
@@ -5267,6 +5301,7 @@ def main():
     many_case()
     big_table_case()
     own_cost_case()
+    own_last_case()
     retry_case()
     stall_case()
     rehook_case()
