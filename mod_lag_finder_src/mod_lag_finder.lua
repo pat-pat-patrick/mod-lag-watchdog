@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.41.0"
+local MARKER = "mod-lag-finder-v0.42.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1608,8 +1608,17 @@ local function write_summary(at)
   -- v0.24.0: what this module itself took, outside the shims (its tick: the
   -- walk, summaries, the window, log writes).
   pcall(installed.render_summary, span)
-  say(string.format("  this module: %.2f ms/s, worst frame %.1f ms",
-                    (installed.own_time or 0) * 1000 / span, (installed.own_worst or 0) * 1000))
+  do
+    local parts, shown = installed.own_parts or {}, {}
+    for _, part in ipairs({ "screen", "times", "chain", "memory", "units", "vram", "render", "log" }) do
+      local value = (parts[part] or 0) * 1000 / span
+      if value >= 0.05 then shown[#shown + 1] = string.format("%s %.2f", part, value) end
+    end
+    say(string.format("  this module: %.2f ms/s, worst frame %.1f ms%s",
+                      (installed.own_time or 0) * 1000 / span, (installed.own_worst or 0) * 1000,
+                      #shown > 0 and ("; parts (ms/s): " .. table.concat(shown, ", ")) or ""))
+    installed.own_parts = {}
+  end
   installed.own_time, installed.own_worst = 0, 0
   local raised = {}
   for key, n in pairs(installed.errors) do raised[#raised + 1] = { key = key, n = n } end
@@ -2914,6 +2923,13 @@ local MEM_STEPS = 2000
 -- frame stops after MEM_ENTRIES entries whatever the clock says.
 local MEM_SLICE = 512
 local MEM_ENTRIES = 8192
+-- v0.42.0 (the user, 2026-10-13: the Watchdog took ~11 ms/s in a mission
+-- where Super Holo Kit held ~200 MB, about half of it this count; "a bit
+-- much for a basic tool"). The next count waits at least MEM_COST_K times
+-- what the last one took, so on average it costs at most 1 ms/s: a 340 ms
+-- count waits ~6 minutes, a 20 ms one the usual minute. A leak is still
+-- judged over FLAG_SPAN counts; its minutes are read from their times.
+local MEM_COST_K = 1000
 local MEM_KEEP = 16
 local FLAG_SPAN = 10
 local FLAG_MIN_KB = 256
@@ -3005,19 +3021,36 @@ local function mem_process(job, obj, owner)
   local bytes
   if type(obj) == "table" then
     local key, entries, strings = nil, 0, 0
-    if job.cont == obj then key, entries, strings = job.cont_key, job.cont_entries, job.cont_strings end
+    local go_on = true
+    if job.cont == obj then
+      key, entries, strings = job.cont_key, job.cont_entries, job.cont_strings
+      go_on = pcall(next, obj, key)
+    end
     local taken = 0
-    while true do
-      local ok, k, value = pcall(next, obj, key)
-      if not ok or k == nil then break end
-      key = k
-      entries = entries + 1
-      if type(key) == "string" then strings = strings + #key else mem_visit(job, key, owner) end
-      if type(value) == "string" then strings = strings + #value else mem_visit(job, value, owner) end
-      taken = taken + 1
-      if taken >= MEM_SLICE then
-        job.cont, job.cont_key, job.cont_entries, job.cont_strings = obj, key, entries, strings
-        return false, taken
+    -- v0.42.0: one pcall(next) an entry took ~150 ns (offline, the game's
+    -- lua51.dll, 5 M numbers in 0.74 s). Within one step nothing else runs,
+    -- so the table cannot change under a plain loop; only the key carried
+    -- over from the last step is checked, once.
+    if go_on then
+      for k, value in next, obj, key do
+        entries = entries + 1
+        local kind = type(k)
+        if kind == "string" then
+          strings = strings + #k
+        elseif kind == "table" or kind == "function" then
+          mem_visit(job, k, owner)
+        end
+        kind = type(value)
+        if kind == "string" then
+          strings = strings + #value
+        elseif kind == "table" or kind == "function" then
+          mem_visit(job, value, owner)
+        end
+        taken = taken + 1
+        if taken >= MEM_SLICE then
+          job.cont, job.cont_key, job.cont_entries, job.cont_strings = obj, k, entries, strings
+          return false, taken
+        end
       end
     end
     job.cont, job.cont_key = nil, nil
@@ -3046,7 +3079,7 @@ end
 
 local function mem_finish(job, at)
   mem.job = nil
-  mem.next_at = at + MEM_EVERY_S
+  mem.next_at = at + math.max(MEM_EVERY_S, job.spent * MEM_COST_K)
   mem.walks = mem.walks + 1
   local rows = {}
   for owner, bytes in pairs(job.size) do
@@ -3060,7 +3093,7 @@ local function mem_finish(job, at)
       local before = history[#history]
       if mem.first[owner] == nil then mem.first[owner] = kb end
       if before ~= nil and kb < before.kb - 1 then mem.dropped[owner] = true end
-      history[#history + 1] = { kb = kb, world = job.world }
+      history[#history + 1] = { kb = kb, world = job.world, at = at }
       while #history > MEM_KEEP do table.remove(history, 1) end
       rows[#rows + 1] = { owner = owner, kb = kb, delta = before and (kb - before.kb) or nil }
     end
@@ -3074,10 +3107,10 @@ local function mem_finish(job, at)
   end
   local ok, heap = false, nil
   if type(collect) == "function" then ok, heap = pcall(collect, "count") end
-  say(string.format("memory: %d objects in %d frames (%.1f ms, at most %.1f ms and %d entries a frame); " ..
-                    "world #%d; Lua heap %s; shared ~%s; %s",
+  say(string.format("memory: %d objects in %d frames (%.1f ms, at most %.1f ms and %d entries a frame; " ..
+                    "next in %.0f s); world #%d; Lua heap %s; shared ~%s; %s",
                     job.objects, job.frames, job.spent * 1000, (job.worst_frame or 0) * 1000,
-                    job.most_entries or 0, job.world,
+                    job.most_entries or 0, mem.next_at - at, job.world,
                     (ok and type(heap) == "number") and kb_text(heap) or "?",
                     kb_text((job.size[SHARED] or 0) / 1024), table.concat(parts, ", ")))
   -- A leak only grows: no drop over the last FLAG_SPAN walks, grown by
@@ -3120,9 +3153,13 @@ local function mem_finish(job, at)
       end
       local growth = history[count].kb - first.kb
       local crossed = history[count].world ~= first.world
-      local found = { kb = history[count].kb, growth = growth, minutes = FLAG_SPAN * MEM_EVERY_S / 60 }
+      -- v0.42.0: the minutes those counts spanned (10 at one a minute); a
+      -- longer span asks for as much growth per 10 minutes.
+      local minutes = math.floor((history[count].at - first.at) / 60 + 0.5)
+      if minutes < FLAG_SPAN then minutes = FLAG_SPAN end
+      local found = { kb = history[count].kb, growth = growth, minutes = minutes }
       if grows and crossed and growth >= FLAG_MIN_KB then leak = found end
-      if grows and growth >= SCREEN_MIN_KB then fast = found end
+      if grows and growth >= SCREEN_MIN_KB * minutes / FLAG_SPAN then fast = found end
     end
     -- The log: every leak, however small.
     if leak ~= nil and mem.logged[owner] == nil then
@@ -4390,9 +4427,23 @@ end
 -- the time of each link that ran is charged as usual, and a link that did
 -- not run costs nothing (settled_incl, v0.16.1; v0.15.0-v0.16.0 charged
 -- nothing at all in such a frame -- review [1], [4], [6], [16]).
+-- v0.42.0: this module's own time split by part, for the minute line
+-- ("this module: ... ms/s; parts: ..."): the user found ~5 ms/s on the ship
+-- and ~11 in a mission a bit much for a basic tool, and offline (no game GUI,
+-- units or video memory) it is ~0.5. One timer reading a part.
+installed.own_parts = {}
+installed.lap = function(part, mark)
+  local t = timer_now()
+  local parts = installed.own_parts
+  parts[part] = (parts[part] or 0) + (t - mark)
+  return t
+end
+
 local function tick(failed)
   local at = now()
+  local lap, mark = installed.lap, timer_now()
   if installed.rt ~= nil then pcall(installed.render_tick) end
+  mark = lap("render", mark)
   if window.started == nil then
     window.started = at
     ui.first_tick = ui.first_tick or at
@@ -4447,6 +4498,7 @@ local function tick(failed)
   elseif mapping ~= nil and not failed then
     walk(step_mapping)
   end
+  mark = lap("chain", mark)
 
   local heap = heap_kb()
   pcall(installed.jit_watch, at)
@@ -4525,6 +4577,7 @@ local function tick(failed)
   end
   last_tick_time = at
   last_heap = heap
+  mark = lap("times", mark)
 
   do
     local ok, err = pcall(units.tick, at)
@@ -4533,6 +4586,7 @@ local function tick(failed)
       say("units: check failed: " .. tostring(err))
     end
   end
+  mark = lap("units", mark)
   if mapping == nil and #links > 0 then
     local ok, err = pcall(mem_step, at)
     if not ok then
@@ -4540,6 +4594,7 @@ local function tick(failed)
       say("memory: walk failed, off for this session: " .. tostring(err))
     end
   end
+  mark = lap("memory", mark)
 
   do
     local ok, err = pcall(gpu.tick, at)
@@ -4548,8 +4603,11 @@ local function tick(failed)
       say("vram: read failed, off for this session: " .. tostring(err))
     end
   end
+  mark = lap("vram", mark)
   if at - window.started >= SUMMARY_S then write_summary(at) end
+  mark = lap("log", mark)
   display(at)
+  lap("screen", mark)
 end
 
 -- ------------------------------------------------------------ update hook

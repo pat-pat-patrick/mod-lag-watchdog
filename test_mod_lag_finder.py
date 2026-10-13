@@ -107,7 +107,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.41.0"
+RELEASE = "Mod Lag Watchdog v0.42.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1588,7 +1588,8 @@ def memory_case():
         s.lua("FAKE.press('home')")
         s.frames(3)
         shown = s.eval("SHOWN()")
-        check(re.search(r"MEM runaway ~[\d.]+ MB, \+[\d.]+ MB in 10 min", shown) is not None,
+        # v0.42.0: the minutes the 10 counts really spanned (10-11 here).
+        check(re.search(r"MEM runaway ~[\d.]+ MB, \+[\d.]+ MB in 1[01] min", shown) is not None,
               "the window names the runaway: %r" % shown)
         check(re.search(r"MEM (leaky|steady|wave|mission|global|hooker|mod_lag_finder)", shown) is None,
               "and nothing else: a 700 KB leak stays in the log: %r" % shown)
@@ -5194,6 +5195,57 @@ def big_table_case():
         clean(s, "big table")
 
 
+OWN_COST_BIG = r"""
+local previous = rawget(_G, "update")
+local cache = {}
+for i = 1, 40 do
+  local t = {}
+  for j = 1, 100000 do t[j] = j * 0.5 end
+  cache[i] = t
+end
+rawset(_G, "update", function(...)
+  local keep = cache
+  return previous(...)
+end)
+"""
+
+
+def own_cost_case():
+    """This module's own cost (v0.42.0, the user: ~11 ms/s in a mission is a
+    bit much for a basic tool). With real time on the clock and a mod holding
+    4 M numbers: the next memory count waits 1000 times what the last one
+    took, at least the usual minute ("next in N s" = max(60, ms taken)), and
+    does not start sooner; the minute line splits this module's time by
+    part. Fails on v0.41.0 (a count every minute, no parts)."""
+    print("own cost")
+    with session(ffi="allow") as s:
+        s.lua(GUI_STUB)
+        s.lua("__hd2_native_test = { box = {}, box_thread = 4242 }")
+        s.lua(GC_CLOCK)
+        load(s, ["std"])
+        check(s.load_mod(source=OWN_COST_BIG, name="mods/test/big"), "big loads")
+        load(s, ["finder"])
+        s.frames(5000)
+        first = log_lines(s, r"memory: \d+ objects in \d+ frames")
+        m = re.search(r"^t=([\d.]+) memory: .*\(([\d.]+) ms, at most .* next in (\d+) s\)", first[0] if first else "")
+        check(m is not None, "the count says when the next one is: %r" % first[:1])
+        if m is None:
+            clean(s, "own cost")
+            return
+        at, took, wait = float(m.group(1)), float(m.group(2)), int(m.group(3))
+        print("    first count: %.0f ms, next in %d s" % (took, wait))
+        check(abs(wait - max(60, took)) <= 2, "it waits max(60 s, 1000 x its own time): %.0f ms -> %d s" % (took, wait))
+        s.frames(int((wait + 40) / 0.016))
+        counts = log_lines(s, r"memory: \d+ objects in \d+ frames")
+        times = [float(re.match(r"t=([\d.]+)", l).group(1)) for l in counts]
+        check(len(times) >= 2 and times[1] - at >= wait - 1,
+              "the next count comes no sooner: %r (first at %.0f, wait %d)" % (times[:3], at, wait))
+        parts = log_lines(s, r"this module: [\d.]+ ms/s, worst frame [\d.]+ ms; parts \(ms/s\): ")
+        check(bool(parts) and any("memory " in l for l in parts),
+              "the minute line splits this module's time by part: %r" % parts[-1:])
+        clean(s, "own cost")
+
+
 def main():
     global BACKEND, SOURCE
     if "--backend" in sys.argv:
@@ -5212,6 +5264,7 @@ def main():
     holo_case()
     many_case()
     big_table_case()
+    own_cost_case()
     retry_case()
     stall_case()
     rehook_case()
