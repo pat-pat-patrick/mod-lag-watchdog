@@ -2,7 +2,7 @@
 
 A Helldivers 2 Lua mod that shows **which mod makes your game stutter**. It times every Lua mod, every frame, and tells you which one to look at.
 
-- **Download (players):** [Nexus Mods page](NEXUS_URL) (or the zips under [Releases](../../releases)).
+- **Download (players):** [Nexus Mods page](https://www.nexusmods.com/helldivers2/mods/16735) (or the zips under [Releases](../../releases)).
 - **Needs:** Bingus Shared Loader v15 or later.
 - **Mod managers:** works with any. With **Arsenal** or **Echelon** (0.36.2+), mods are shown under their names in the manager.
 
