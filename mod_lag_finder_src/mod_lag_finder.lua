@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.46.0"
+local MARKER = "mod-lag-finder-v0.47.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -3163,7 +3163,10 @@ end
 
 local function mem_finish(job, at)
   mem.job = nil
-  mem.next_at = at + math.max(MEM_EVERY_S, job.spent * MEM_COST_K)
+  local wait = math.max(MEM_EVERY_S, job.spent * MEM_COST_K)
+  local forced = rawget(_G, "__mlf_mem_every")          -- test seam: counts this far apart
+  if type(forced) == "number" then wait = forced end
+  mem.next_at = at + wait
   mem.walks = mem.walks + 1
   local rows = {}
   for owner, bytes in pairs(job.size) do
@@ -3226,10 +3229,25 @@ local function mem_finish(job, at)
     end
     local count = #history
     local leak, fast = nil, nil
-    if count >= FLAG_SPAN + 1 then
-      local first = history[count - FLAG_SPAN]
+    -- v0.47.0: the counts judged are the latest ones that span FLAG_SPAN
+    -- minutes, at least three of them. v0.42.0-v0.46.0 took FLAG_SPAN counts
+    -- whatever their spacing: with a big heap a count waits 10-17 minutes
+    -- (MEM_COST_K), so a leak needed hours (in game 2026-10-14: Super Holo
+    -- Kit 391 -> 656 MB in 24 minutes, never flagged). At one count a
+    -- minute this is the same ten counts as before.
+    local start = nil
+    if count >= 3 then
+      for index = count - 2, 1, -1 do
+        if history[count].at - history[index].at >= FLAG_SPAN * 60 - 30 then
+          start = index
+          break
+        end
+      end
+    end
+    if start ~= nil then
+      local first = history[start]
       local grows = true
-      for index = count - FLAG_SPAN + 1, count do
+      for index = start + 1, count do
         if history[index].kb < history[index - 1].kb - 1 then
           grows = false
           break
@@ -3247,8 +3265,8 @@ local function mem_finish(job, at)
     end
     -- The log: every leak, however small.
     if leak ~= nil and mem.logged[owner] == nil then
-      say(string.format("memory: %s only grows: ~%s, %s more than %d walks ago",
-                        owner, kb_text(leak.kb), kb_text(leak.growth), FLAG_SPAN))
+      say(string.format("memory: %s only grows: ~%s, %s more than %d min ago",
+                        owner, kb_text(leak.kb), kb_text(leak.growth), leak.minutes))
     elseif leak == nil and mem.logged[owner] ~= nil and not missing then
       say(string.format("memory: %s dropped again; no longer flagged", owner))
     end

@@ -5283,6 +5283,39 @@ def own_last_case():
         clean(s, "own last")
 
 
+SLOW_COUNT_LEAK = r"""
+local previous = rawget(_G, "update")
+local held, n = {}, 0
+rawset(_G, "update", function(...)
+  n = n + 1
+  held[#held + 1] = string.rep("x", 8000) .. n          -- ~1.9 MB a minute at 4 frames a second
+  return previous(...)
+end)
+"""
+
+
+def sparse_leak_case():
+    """A leak with the memory counts far apart (v0.47.0). With a big heap a
+    count waits 10+ minutes (MEM_COST_K), so v0.42.0-v0.46.0 needed 10 of
+    them -- hours -- to flag a leak. Now: the latest counts spanning 10
+    minutes, at least three. Counts are forced 12 minutes apart here
+    (__mlf_mem_every); a mod growing ~30 MB a minute is flagged on screen
+    after the third count. Fails on v0.46.0."""
+    print("sparse leak")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua("FAKE.before_frame = function() CLOCK = CLOCK + 0.25 end")   # 4 frames a second
+        s.lua("__mlf_mem_every = 720")
+        load(s, ["std", "finder"])
+        check(s.load_mod(source=SLOW_COUNT_LEAK, name="mods/test/sparse"), "sparse loads")
+        s.frames(int(40 * 60 / 0.25))                     # 40 minutes: counts at ~1, 13, 25, 37 min
+        counts = log_lines(s, r"memory: \d+ objects in \d+ frames")
+        fast = log_lines(s, r"memory: mods/test/sparse grows fast")
+        check(3 <= len(counts) <= 5, "the counts were far apart: %d in 40 minutes" % len(counts))
+        check(bool(fast), "the leak is flagged within 40 minutes: %r" % (fast or counts[-1:]))
+        clean(s, "sparse leak")
+
+
 def main():
     global BACKEND, SOURCE, RELEASE_V
     if "--backend" in sys.argv:
@@ -5305,6 +5338,7 @@ def main():
     big_table_case()
     own_cost_case()
     own_last_case()
+    sparse_leak_case()
     retry_case()
     stall_case()
     rehook_case()
