@@ -107,7 +107,8 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.44.0"
+RELEASE = modpaths.current("Mod Lag Watchdog")   # its MOD.md 当前发布
+RELEASE_V = re.search(r"v\d+\.\d+\.\d+", RELEASE).group(0)    # "v0.44.0", also in a "... Nexus" name
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None
@@ -1221,8 +1222,8 @@ def menu_case():
             title = s.eval("POS('MOD LAG WATCHDOG')")
             check(title == "1064,600", "at the default place (1056,620; title 8 px in, 8 px up from the bar's bottom): %s" % title)
             # v0.28.0 (the user): the title carries the version.
-            check("MOD LAG WATCHDOG " + RELEASE.split()[3] in shown.split("|"),
-                  "the title is 'MOD LAG WATCHDOG %s': %r" % (RELEASE.split()[3], shown))
+            check("MOD LAG WATCHDOG " + RELEASE_V in shown.split("|"),
+                  "the title is 'MOD LAG WATCHDOG %s': %r" % (RELEASE_V, shown))
 
             # Drag the title bar 200 px left and 100 px down.
             s.lua("MOUSE.x, MOUSE.y = 1100, 605; PRESS(1)")
@@ -3402,7 +3403,7 @@ def modlist_case():
             s.frames(6)
             clip = click(s, "copy mod list")
             lines = clip.split("\r\n")
-            check(lines[0].startswith("Mod Lag Watchdog mod list (" + RELEASE.split()[-1] + ", game build 6AB3B43F)"),
+            check(lines[0].startswith("Mod Lag Watchdog mod list (" + RELEASE_V + ", game build 6AB3B43F)"),
                   "the header: %r" % lines[:1])
             check("Enabled in Arsenal: 6 mods" in lines, "six enabled mods: %r" % clip)
 
@@ -3481,7 +3482,7 @@ def report_case():
             check(lines[0] == "Mod Lag Watchdog report: slow (mods/test/slow)", "who: %r" % lines[:1])
             check(lines[1:2] == ["Mod manager: unknown (no mod manager list)"], "no Arsenal list: %r" % lines[1:2])
             del lines[1:2]
-            check(re.match(r"Game build 6AB3B43F, Watchdog " + re.escape(RELEASE.split()[-1]) + r", 4 mods hook the update", lines[1] if len(lines) > 1 else "")
+            check(re.match(r"Game build 6AB3B43F, Watchdog " + re.escape(RELEASE_V) + r", 4 mods hook the update", lines[1] if len(lines) > 1 else "")
                   is not None, "build, version, chain: %r" % lines[1:2])
             check(re.match(r"Session: \d+ min, \d+ FPS average, 0 world changes", lines[2] if len(lines) > 2 else "")
                   is not None, "the session: %r" % lines[2:3])
@@ -5087,7 +5088,7 @@ def data_file_case():
     check(data.get("format") == "mod-lag-watchdog" and data.get("version") == 1,
           "format and version: %r" % {k: data.get(k) for k in ("format", "version")})
     w = data.get("watchdog") or {}
-    check(w.get("version") == RELEASE.split()[-1].lstrip("v") and re.match(r"^[0-9a-f]{12}$", w.get("build") or ""),
+    check(w.get("version") == RELEASE_V.lstrip("v") and re.match(r"^[0-9a-f]{12}$", w.get("build") or ""),
           "the Watchdog's version and build: %r" % w)
     sess = data.get("session") or {}
     check(sess.get("ended_how") == "closed" and 0.9 <= (sess.get("minutes_played") or 0) <= 1.8

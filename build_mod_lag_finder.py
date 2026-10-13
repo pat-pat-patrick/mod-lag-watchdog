@@ -188,6 +188,11 @@ def build():
     print("build id %s (listed in %s)" % (ident, builds))
     print("wrote %s (%d files, %d bytes)"
           % (zip_path, count, os.path.getsize(zip_path)))
+    # The tests take the current build from MOD.md (modpaths.current): it is
+    # named there once its zip exists, never before.
+    import modinfo
+    modinfo.mod(FOLDER).set_current(RELEASE)
+    print("MOD.md 当前发布: %s" % RELEASE)
 
 
 if __name__ == "__main__":
