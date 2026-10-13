@@ -39,7 +39,7 @@ from hd2fake import Session                      # noqa: E402
 from hd2fake.sources import lua_from_release     # noqa: E402
 import modpaths                                  # noqa: E402
 
-CURRENT = "Mod Lag Watchdog v0.42.0"
+CURRENT = "Mod Lag Watchdog v0.43.0"
 CONTROL = "Mod Lag Watchdog v0.16.1"
 FOLDER = "Mod Lag Watchdog"
 NAME = "mods/patpatpatrick/mod_lag_finder"

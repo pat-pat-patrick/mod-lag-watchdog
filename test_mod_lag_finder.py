@@ -107,7 +107,7 @@ from hd2fake.gate import FFI_DOORS  # noqa: E402
 from hashing import murmur64_hash  # noqa: E402
 from hd2fake.sources import lua_from_release  # noqa: E402
 
-RELEASE = "Mod Lag Watchdog v0.42.0"
+RELEASE = "Mod Lag Watchdog v0.43.0"
 FOLDER = "Mod Lag Watchdog"
 LOG = "mod_lag_finder.log"
 SOURCE = None

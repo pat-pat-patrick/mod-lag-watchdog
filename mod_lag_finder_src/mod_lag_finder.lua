@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.42.0"
+local MARKER = "mod-lag-finder-v0.43.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1271,6 +1271,10 @@ local function settled_incl(index, link)
   return 0
 end
 
+-- v0.43.0 (in game 2026-10-13, 30 links: this part of the tick took
+-- ~2.5 ms/s, the largest of this module's own): each link keeps one entry
+-- table, refilled every frame, where a new one was made for every link
+-- every frame (~450 KB/s of garbage). Nothing keeps an entry past the tick.
 local function selfs()
   local out = {}
   local n = #links
@@ -1280,7 +1284,13 @@ local function selfs()
     local below = index < n and settled_incl(index + 1, links[index + 1]) or 0
     local own = incl - below
     if own < 0 then own = 0 end
-    out[index] = { link = link, own = own, incl = incl }
+    local entry = link.self_entry
+    if entry == nil then
+      entry = { link = link }
+      link.self_entry = entry
+    end
+    entry.own, entry.incl = own, incl
+    out[index] = entry
   end
   return out
 end
@@ -1289,8 +1299,14 @@ end
 -- walk reached it, otherwise whatever the walk could not see past.
 local function owner(link)
   if link.bottom == "game" then return "(the game)" end
-  if link.boot_patch then return link.source .. " (boot patch)" end
-  if link.bottom ~= nil then return link.source .. " (+ all below it)" end
+  if link.boot_patch or link.bottom ~= nil then
+    -- v0.43.0: made once per link and kind, not every frame.
+    local kind = link.boot_patch and " (boot patch)" or " (+ all below it)"
+    if link.owner_kind ~= kind or link.owner_of ~= link.source then
+      link.owner_kind, link.owner_of, link.owner_text = kind, link.source, link.source .. kind
+    end
+    return link.owner_text
+  end
   return link.source
 end
 
@@ -1325,10 +1341,17 @@ local function gc_window(a, b)
   return true, wrap or sa >= 3 or sb >= 3, sa <= 2 and (sb >= 3 or wrap)
 end
 
-installed.gc_frame = function(frame_selfs)
+-- v0.43.0: the split runs in one frame of GC_EVERY and counts that frame
+-- GC_EVERY times (it is statistical anyway: good over a minute, not for one
+-- frame); a frame long enough to be a stall is always looked at, for its
+-- line, and counted 0 times when it is not a sampled one. In game it was
+-- part of this module's largest share (~2.5 ms/s with 30 links).
+installed.gc_every = 4
+installed.gc_frame = function(frame_selfs, weight)
   local w = installed.gcw
   w.note = nil
   if installed.gcp == nil or frame_selfs == nil then return end
+  weight = weight or 1
   local frame = installed.frame_id - 1
   local n = #links
   local any, notes = false, nil
@@ -1355,20 +1378,20 @@ installed.gc_frame = function(frame_selfs)
         row = { frames = 0, clean = 0, alloc = 0, stepped = 0, gc = 0 }
         w.rows[key] = row
       end
-      row.frames = row.frames + 1
-      w.chain = w.chain + entry.own
+      row.frames = row.frames + weight
+      w.chain = w.chain + entry.own * weight
       if not swept then
-        row.clean = row.clean + 1
-        row.alloc = row.alloc + math.max(0, alloc)
+        row.clean = row.clean + weight
+        row.alloc = row.alloc + math.max(0, alloc) * weight
       end
       local base = link.gc_base
       if not stepped then
-        link.gc_base = base == nil and entry.own or base + (entry.own - base) * 0.05
+        if weight > 0 then link.gc_base = base == nil and entry.own or base + (entry.own - base) * 0.05 end
       else
         any = true
-        row.stepped = row.stepped + 1
+        row.stepped = row.stepped + weight
         local extra = math.max(0, entry.own - (base or entry.own))
-        row.gc = row.gc + extra
+        row.gc = row.gc + extra * weight
         if atomic and extra > w.worst_atomic then
           w.worst_atomic, w.worst_atomic_key = extra, key
         end
@@ -1379,8 +1402,8 @@ installed.gc_frame = function(frame_selfs)
       end
     end
   end
-  w.frames = w.frames + 1
-  if any then w.chain_gc_frames = w.chain_gc_frames + 1 end
+  w.frames = w.frames + weight
+  if any then w.chain_gc_frames = w.chain_gc_frames + weight end
   if notes ~= nil then w.note, w.note_frame = "gc steps in " .. notes, frame end
 end
 
@@ -1561,10 +1584,21 @@ local function charge_row(rows, key, own)
 end
 
 local function charge(frame_selfs)
-  for _, entry in pairs(frame_selfs) do
-    local key = owner(entry.link)
-    charge_row(window.mods, key, entry.own)
-    if live.bucket ~= nil then charge_row(live.bucket.mods, key, entry.own) end
+  -- v0.43.0: a counted loop over the links, then MDL's scripts at -1, -2, ...
+  -- (add_mdl), where pairs() went over the table every frame.
+  local rows, bucket = window.mods, live.bucket ~= nil and live.bucket.mods or nil
+  local index = #links
+  while true do
+    local entry = frame_selfs[index]
+    if entry ~= nil then
+      local key = owner(entry.link)
+      charge_row(rows, key, entry.own)
+      if bucket ~= nil then charge_row(bucket, key, entry.own) end
+    elseif index < 0 then
+      break
+    end
+    index = index - 1
+    if index == 1 then index = -1 end
   end
 end
 
@@ -1610,7 +1644,7 @@ local function write_summary(at)
   pcall(installed.render_summary, span)
   do
     local parts, shown = installed.own_parts or {}, {}
-    for _, part in ipairs({ "screen", "times", "chain", "memory", "units", "vram", "render", "log" }) do
+    for _, part in ipairs({ "screen", "times", "gc", "chain", "memory", "units", "vram", "render", "log" }) do
       local value = (parts[part] or 0) * 1000 / span
       if value >= 0.05 then shown[#shown + 1] = string.format("%s %.2f", part, value) end
     end
@@ -2523,6 +2557,13 @@ local function menu_check()
     end
   end
   if native.read == nil then return false end
+  -- v0.43.0: while the menu is shut it is read every third frame (two
+  -- ReadProcessMemory calls and two strings each time; ~0.8 ms/s of this
+  -- module's time in game went to the screen part). It still opens after
+  -- MENU.HOLD readings in a row, ~0.1 s at 100 FPS; open, every frame.
+  native.skip = (native.skip or 0) + 1
+  if native.run == 0 and native.skip < 3 then return false end
+  native.skip = 0
   local ok, open = pcall(menu_open_now)
   if ok and open == true then native.run = native.run + 1 else native.run = 0 end
   return native.run >= MENU.HOLD
@@ -4511,8 +4552,13 @@ local function tick(failed)
       frame_selfs = selfs()
     end
   end
+  mark = lap("times", mark)
   do
-    local ok, err = pcall(installed.gc_frame, frame_selfs)
+    local every = installed.gc_every
+    local sampled = installed.frame_id % every == 0
+    local long = last_tick_time ~= nil and (at - last_tick_time) * 1000 >= HITCH_MS
+    local ok, err = true, nil
+    if sampled or long then ok, err = pcall(installed.gc_frame, frame_selfs, sampled and every or 0) end
     if ok then ok, err = pcall(installed.gc_tick) end
     if not ok then
       installed.gcp = nil
@@ -4520,6 +4566,7 @@ local function tick(failed)
       say("gc: probe failed, off for this session: " .. tostring(err))
     end
   end
+  mark = lap("gc", mark)
   add_mdl(frame_selfs)
 
   if pending ~= nil then
@@ -4534,12 +4581,23 @@ local function tick(failed)
   -- left out, none left). HD2 HUD+ 0.2.2 puts a copy of the same hook on top
   -- (same line) and the one below passes through idle: still left out.
   if mapped and live.bucket ~= nil and links[1] ~= nil and links[1].fn ~= installed.wrapper then
+    -- v0.43.0: worked out once per top hook (source and line) and chain
+    -- length, not every frame. No reference to the link itself is kept: the
+    -- memory walk would reach a mod that has left through it.
     local timed_below = false
-    for k = 2, #links do
-      if links[k].source == links[1].source and links[k].line ~= links[1].line then
-        timed_below = true
-        break
+    local top_link = links[1]
+    if installed.tops_src == top_link.source and installed.tops_line == top_link.line
+       and installed.tops_n == #links then
+      timed_below = installed.tops_below
+    else
+      for k = 2, #links do
+        if links[k].source == links[1].source and links[k].line ~= links[1].line then
+          timed_below = true
+          break
+        end
       end
+      installed.tops_src, installed.tops_line = top_link.source, top_link.line
+      installed.tops_n, installed.tops_below = #links, timed_below
     end
     if not timed_below then
       local tops = live.bucket.tops
@@ -5896,6 +5954,19 @@ local function main()
   say(string.format("names: %s (%.0f ms)", ok_names and tostring(told) or ("failed: " .. tostring(told)),
                     (now() - named_at) * 1000))
   say("timer: " .. timer_kind)
+  -- v0.43.0: whether LuaJIT compiles at all here (its interpreter is many
+  -- times slower: this module's own time in game is ~10x that offline).
+  do
+    local jit_lib = rawget(_G, "jit")
+    local status = type(jit_lib) == "table" and rawget(jit_lib, "status") or nil
+    if type(status) == "function" then
+      local ok_status, on = pcall(status)
+      say("jit: " .. (ok_status and (on and "on" or "off") or "status failed") ..
+          " (" .. tostring(rawget(jit_lib, "version")) .. ")")
+    else
+      say("jit: no jit library")
+    end
+  end
   if log_path ~= nil then
     installed.crash_path = string.gsub(log_path, "mod_lag_finder%.log$", "mod_lag_finder_crash.txt")
     local last = read_all(installed.crash_path)
