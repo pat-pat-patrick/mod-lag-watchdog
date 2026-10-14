@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.48.0"
+local MARKER = "mod-lag-finder-v0.49.0"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -1687,12 +1687,27 @@ local function write_summary(at)
       local value = (parts[part] or 0) * 1000 / span
       if value >= 0.05 then shown[#shown + 1] = string.format("%s %.2f", part, value) end
     end
-    -- v0.44.0: before, call and after are outside the tick: not in the
-    -- first figure, which is the tick's own time.
-    say(string.format("  this module: %.2f ms/s, worst frame %.1f ms%s",
-                      (installed.own_time or 0) * 1000 / span, (installed.own_worst or 0) * 1000,
-                      #shown > 0 and ("; parts (ms/s): " .. table.concat(shown, ", ")) or ""))
+    -- v0.49.0: the first figure is the whole: the tick, and before, call and
+    -- after around the chain (v0.44.0-v0.48.0 gave the tick alone, ~1.6 ms/s
+    -- short in game).
+    local tick_mss = (installed.own_time or 0) * 1000 / span
+    local around = ((parts.before or 0) + (parts.call or 0) + (parts.after or 0)) * 1000 / span
+    installed.own_around_mss = around
+    say(string.format("  this module: %.2f ms/s, worst frame %.1f ms%s; tick %.2f + around the chain %.2f",
+                      tick_mss + around, (installed.own_worst or 0) * 1000,
+                      #shown > 0 and ("; parts (ms/s): " .. table.concat(shown, ", ")) or "",
+                      tick_mss, around))
     installed.own_parts = {}
+    local cal = installed.cal
+    if cal ~= nil and cal.n > 0 then
+      local per = cal.sum / cal.n
+      local timed = math.max(0, #links - 1)
+      local mss = per * timed * window.frames / span * 1000
+      installed.cal_mss = mss
+      say(string.format("  timing layer: ~%.1f us a link a frame (%d readings) -> ~%.2f ms/s over %d links, " ..
+                        "counted in the mods' own rows", per * 1e6, cal.n, mss, timed))
+      cal.n, cal.sum = 0, 0
+    end
   end
   installed.own_time, installed.own_worst = 0, 0
   local raised = {}
@@ -3104,10 +3119,10 @@ end
 local function mem_process(job, obj, owner)
   local bytes
   if type(obj) == "table" then
-    local key, entries, strings = nil, 0, 0
+    local key, entries, strings, arr = nil, 0, 0, 0
     local go_on = true
     if job.cont == obj then
-      key, entries, strings = job.cont_key, job.cont_entries, job.cont_strings
+      key, entries, strings, arr = job.cont_key, job.cont_entries, job.cont_strings, job.cont_arr
       go_on = pcall(next, obj, key)
     end
     local taken = 0
@@ -3121,6 +3136,8 @@ local function mem_process(job, obj, owner)
         local kind = type(k)
         if kind == "string" then
           strings = strings + #k
+        elseif kind == "number" then
+          if k >= 1 and k % 1 == 0 then arr = arr + 1 end
         elseif kind == "table" or kind == "function" then
           mem_visit(job, k, owner)
         end
@@ -3132,14 +3149,19 @@ local function mem_process(job, obj, owner)
         end
         taken = taken + 1
         if taken >= MEM_SLICE then
-          job.cont, job.cont_key, job.cont_entries, job.cont_strings = obj, k, entries, strings
+          job.cont, job.cont_key, job.cont_entries, job.cont_strings, job.cont_arr = obj, k, entries, strings, arr
           return false, taken
         end
       end
     end
     job.cont, job.cont_key = nil, nil
     if getmeta ~= nil then mem_visit(job, getmeta(obj), owner) end
-    bytes = 64 + 40 * entries + strings
+    -- v0.49.0: LuaJIT's own sizes (2.1, not GC64): a table is 40 bytes, an
+    -- array slot 8, a hash node 24 -- 32 here, for the power-of-two size.
+    -- Whole-number keys from 1 are taken as the array part. 64 + 40 an entry
+    -- counted a mod's arrays of numbers 5 times over: in game 2026-10-14
+    -- Super Holo Kit "~656 MB" in a Lua heap of 295 MB.
+    bytes = 40 + 8 * arr + 32 * (entries - arr) + strings
     job.size[owner] = (job.size[owner] or 0) + bytes
     job.objects = job.objects + 1
     return true, taken
@@ -3314,7 +3336,12 @@ mem_step = function(at)
         mem.world, mem.worlds = world, mem.worlds + 1
       end
     end
-    job.world = mem.worlds
+    -- v0.49.0: plus the world changes the units watch counts. The mission
+    -- often reuses the ship's main_world handle (in game 2026-10-14, eight
+    -- games: "units: main world changed" 2-4 times, every count "world #1"),
+    -- so the handle alone never changed and a leak, which must outlive a
+    -- world change to be logged, never was.
+    job.world = mem.worlds + (installed.world_changes or 0)
     mem_visit(job, _G, SHARED)
     if type(getregistry) == "function" then
       local ok, registry = pcall(getregistry)
@@ -3496,6 +3523,7 @@ function units.tick(at)
       units.candidate, units.candidate_at = world, at
     elseif at - units.candidate_at >= UNITS_SETTLE_S then
       units.world_changes = units.world_changes + 1
+      installed.world_changes = units.world_changes          -- for the memory count (v0.49.0)
       units.world, units.candidate, units.world_since = world, nil, at
       for unit, mod in pairs(units.owner) do
         if units.world_of[unit] ~= world then
@@ -4002,6 +4030,17 @@ local function panel_lines(at)
   local worst_write = writes_worst()
   out[#out + 1] = { string.format("slowest log write: %.0f ms", worst_write * 1000),
                     worst_write >= 0.1 and AMBER or GREY }
+  -- v0.49.0 (the user: does it know its own cost?): on the pause menu, this
+  -- module's own ms/s over the window -- its tick, plus the last minute's
+  -- time around the chain -- and what its timing adds to the mods' rows.
+  if ui.in_menu and seconds > 0 then
+    local own = 0
+    for _, bucket in ipairs(buckets) do own = own + (bucket.own or 0) end
+    local mss = own * 1000 / seconds + (installed.own_around_mss or 0)
+    out[#out + 1] = { string.format("Watchdog itself: %.1f ms/s%s", mss,
+                                    installed.cal_mss and string.format(" (+%.1f in the rows above)", installed.cal_mss) or ""),
+                      GREY }
+  end
   if mapping ~= nil then
     out[#out + 1] = { "mapping the update chain ...", GREY }
   elseif seconds > 0 then
@@ -4590,8 +4629,35 @@ installed.lap = function(part, mark)
   return t
 end
 
+-- v0.49.0: what one timing shim adds to a mod's row. Each mod's own time
+-- holds the work of the shim around the link below it that falls outside
+-- that shim's own window, and the inside of its own shim. A shim around a
+-- function that does nothing, called on the sampled frames, measures both:
+-- its time less the bare call's. Times the links and the frame rate, that
+-- is this module's time inside the other mods' rows.
+installed.calibrate = function()
+  local cal = installed.cal
+  if cal == nil then
+    local noop = function(...) return ... end
+    local counter = { box = installed.box, gcp = installed.gcp, frame_id = 0,
+                      box_id = function() return 2 end }
+    cal = { noop = noop, n = 0, sum = 0,
+            shim = make_shim({ source = "(calibration)" }, noop,
+                             installed.xpcall_args and installed.link_handler or nil, counter) }
+    installed.cal = cal
+  end
+  local t0 = timer_now()
+  cal.shim(1)
+  local t1 = timer_now()
+  cal.noop(1)
+  local t2 = timer_now()
+  local extra = (t1 - t0) - (t2 - t1)
+  if extra > 0 and extra < 0.001 then cal.n, cal.sum = cal.n + 1, cal.sum + extra end
+end
+
 local function tick(failed)
   local at = now()
+  if installed.lap_now then pcall(installed.calibrate) end    -- in the tick's total, in no part
   local lap, mark = installed.lap, installed.lap_now and timer_now() or 0
   if installed.rt ~= nil then pcall(installed.render_tick) end
   mark = lap("render", mark)
@@ -5003,6 +5069,7 @@ local function arm()
       local started = now()
       local ok_tick, err = pcall(tick, failed)
       installed.tick_cost = now() - started
+      if live.bucket ~= nil then live.bucket.own = (live.bucket.own or 0) + installed.tick_cost end
       -- v0.24.0: this module's own time, for the summary.
       installed.own_time = (installed.own_time or 0) + installed.tick_cost
       if installed.tick_cost > (installed.own_worst or 0) then installed.own_worst = installed.tick_cost end

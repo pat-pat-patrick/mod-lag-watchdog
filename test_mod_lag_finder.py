@@ -1495,7 +1495,7 @@ local store, world = {}, nil
 rawset(_G, "update", function(...)
   local now = stingray.Application.main_world()
   if now ~= world then world, store = now, {} end
-  for i = 1, 4 do store[#store + 1] = i end
+  for i = 1, 16 do store[#store + 1] = i end      -- 16 (v0.49.0: an array slot is 8 bytes now, not 40)
   return previous(...)
 end)
 """,
@@ -1575,12 +1575,14 @@ def memory_case():
         s.frames(700)                               # ~3 more minutes
         walks = log_lines(s, r"memory: \d+ objects")
         steady = [float(m.group(1)) for m in (re.search(r"steady ~(\d+) KB", w) for w in walks) if m]
-        check(len(steady) >= 13 and max(steady) - min(steady) <= 2 and 100 <= steady[0] <= 200,
-              "a steady 3000-entry table reads about the same every minute (~120 KB): %r" % steady[:4])
+        # v0.49.0: 3000 array slots of 8 bytes (~24 KB; 64 + 40 an entry read ~120 KB).
+        check(len(steady) >= 13 and max(steady) - min(steady) <= 2 and 20 <= steady[0] <= 40,
+              "a steady 3000-entry table reads about the same every minute (~24 KB): %r" % steady[:4])
         hooker = [float(m.group(1)) for m in (re.search(r"hooker ~(\d+) KB", w) for w in walks) if m]
         check(all(v < 5 for v in hooker),
               "a mod that hooks a game function is not charged the game's state: %r" % hooker[:4])
-        check(re.search(r"world #2", walks[-1] if walks else "") is not None,
+        # v0.49.0: the world number also counts the units watch's world changes.
+        check(re.search(r"world #([2-9])", walks[-1] if walks else "") is not None,
               "the world change is seen: %r" % (walks[-1][:120] if walks else ""))
         leaks = log_lines(s, r"memory: (\S+) only grows")
         who = sorted(set(re.search(r"memory: (\S+) only grows", l).group(1) for l in leaks))
@@ -5196,7 +5198,7 @@ def big_table_case():
         check(m is not None and int(m.group(1)) <= 8192 + 512,
               "no frame walks more than one slice past the cap: %r" % line[-1:])
         mb = re.search(r"big ~([\d.]+) MB", line[-1] if line else "")
-        check(mb is not None and float(mb.group(1)) >= 10, "the table still counts to its mod: %r" % line[-1:])
+        check(mb is not None and float(mb.group(1)) >= 2, "the table still counts to its mod (300k slots, ~2.3 MB): %r" % line[-1:])
         clean(s, "big table")
 
 
@@ -5249,6 +5251,10 @@ def own_cost_case():
         parts = log_lines(s, r"this module: [\d.]+ ms/s, worst frame [\d.]+ ms; parts \(ms/s\): ")
         check(bool(parts) and any("memory " in l for l in parts),
               "the minute line splits this module's time by part: %r" % parts[-1:])
+        whole = log_lines(s, r"this module: [\d.]+ ms/s, .*; tick [\d.]+ \+ around the chain [\d.]+$")
+        check(bool(whole), "and gives the whole: the tick plus the time around the chain (v0.49.0): %r" % parts[-1:])
+        layer = log_lines(s, r"timing layer: ~[\d.]+ us a link a frame \(\d+ readings\) -> ~[\d.]+ ms/s over \d+ links")
+        check(bool(layer), "the timing layer is measured: what it adds to the mods' rows (v0.49.0): %r" % layer[-1:])
         clean(s, "own cost")
 
 
@@ -5279,7 +5285,7 @@ def own_last_case():
         big = re.search(r"fieldbig ~([\d.]+) (MB|KB)", text)
         mine = re.search(r"mod_lag_finder ~([\d.]+) (MB|KB)", text)
         size = lambda m: float(m.group(1)) * (1024 if m.group(2) == "MB" else 1) if m else 0
-        check(size(big) >= 5 * 1024 and size(mine) < 2 * 1024,
+        check(size(big) >= 1024 and size(mine) < 512,          # 200k numbers ~1.5 MB (v0.49.0 sizes)
               "the mod's data counts to the mod, not to this module: %r" % text[:300])
         clean(s, "own last")
 
@@ -5359,6 +5365,51 @@ def load_step_case():
             clean(s, "load step")
 
 
+def world_reuse_case():
+    """A mission on the ship's main_world handle (v0.49.0). In game the handle
+    flips during the load and comes back the same (2026-10-14: the units watch
+    logged 2-4 world changes, every memory count said "world #1"), so a leak,
+    which must outlive a world change to be logged, never was. Here the
+    handle flips for ~3 s and comes back; the next count is in a new world.
+    Fails on v0.48.0."""
+    print("world reuse")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua("local real = stingray.Application.main_world\n"
+              "stingray.Application.main_world = function() if FLIP ~= nil then return FLIP end return real() end")
+        load(s, ["std", "finder"])
+        s.frames(3900)                                    # the first count, world #1
+        s.lua("FLIP = {}")
+        s.frames(200)                                     # ~3 s in the loading world
+        s.lua("FLIP = nil")
+        s.frames(3900)
+        walks = log_lines(s, r"memory: \d+ objects in \d+ frames")
+        worlds = [int(m.group(1)) for m in (re.search(r"world #(\d+)", w) for w in walks) if m]
+        check(bool(log_lines(s, r"units: main world changed")), "the units watch saw the flip")
+        check(len(worlds) >= 2 and worlds[0] == 1 and worlds[-1] > 1,
+              "the memory count's world changed too, the handle being the same: %r" % worlds)
+        clean(s, "world reuse")
+
+
+def own_line_case():
+    """The pause-menu window says what the Watchdog itself costs (v0.49.0,
+    the user: does it know its own cost?), whether or not it is a row: a
+    "Watchdog itself: N ms/s" line. Not in missions. Fails on v0.48.0."""
+    print("own line")
+    with session() as s:
+        s.lua(GUI_STUB)
+        s.lua(menu_stub())
+        load(s, ["heavy", "std", "finder"])
+        s.frames(300)
+        check("Watchdog itself" not in s.eval("SHOWN()"), "not in a mission without the menu")
+        s.lua("MENU_STATE(1, 0)")
+        s.frames(15)
+        shown = s.eval("SHOWN()")
+        check(re.search(r"Watchdog itself: [\d.]+ ms/s", shown) is not None,
+              "on the pause menu, its own cost: %r" % shown[-200:])
+        clean(s, "own line")
+
+
 def main():
     global BACKEND, SOURCE, RELEASE_V
     if "--backend" in sys.argv:
@@ -5383,6 +5434,8 @@ def main():
     own_last_case()
     sparse_leak_case()
     load_step_case()
+    world_reuse_case()
+    own_line_case()
     retry_case()
     stall_case()
     rehook_case()
