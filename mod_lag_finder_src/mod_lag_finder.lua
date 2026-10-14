@@ -124,7 +124,7 @@
 -- compared. v0.1.0 in game (09-29) once followed a stripped mod's own helper
 -- down three links of the same file, because both candidates timed at 0 ms.
 
-local MARKER = "mod-lag-finder-v0.49.0"
+local MARKER = "mod-lag-finder-v0.49.1"
 
 if rawget(_G, "__mlf_marker") == MARKER then return { name = MARKER } end
 rawset(_G, "__mlf_marker", MARKER)
@@ -4037,9 +4037,13 @@ local function panel_lines(at)
     local own = 0
     for _, bucket in ipairs(buckets) do own = own + (bucket.own or 0) end
     local mss = own * 1000 / seconds + (installed.own_around_mss or 0)
-    out[#out + 1] = { string.format("Watchdog itself: %.1f ms/s%s", mss,
-                                    installed.cal_mss and string.format(" (+%.1f in the rows above)", installed.cal_mss) or ""),
-                      GREY }
+    out[#out + 1] = { string.format("Watchdog itself: %.1f ms/s", mss), GREY }
+    -- v0.49.1 (the user: list the timing layer on its own; with 30-70 mods
+    -- it matters little, so it is shown, not cut): its own line.
+    if installed.cal_mss ~= nil then
+      out[#out + 1] = { string.format("Watchdog timing layer: %.1f ms/s (inside the rows above)", installed.cal_mss),
+                        GREY }
+    end
   end
   if mapping ~= nil then
     out[#out + 1] = { "mapping the update chain ...", GREY }
